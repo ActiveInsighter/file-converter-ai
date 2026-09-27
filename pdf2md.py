@@ -92,7 +92,11 @@ def download_pdf(source_url: str, destination: Path) -> None:
 
 
 def render_pdf(
-    pdf_path: Path, image_dir: Path, dpi: int, jpeg_quality: int
+    pdf_path: Path,
+    image_dir: Path,
+    dpi: int,
+    jpeg_quality: int,
+    image_format: str,
 ) -> tuple[list[Path], int]:
     image_dir.mkdir(parents=True, exist_ok=True)
     document = fitz.open(pdf_path)
@@ -104,10 +108,14 @@ def render_pdf(
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     paths: list[Path] = []
 
+    extension = "png" if image_format == "png" else "jpg"
     for index, page in enumerate(document, start=1):
         pix = page.get_pixmap(matrix=matrix, alpha=False)
-        path = image_dir / f"{index:0{width}d}.jpg"
-        path.write_bytes(pix.tobytes("jpeg", jpg_quality=jpeg_quality))
+        path = image_dir / f"{index:0{width}d}.{extension}"
+        if image_format == "png":
+            path.write_bytes(pix.tobytes("png"))
+        else:
+            path.write_bytes(pix.tobytes("jpeg", jpg_quality=jpeg_quality))
         paths.append(path)
         print(f"[render] {index}/{total_pages}: {path.name}", flush=True)
 
@@ -151,10 +159,11 @@ def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
     for path in chunk.image_paths:
         data = path.read_bytes()
         raw_bytes += len(data)
+        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
         parts.append(
             {
                 "inlineData": {
-                    "mimeType": "image/jpeg",
+                    "mimeType": mime_type,
                     "data": base64.b64encode(data).decode("ascii"),
                 }
             }
@@ -165,6 +174,55 @@ def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
         raise ValueError(
             f"Chunk {chunk.stem} is about {estimated / 1024 / 1024:.1f} MiB after base64, "
             "too large for inline image input. Lower images_per_request, dpi, or jpeg_quality."
+        )
+    return parts, estimated
+
+
+def make_verification_parts(
+    chunk: Chunk, prompt: str, draft: str
+) -> tuple[list[dict], int]:
+    verify_prompt = f"""请逐页对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
+
+审校重点：
+1. 逐字符核对所有数学公式：正负号、分数、根号、上下标、积分/求和上下限、矩阵、转置、希腊字母、括号和数字。
+2. 检查是否有漏行、错行、重复、跨页错位、把页眉页脚或扫描水印误当正文。
+3. 检查 Markdown/LaTeX 格式，行内公式使用成对 $...$，多行公式使用成对 $...$。
+4. 只依据图片纠错，不要自行改写原文、推导新内容或加入解释。
+5. 若草稿与图片冲突，以图片为准。看不清时写 [无法辨认]，不要猜。
+6. 只输出最终修正后的 Markdown。
+
+原始转录要求：
+{prompt.strip()}
+
+待审校草稿：
+---BEGIN DRAFT---
+{draft}
+---END DRAFT---
+"""
+    parts = [{"text": verify_prompt}]
+    raw_bytes = 0
+    for path in chunk.image_paths:
+        data = path.read_bytes()
+        raw_bytes += len(data)
+        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        parts.append(
+            {
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": base64.b64encode(data).decode("ascii"),
+                }
+            }
+        )
+    estimated = (
+        int(raw_bytes * 4 / 3)
+        + len(verify_prompt.encode("utf-8"))
+        + 64 * 1024
+    )
+    if estimated > MAX_INLINE_REQUEST_BYTES:
+        raise ValueError(
+            f"Verification chunk {chunk.stem} is about "
+            f"{estimated / 1024 / 1024:.1f} MiB after base64, too large. "
+            "Lower images_per_request or dpi."
         )
     return parts, estimated
 
@@ -325,6 +383,7 @@ async def process_chunks(
     concurrency: int,
     keys: list[str],
     thinking_level: str,
+    verification_passes: int,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
@@ -355,6 +414,19 @@ async def process_chunks(
                         chunk.stem,
                         thinking_level,
                     )
+
+                for verify_index in range(verification_passes):
+                    verify_parts, _ = make_verification_parts(chunk, prompt, text)
+                    async with semaphore:
+                        text = await call_gemini(
+                            client,
+                            key_pool,
+                            len(keys),
+                            model,
+                            verify_parts,
+                            f"{chunk.stem}-verify-{verify_index + 1}",
+                            thinking_level,
+                        )
 
                 md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
                 if error_path.exists():
@@ -420,8 +492,20 @@ def parser() -> argparse.ArgumentParser:
         default="high",
         help="Gemini 3 thinking level. Default: high.",
     )
-    p.add_argument("--dpi", type=int, default=180)
-    p.add_argument("--jpeg-quality", type=int, default=88)
+    p.add_argument("--dpi", type=int, default=220)
+    p.add_argument(
+        "--image-format",
+        choices=["png", "jpeg"],
+        default="png",
+        help="Rendered page image format. PNG is lossless and is the default.",
+    )
+    p.add_argument("--jpeg-quality", type=int, default=95)
+    p.add_argument(
+        "--verification-passes",
+        type=int,
+        default=1,
+        help="Extra image-vs-Markdown verification passes after initial transcription.",
+    )
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output")
     return p
@@ -436,6 +520,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("dpi must be between 72 and 300")
     if not 50 <= args.jpeg_quality <= 100:
         raise ValueError("jpeg_quality must be between 50 and 100")
+    if args.image_format not in {"png", "jpeg"}:
+        raise ValueError("image_format must be png or jpeg")
+    if not 0 <= args.verification_passes <= 3:
+        raise ValueError("verification_passes must be between 0 and 3")
     if args.thinking_level not in {"minimal", "low", "medium", "high"}:
         raise ValueError("thinking_level must be minimal, low, medium, or high")
 
@@ -460,7 +548,9 @@ async def async_main(args: argparse.Namespace) -> int:
         f"[config] model={args.model} keys={len(keys)} "
         f"concurrency={args.concurrency} "
         f"images_per_request={args.images_per_request} "
-        f"thinking_level={args.thinking_level}",
+        f"thinking_level={args.thinking_level} "
+        f"image_format={args.image_format} dpi={args.dpi} "
+        f"verification_passes={args.verification_passes}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -477,6 +567,7 @@ async def async_main(args: argparse.Namespace) -> int:
         images_dir,
         args.dpi,
         args.jpeg_quality,
+        args.image_format,
     )
     chunks = build_chunks(image_paths, args.images_per_request, width)
     print(
@@ -492,6 +583,7 @@ async def async_main(args: argparse.Namespace) -> int:
         args.concurrency,
         keys,
         args.thinking_level,
+        args.verification_passes,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -506,7 +598,9 @@ async def async_main(args: argparse.Namespace) -> int:
         "concurrency": args.concurrency,
         "thinking_level": args.thinking_level,
         "dpi": args.dpi,
+        "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality,
+        "verification_passes": args.verification_passes,
         "chunks": [
             {
                 **asdict(chunk),
