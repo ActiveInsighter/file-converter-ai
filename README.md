@@ -183,7 +183,7 @@ jpeg_quality = 90
 
 当前默认使用 **240 DPI + PNG 无损**。PNG 仍会进行无损压缩，但不会损失像素信息；相比真正的未压缩位图，体积小很多而视觉内容完全一致。对于本次 110 页数学 PDF，抽样页约 0.68 MB/页，3 页一组经过 Base64 后仍远低于 Gemini 内联请求大小限制。
 
-默认还会在初次转录后执行 **1 次图片对照审校**，也就是同一页组会经过“转录 → 再对照原图修正”的两阶段处理。可将 `verification_passes` 设为 0 关闭，或提高到 2~3（会增加耗时和 API 用量）。
+默认不会执行额外图片对照审校（`verification_passes = 0`）；如手动开启，则会在初次转录后执行额外审校，也就是同一页组会经过“转录 → 再对照原图修正”的两阶段处理。可将 `verification_passes` 设为 0 关闭，或提高到 2~3（会增加耗时和 API 用量）。
 
 
 ### 数学 PDF 推荐精度策略
@@ -202,18 +202,74 @@ verification_passes = 0
 原因：同一模型进行第二次“整段重写式审校”有时会修正错误，也可能把原本正确的公式改错，所以默认关闭；需要时仍可手动开启。相比单纯继续增加 DPI，Gemini 3 的 `MEDIA_RESOLUTION_ULTRA_HIGH` 会给每张图片分配更高的视觉 token 预算，更适合小字号公式、上下标和矩阵。
 
 
-### API Key 限速
+### Project 级配额与跨 Action 持久化
 
-默认按“每个 Key 独立配额”调度：
+Gemini API 的 RPM/RPD 按 **Google Cloud Project** 计算，而不是按 API Key。仓库现在使用 Project 配额池调度，并把使用状态持久化到专用的 `quota-state` 分支：
 
 ```text
-rpm_per_key = 15
-rpd_per_key = 500
+quota-state
+└── quota-state.json
 ```
 
-调度器不会简单机械轮询，而是保证同一个 Key 两次请求至少间隔约 `60 / rpm_per_key` 秒。遇到 HTTP 429 时会暂停该 Key；如果错误详情显示是每日配额，则该 Key 在本次运行中会被停用并继续尝试其它 Key。
+状态文件只保存 `key#1`、`key#2` 这样的编号和统计信息，**不会保存真实 API Key**。每次 Action 启动都会读取上一次状态；运行中每 10 次请求或约 30 秒 checkpoint，一旦遇到 429 会立即 checkpoint，Action 结束时再强制保存一次。
 
-> Google 官方说明 Gemini API 的限额实际按 **Project** 计算，而不是按 API Key。只有这些 Key 分属不同 Project 时，才能把它们视为真正独立配额；如果多个 Key 属于同一 Project，它们仍共享项目级 RPM/RPD。
+需要在：
+
+**Settings → Secrets and variables → Actions → Variables**
+
+新增 Repository Variable：
+
+```text
+GEMINI_KEY_GROUPS
+```
+
+它与 `GEMINI_API_KEYS` 按行一一对应。例如：
+
+```text
+GEMINI_API_KEYS              GEMINI_KEY_GROUPS
+key1                         p1
+key2                         p1
+key3                         p2
+key4                         p3
+...
+```
+
+表示 `key1` 和 `key2` 属于同一个 Project，共享同一份 RPM/RPD；`key3` 属于另一 Project。
+
+实际 Variable 只填写右侧组名，每行一个：
+
+```text
+p1
+p1
+p2
+p3
+p4
+p5
+p6
+p7
+p8
+p9
+```
+
+如果不设置 `GEMINI_KEY_GROUPS`，为了兼容旧配置，程序会暂时把每个 Key 当成独立 Project。
+
+现有 workflow input 名 `rpm_per_key` / `rpd_per_key` 为了兼容 n8n 调用暂时保留，但**现在语义是每个 Project 配额池的 RPM/RPD**：
+
+```text
+rpm_per_key = 15   # 实际：每个 Project 15 RPM
+rpd_per_key = 500  # 实际：每个 Project 500 RPD
+```
+
+调度器会：
+
+- 在同一 Project 内轮换多个 Key，但共享同一个 RPM/RPD 计数；
+- 跨 Action 继承当天已经消耗的请求数和最近一分钟请求时间；
+- Google 返回项目级 429 时，立即更新该 Project 的 cooldown；
+- 识别到 `limit: 500` 等日额度耗尽信息时，把整个 Project 标记为当天 exhausted，跳过其所有 Key；
+- 到 **Pacific Time 新的一天**时自动重置 RPD 状态；
+- 每次 Artifact 额外输出 `quota-usage.json`，便于查看本次/累计 Project 与 Key 使用情况。
+
+GitHub workflow 本身使用同一个 concurrency group 排队，因此多个 PDF 任务可以同时提交，但 Gemini 阶段一次只运行一个 Action，避免跨 Action 抢同一组 Project 配额。
 
 ## AnyWorkflow Remote integration
 
