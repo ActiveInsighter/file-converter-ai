@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:25:26.185169Z",
+  "updated_at": "2026-09-27T16:25:57.594920Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -61,38 +61,37 @@
       "errors": 2
     },
     "project-5": {
-      "requests_today": 87,
+      "requests_today": 90,
       "recent_requests": [
-        "2026-09-27T16:24:31.000742Z",
-        "2026-09-27T16:24:39.469100Z",
-        "2026-09-27T16:24:53.909634Z",
         "2026-09-27T16:25:11.355458Z",
         "2026-09-27T16:25:16.394526Z",
-        "2026-09-27T16:25:22.507569Z"
+        "2026-09-27T16:25:22.507569Z",
+        "2026-09-27T16:25:39.098469Z",
+        "2026-09-27T16:25:44.196184Z",
+        "2026-09-27T16:25:57.594913Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 83,
+      "success": 87,
       "http_429": 0,
       "errors": 0
     },
     "project-6": {
-      "requests_today": 33,
+      "requests_today": 35,
       "recent_requests": [
-        "2026-09-27T16:24:55.108047Z",
-        "2026-09-27T16:25:26.185161Z"
+        "2026-09-27T16:25:26.185161Z",
+        "2026-09-27T16:25:39.724957Z",
+        "2026-09-27T16:25:46.731341Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 32,
+      "success": 33,
       "http_429": 0,
       "errors": 0
     },
     "project-7": {
       "requests_today": 8,
-      "recent_requests": [
-        "2026-09-27T16:24:56.237864Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 8,
@@ -168,16 +167,16 @@
     },
     "5": {
       "project": "project-5",
-      "requests": 87,
-      "success": 83,
+      "requests": 90,
+      "success": 87,
       "http_429": 0,
       "errors": 0,
       "disabled": false
     },
     "6": {
       "project": "project-6",
-      "requests": 33,
-      "success": 32,
+      "requests": 35,
+      "success": 33,
       "http_429": 0,
       "errors": 0,
       "disabled": false
