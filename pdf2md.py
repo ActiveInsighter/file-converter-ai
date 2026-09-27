@@ -173,18 +173,70 @@ def extract_response_text(payload: dict) -> str:
     texts = []
     for candidate in payload.get("candidates", []):
         for part in (candidate.get("content") or {}).get("parts", []):
+            if part.get("thought"):
+                continue
             if part.get("text"):
                 texts.append(part["text"])
 
     result = "\n".join(texts).strip()
     if not result:
+        finish_reasons = [
+            candidate.get("finishReason")
+            for candidate in payload.get("candidates", [])
+            if candidate.get("finishReason")
+        ]
         raise RuntimeError(
-            f"Gemini returned no text. promptFeedback={payload.get('promptFeedback') or {}}"
+            "Gemini returned no answer text. "
+            f"finishReasons={finish_reasons}, "
+            f"promptFeedback={payload.get('promptFeedback') or {}}"
         )
 
     if result.startswith("~~~markdown") and result.endswith("~~~"):
         result = result[len("~~~markdown") : -3].strip()
+    if result.startswith("```markdown") and result.endswith("```"):
+        result = result[len("```markdown") : -3].strip()
+    elif result.startswith("```md") and result.endswith("```"):
+        result = result[len("```md") : -3].strip()
     return result
+
+
+def validate_markdown_output(text: str) -> None:
+    """Reject clear formatting failures so the request can be retried."""
+    if "\ufffd" in text:
+        raise RuntimeError("Markdown contains Unicode replacement characters")
+
+    if "此行视具体排版" in text:
+        raise RuntimeError("Markdown contains model-side layout commentary")
+
+    # Inline math must open and close on the same line. Display math ($$) is
+    # removed before counting single-dollar delimiters.
+    bad_math_lines = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        without_display = line.replace("$$", "")
+        without_escaped = without_display.replace("\\$", "")
+        if without_escaped.count("$") % 2:
+            bad_math_lines.append(line_no)
+            if len(bad_math_lines) >= 5:
+                break
+    if bad_math_lines:
+        raise RuntimeError(
+            f"Markdown has unbalanced inline-math delimiters on lines {bad_math_lines}"
+        )
+
+    # Catch OCR/model artifacts such as a four-digit code repeated as its own
+    # line many times in one response.
+    numeric_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if re.fullmatch(r"\d{4,8}", line.strip())
+    ]
+    if numeric_lines:
+        counts = {value: numeric_lines.count(value) for value in set(numeric_lines)}
+        repeated = {value: count for value, count in counts.items() if count >= 3}
+        if repeated:
+            raise RuntimeError(
+                f"Markdown contains repeated standalone numeric artifacts: {repeated}"
+            )
 
 
 async def call_gemini(
@@ -220,7 +272,20 @@ async def call_gemini(
                 json=payload,
             )
             if response.status_code == 200:
-                return extract_response_text(response.json())
+                try:
+                    text = extract_response_text(response.json())
+                    validate_markdown_output(text)
+                    return text
+                except RuntimeError as exc:
+                    last_error = exc
+                    print(
+                        f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
+                        f"{exc}; rotating key",
+                        flush=True,
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(min(2 ** (attempt - 1), 20))
+                    continue
 
             message = response.text[:2000]
             if response.status_code in {400, 404}:
