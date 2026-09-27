@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:05:20.498541Z",
+  "updated_at": "2026-09-27T16:05:53.575554Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -27,23 +27,23 @@
       "errors": 0
     },
     "project-3": {
-      "requests_today": 84,
+      "requests_today": 87,
       "recent_requests": [
-        "2026-09-27T16:04:23.853112Z",
-        "2026-09-27T16:04:31.352928Z",
-        "2026-09-27T16:04:40.606448Z",
-        "2026-09-27T16:05:20.498534Z"
+        "2026-09-27T16:05:20.498534Z",
+        "2026-09-27T16:05:42.830509Z",
+        "2026-09-27T16:05:49.158466Z",
+        "2026-09-27T16:05:53.575546Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 79,
+      "success": 82,
       "http_429": 0,
       "errors": 1
     },
     "project-4": {
-      "requests_today": 42,
+      "requests_today": 43,
       "recent_requests": [
-        "2026-09-27T16:04:25.025743Z"
+        "2026-09-27T16:05:50.652814Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
@@ -53,12 +53,10 @@
     },
     "project-5": {
       "requests_today": 11,
-      "recent_requests": [
-        "2026-09-27T16:04:27.935438Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 10,
+      "success": 11,
       "http_429": 0,
       "errors": 0
     },
@@ -133,15 +131,15 @@
     },
     "3": {
       "project": "project-3",
-      "requests": 84,
-      "success": 79,
+      "requests": 87,
+      "success": 82,
       "http_429": 0,
       "errors": 1,
       "disabled": false
     },
     "4": {
       "project": "project-4",
-      "requests": 42,
+      "requests": 43,
       "success": 41,
       "http_429": 0,
       "errors": 1,
@@ -150,7 +148,7 @@
     "5": {
       "project": "project-5",
       "requests": 11,
-      "success": 10,
+      "success": 11,
       "http_429": 0,
       "errors": 0,
       "disabled": false
