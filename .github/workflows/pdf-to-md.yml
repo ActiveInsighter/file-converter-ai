@@ -81,6 +81,16 @@ on:
         required: true
         default: "500"
         type: string
+      start_page:
+        description: "Optional first PDF page to process (1-based)"
+        required: false
+        default: ""
+        type: string
+      end_page:
+        description: "Optional last PDF page to process (1-based)"
+        required: false
+        default: ""
+        type: string
 
   repository_dispatch:
     types: [pdf_to_md]
@@ -107,6 +117,8 @@ jobs:
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '15' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || github.event.client_payload.rpd_per_key || '500' }}
+      START_PAGE: ${{ github.event.inputs.start_page || github.event.client_payload.start_page || '' }}
+      END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
     steps:
@@ -157,6 +169,12 @@ jobs:
           )
           if [[ -n "${USER_PROMPT}" ]]; then
             args+=(--prompt "${USER_PROMPT}")
+          fi
+          if [[ -n "${START_PAGE}" ]]; then
+            args+=(--start-page "${START_PAGE}")
+          fi
+          if [[ -n "${END_PAGE}" ]]; then
+            args+=(--end-page "${END_PAGE}")
           fi
           python pdf2md.py "${args[@]}"
 
