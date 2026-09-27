@@ -1,0 +1,82 @@
+name: Flash availability probe
+
+on:
+  push:
+    branches:
+      - bench/flash-math-accuracy
+    paths:
+      - ".github/workflows/flash-availability-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Probe text-only and single-image availability
+        run: |
+          python - <<'PY'
+          import base64, json, os, re, time
+          from pathlib import Path
+          import fitz, gdown, httpx
+
+          keys=[x.strip() for x in re.split(r'[\r\n,;]+', os.environ['GEMINI_API_KEYS']) if x.strip()]
+          key=keys[9]
+          models=['gemini-3.6-flash','gemini-3.7-flash','gemini-3.8-flash']
+
+          pdf=Path('probe.pdf')
+          gdown.download(url=os.environ['SOURCE_URL'],output=str(pdf),quiet=True,fuzzy=True)
+          doc=fitz.open(pdf)
+          pix=doc[10].get_pixmap(matrix=fitz.Matrix(240/72,240/72),alpha=False)
+          img=pix.tobytes('jpeg',jpg_quality=95)
+          doc.close()
+          b64=base64.b64encode(img).decode('ascii')
+
+          client=httpx.Client(timeout=180.0)
+          results=[]
+          for model in models:
+              for kind in ['text','image']:
+                  if kind=='text':
+                      parts=[{'text':'Reply only with OK.'}]
+                  else:
+                      parts=[
+                        {'text':'Transcribe the main mathematical formula on this page exactly. Return only the formula.'},
+                        {'inlineData':{'mimeType':'image/jpeg','data':b64},'mediaResolution':{'level':'MEDIA_RESOLUTION_HIGH'}}
+                      ]
+                  payload={
+                    'contents':[{'role':'user','parts':parts}],
+                    'generationConfig':{'thinkingConfig':{'thinkingLevel':'high'}}
+                  }
+                  started=time.time()
+                  r=client.post(
+                    f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+                    headers={'x-goog-api-key':key,'Content-Type':'application/json'},
+                    json=payload,
+                  )
+                  elapsed=round(time.time()-started,2)
+                  body=r.text[:1600]
+                  print(f'[probe] model={model} kind={kind} status={r.status_code} elapsed={elapsed}s body={body}',flush=True)
+                  results.append({'model':model,'kind':kind,'status':r.status_code,'elapsed':elapsed,'body':body})
+                  time.sleep(13)
+          Path('probe-results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flash-availability-probe-${{ github.run_id }}
+          path: probe-results.json
+          retention-days: 2
