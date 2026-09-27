@@ -40,7 +40,7 @@ on:
       dpi:
         description: "PDF render DPI"
         required: true
-        default: "220"
+        default: "240"
         type: string
       image_format:
         description: "Rendered page format; PNG is lossless"
@@ -58,8 +58,19 @@ on:
       verification_passes:
         description: "Extra image-vs-Markdown verification passes"
         required: true
-        default: "1"
+        default: "0"
         type: string
+      media_resolution:
+        description: "Gemini per-image media resolution"
+        required: true
+        default: "ultra_high"
+        type: choice
+        options:
+          - ultra_high
+          - high
+          - medium
+          - low
+          - unspecified
 
   repository_dispatch:
     types: [pdf_to_md]
@@ -79,10 +90,11 @@ jobs:
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
-      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '220' }}
+      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
-      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '1' }}
+      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '0' }}
+      MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
     steps:
@@ -125,6 +137,7 @@ jobs:
             --image-format "${IMAGE_FORMAT}"
             --jpeg-quality "${JPEG_QUALITY}"
             --verification-passes "${VERIFICATION_PASSES}"
+            --media-resolution "${MEDIA_RESOLUTION}"
             --work-dir work
             --output-dir output
           )
