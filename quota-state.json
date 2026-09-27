@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:17:58.346567Z",
+  "updated_at": "2026-09-27T16:18:43.713954Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -44,33 +44,39 @@
       "errors": 1
     },
     "project-4": {
-      "requests_today": 114,
+      "requests_today": 118,
       "recent_requests": [
-        "2026-09-27T16:17:17.468908Z",
-        "2026-09-27T16:17:23.628402Z",
-        "2026-09-27T16:17:31.965875Z",
-        "2026-09-27T16:17:41.700888Z",
         "2026-09-27T16:17:51.175010Z",
-        "2026-09-27T16:17:58.346559Z"
+        "2026-09-27T16:17:58.346559Z",
+        "2026-09-27T16:18:03.976940Z",
+        "2026-09-27T16:18:10.788306Z",
+        "2026-09-27T16:18:21.707258Z",
+        "2026-09-27T16:18:43.713947Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 107,
+      "success": 114,
       "http_429": 0,
       "errors": 2
     },
     "project-5": {
-      "requests_today": 45,
-      "recent_requests": [],
+      "requests_today": 48,
+      "recent_requests": [
+        "2026-09-27T16:18:00.127643Z",
+        "2026-09-27T16:18:13.974255Z",
+        "2026-09-27T16:18:21.963431Z"
+      ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 45,
+      "success": 46,
       "http_429": 0,
       "errors": 0
     },
     "project-6": {
-      "requests_today": 13,
-      "recent_requests": [],
+      "requests_today": 14,
+      "recent_requests": [
+        "2026-09-27T16:18:14.908639Z"
+      ],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 13,
@@ -147,23 +153,23 @@
     },
     "4": {
       "project": "project-4",
-      "requests": 114,
-      "success": 107,
+      "requests": 118,
+      "success": 114,
       "http_429": 0,
       "errors": 2,
       "disabled": false
     },
     "5": {
       "project": "project-5",
-      "requests": 45,
-      "success": 45,
+      "requests": 48,
+      "success": 46,
       "http_429": 0,
       "errors": 0,
       "disabled": false
     },
     "6": {
       "project": "project-6",
-      "requests": 13,
+      "requests": 14,
       "success": 13,
       "http_429": 0,
       "errors": 0,
