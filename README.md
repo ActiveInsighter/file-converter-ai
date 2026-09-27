@@ -54,7 +54,7 @@ AIza...key10
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
 | `concurrency` | 最大 Gemini 并发请求数 | `5` |
 | `prompt` | 自定义提示词；留空使用内置 Markdown 转换提示词 | 空 |
-| `model` | Gemini 模型 ID | `gemini-3.8-flash` |
+| `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
 | `dpi` | PDF 渲染 DPI | `180` |
 | `jpeg_quality` | JPEG 质量 | `88` |
 
@@ -100,7 +100,7 @@ Content-Type: application/json
     "images_per_request": 3,
     "concurrency": 10,
     "prompt": "请准确识别页面内容并转换为 Markdown，公式使用 LaTeX。",
-    "model": "gemini-3.8-flash",
+    "model": "gemini-3.5-flash-lite",
     "dpi": 180,
     "jpeg_quality": 88
   }
