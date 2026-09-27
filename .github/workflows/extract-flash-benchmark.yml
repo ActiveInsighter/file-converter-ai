@@ -1,0 +1,48 @@
+name: Extract compact Flash benchmark
+
+on:
+  push:
+    branches:
+      - bench/flash-math-accuracy
+    paths:
+      - ".github/workflows/extract-flash-benchmark.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download 3.5 Lite artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flash-benchmark-gemini-3.5-flash-lite-36331942330
+          path: full-35
+          github-token: ${{ github.token }}
+          run-id: 36331942330
+
+      - name: Download 3.8 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flash-benchmark-gemini-3.8-flash-36331942330
+          path: full-38
+          github-token: ${{ github.token }}
+          run-id: 36331942330
+
+      - name: Keep only outputs
+        run: |
+          mkdir -p compact/gemini-3.5-flash-lite compact/gemini-3.8-flash
+          cp -r full-35/batch-* compact/gemini-3.5-flash-lite/ 2>/dev/null || true
+          cp full-35/manifest.json compact/gemini-3.5-flash-lite/ 2>/dev/null || true
+          cp -r full-38/batch-* compact/gemini-3.8-flash/ 2>/dev/null || true
+          cp full-38/manifest.json compact/gemini-3.8-flash/ 2>/dev/null || true
+          find compact -type f -maxdepth 5 -print
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compact-flash-benchmark-${{ github.run_id }}
+          path: compact/
+          retention-days: 2
