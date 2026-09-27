@@ -1,0 +1,53 @@
+name: Temporary streaming benchmark
+
+on:
+  push:
+    branches:
+      - feat/sharded-parallel
+    paths:
+      - ".github/workflows/stream-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run streaming full-book benchmark
+        run: |
+          python pdf2md_stream.py \
+            --source-url "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk" \
+            --concurrency 30 \
+            --model "gemini-3.5-flash-lite" \
+            --thinking-level high \
+            --dpi 240 \
+            --image-format png \
+            --jpeg-quality 95 \
+            --media-resolution ultra_high \
+            --rpm-per-key 12 \
+            --rpd-per-key 500 \
+            --work-dir work-stream \
+            --output-dir output-stream
+
+      - name: Upload streaming result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: streaming-result-${{ github.run_id }}
+          path: output-stream/
+          if-no-files-found: warn
+          retention-days: 1
