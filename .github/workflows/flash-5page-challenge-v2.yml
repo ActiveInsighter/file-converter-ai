@@ -1,0 +1,48 @@
+name: Flash 5-page challenge v2
+
+on:
+  push:
+    branches:
+      - bench/flash-math-accuracy
+    paths:
+      - ".github/workflows/flash-5page-challenge-v2.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  challenge:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model:
+          - gemini-3.6-flash
+          - gemini-3.7-flash
+          - gemini-3.8-flash
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run 5-page challenge
+        run: |
+          python flash_challenge5.py \
+            --model "${{ matrix.model }}" \
+            --source-url "${SOURCE_URL}" \
+            --output "challenge/${{ matrix.model }}/result.md"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: challenge5-${{ matrix.model }}-${{ github.run_id }}
+          path: challenge/${{ matrix.model }}/
+          if-no-files-found: warn
+          retention-days: 2
