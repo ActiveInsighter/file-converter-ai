@@ -377,6 +377,11 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     print(f"[download] {args.source_url}", flush=True)
     await asyncio.to_thread(download_pdf, args.source_url, source_pdf)
+    with source_pdf.open("rb") as handle:
+        if handle.read(5) != b"%PDF-":
+            raise RuntimeError(
+                "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
+            )
 
     image_paths, width = await asyncio.to_thread(
         render_pdf,
