@@ -374,37 +374,30 @@ def _single_dollar_positions(line: str) -> list[int]:
 
 
 def repair_multiline_math_delimiters(text: str) -> tuple[str, list[int]]:
-    """Repair the common case where display math uses one $ across lines.
+    """Join lines when an inline $...$ formula was split by a newline.
 
-    We only touch paired odd-dollar lines that are close together. Any
-    remaining suspicious lines are returned as warnings instead of causing
-    a full-page model retry.
+    This preserves the model's delimiters and only removes the newline inside
+    an already-open inline-math span. It is safer than re-generating the page
+    or changing the span to display math.
     """
-    lines = text.splitlines()
-    odd = [
-        i
-        for i, line in enumerate(lines)
-        if len(_single_dollar_positions(line)) % 2 == 1
-    ]
+    source_lines = text.splitlines()
+    if not source_lines:
+        return text, []
 
-    repaired = set()
-    for left, right in zip(odd[0::2], odd[1::2]):
-        if right - left > 12:
-            continue
-        left_pos = _single_dollar_positions(lines[left])
-        right_pos = _single_dollar_positions(lines[right])
-        if not left_pos or not right_pos:
-            continue
+    output: list[str] = []
+    inline_open = False
 
-        lp = left_pos[0]
-        rp = right_pos[-1]
-        lines[left] = lines[left][:lp] + "$" + lines[left][lp + 1 :]
-        # right position may shift only within its own line, so original index is fine.
-        lines[right] = lines[right][:rp] + "$" + lines[right][rp + 1 :]
-        repaired.add(left)
-        repaired.add(right)
+    for line in source_lines:
+        if inline_open and output:
+            output[-1] = output[-1].rstrip() + " " + line.lstrip()
+        else:
+            output.append(line)
 
-    result = "\n".join(lines)
+        # Recompute state from the newly appended/current logical line.
+        single_count = len(_single_dollar_positions(output[-1]))
+        inline_open = single_count % 2 == 1
+
+    result = "\n".join(output)
     remaining = [
         i + 1
         for i, line in enumerate(result.splitlines())
