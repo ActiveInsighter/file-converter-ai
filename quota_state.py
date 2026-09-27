@@ -438,6 +438,33 @@ class ProjectQuotaPool:
             project["errors"] = int(project.get("errors", 0)) + 1
             key_state["errors"] = int(key_state.get("errors", 0)) + 1
 
+    def is_daily_quota_message(self, message: str) -> bool:
+        lower = message.lower()
+        explicit_daily_markers = (
+            "perday",
+            "per_day",
+            "per day",
+            "requestsperday",
+            "requests per day",
+            "daily",
+        )
+        if any(marker in lower for marker in explicit_daily_markers):
+            return True
+
+        # Gemini sometimes omits the quota-id and only prints the numeric
+        # limit in the human-readable message. Treat an exceeded request quota
+        # whose advertised limit matches the configured project RPD as daily.
+        limit_match = __import__("re").search(
+            r"quota exceeded for metric:[^\n]*requests[^\n]*limit:\s*(\d+)",
+            lower,
+        )
+        if limit_match:
+            try:
+                return int(limit_match.group(1)) == int(self.rpd_per_project)
+            except ValueError:
+                pass
+        return False
+
     async def rate_limited(
         self,
         key_index: int,
@@ -453,6 +480,10 @@ class ProjectQuotaPool:
 
             if daily_exhausted:
                 project["daily_exhausted"] = True
+                project["requests_today"] = max(
+                    int(project.get("requests_today", 0)),
+                    self.rpd_per_project,
+                )
             else:
                 until = datetime.fromtimestamp(
                     time.time() + cooldown_seconds,
