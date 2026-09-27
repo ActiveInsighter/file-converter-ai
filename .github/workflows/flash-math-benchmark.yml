@@ -1,0 +1,98 @@
+name: Flash math accuracy benchmark
+
+on:
+  push:
+    branches:
+      - bench/flash-math-accuracy
+    paths:
+      - ".github/workflows/flash-math-benchmark.yml"
+      - "benchmark_flash_models.py"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        model:
+          - gemini-3.5-flash-lite
+          - gemini-3.6-flash
+          - gemini-3.7-flash
+          - gemini-3.8-flash
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run math benchmark
+        run: |
+          python benchmark_flash_models.py \
+            --model "${{ matrix.model }}" \
+            --source-url "${SOURCE_URL}" \
+            --out-dir "benchmark/${{ matrix.model }}" \
+            --key-index 10 \
+            --rpm 5 \
+            --daily-limit 20
+
+      - name: Upload model benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-benchmark-${{ matrix.model }}-${{ github.run_id }}
+          path: benchmark/${{ matrix.model }}/
+          if-no-files-found: warn
+          retention-days: 2
+
+  collect:
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: flash-benchmark-*
+          path: all-results
+
+      - name: Summarize manifests
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          rows = []
+          for path in sorted(Path("all-results").glob("**/manifest.json")):
+              data = json.loads(path.read_text(encoding="utf-8"))
+              rows.append({
+                  "model": data["model"],
+                  "requests_used": data["requests_used"],
+                  "total_elapsed_seconds": data["total_elapsed_seconds"],
+                  "batch3_missing": data["modes"]["batch-3"]["missing_pages"],
+                  "batch5_missing": data["modes"]["batch-5"]["missing_pages"],
+              })
+          print(json.dumps(rows, ensure_ascii=False, indent=2))
+          Path("all-results/summary.json").write_text(
+              json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flash-math-benchmark-combined-${{ github.run_id }}
+          path: all-results/
+          retention-days: 2
