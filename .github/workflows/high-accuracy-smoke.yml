@@ -1,4 +1,4 @@
-name: Temporary high-accuracy PDF2MD test
+name: Temporary ultra-high PDF2MD test
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Run full PDF high-accuracy test
+      - name: Run full PDF ultra-high test
         run: |
           python pdf2md.py \
             --source-url "https://drive.google.com/file/d/14EPNh_iAdchuEcz7Y-jBMXVZJ9AA2aoi/view?usp=drivesdk" \
@@ -40,7 +40,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: high-accuracy-result-${{ github.run_id }}
+          name: ultra-high-result-${{ github.run_id }}
           path: output/
           if-no-files-found: warn
           retention-days: 1
