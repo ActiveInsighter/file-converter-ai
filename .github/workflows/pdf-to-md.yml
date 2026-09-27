@@ -40,12 +40,25 @@ on:
       dpi:
         description: "PDF render DPI"
         required: true
-        default: "180"
+        default: "220"
         type: string
-      jpeg_quality:
-        description: "JPEG quality (50-100)"
+      image_format:
+        description: "Rendered page format; PNG is lossless"
         required: true
-        default: "88"
+        default: "png"
+        type: choice
+        options:
+          - png
+          - jpeg
+      jpeg_quality:
+        description: "JPEG quality (50-100; ignored for PNG)"
+        required: true
+        default: "95"
+        type: string
+      verification_passes:
+        description: "Extra image-vs-Markdown verification passes"
+        required: true
+        default: "1"
         type: string
 
   repository_dispatch:
@@ -66,8 +79,10 @@ jobs:
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
-      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '180' }}
-      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '88' }}
+      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '220' }}
+      IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
+      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
+      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '1' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
     steps:
@@ -107,7 +122,9 @@ jobs:
             --model "${MODEL}"
             --thinking-level "${THINKING_LEVEL}"
             --dpi "${DPI}"
+            --image-format "${IMAGE_FORMAT}"
             --jpeg-quality "${JPEG_QUALITY}"
+            --verification-passes "${VERIFICATION_PASSES}"
             --work-dir work
             --output-dir output
           )
