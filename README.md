@@ -56,10 +56,11 @@ AIza...key10
 | `prompt` | 自定义提示词；留空使用内置 Markdown 转换提示词 | 空 |
 | `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
 | `thinking_level` | Gemini 思考深度 | `high` |
-| `dpi` | PDF 渲染 DPI | `220` |
+| `dpi` | PDF 渲染 DPI | `240` |
 | `image_format` | 页面图像格式，PNG 为无损 | `png` |
 | `jpeg_quality` | JPEG 质量（PNG 时忽略） | `95` |
-| `verification_passes` | 初次转录后再对照图片审校的次数 | `1` |
+| `verification_passes` | 初次转录后再对照图片审校的次数 | `0` |
+| `media_resolution` | Gemini 每张图片的视觉分辨率预算 | `ultra_high` |
 
 例如 10 页 PDF 且：
 
@@ -105,10 +106,10 @@ Content-Type: application/json
     "prompt": "请准确识别页面内容并转换为 Markdown，公式使用 LaTeX。",
     "model": "gemini-3.5-flash-lite",
     "thinking_level": "high",
-    "dpi": 220,
+    "dpi": 240,
     "image_format": "png",
     "jpeg_quality": 95,
-    "verification_passes": 1
+    "verification_passes": 0
   }
 }
 ```
@@ -146,7 +147,7 @@ concurrency = 5~10
 dpi = 220
 image_format = png
 jpeg_quality = 95
-verification_passes = 1
+verification_passes = 0
 ```
 
 确认你的 Google AI Studio 项目实际限流后，再逐步增加并发。
@@ -180,6 +181,22 @@ jpeg_quality = 90
 
 ### 默认图像质量
 
-当前默认使用 **220 DPI + PNG 无损**。PNG 仍会进行无损压缩，但不会损失像素信息；相比真正的未压缩位图，体积小很多而视觉内容完全一致。对于本次 110 页数学 PDF，抽样页约 0.68 MB/页，3 页一组经过 Base64 后仍远低于 Gemini 内联请求大小限制。
+当前默认使用 **240 DPI + PNG 无损**。PNG 仍会进行无损压缩，但不会损失像素信息；相比真正的未压缩位图，体积小很多而视觉内容完全一致。对于本次 110 页数学 PDF，抽样页约 0.68 MB/页，3 页一组经过 Base64 后仍远低于 Gemini 内联请求大小限制。
 
 默认还会在初次转录后执行 **1 次图片对照审校**，也就是同一页组会经过“转录 → 再对照原图修正”的两阶段处理。可将 `verification_passes` 设为 0 关闭，或提高到 2~3（会增加耗时和 API 用量）。
+
+
+### 数学 PDF 推荐精度策略
+
+对公式密集型 PDF，默认配置现在是：
+
+```text
+images_per_request = 1
+dpi = 240
+image_format = png
+thinking_level = high
+media_resolution = ultra_high
+verification_passes = 0
+```
+
+原因：同一模型进行第二次“整段重写式审校”有时会修正错误，也可能把原本正确的公式改错，所以默认关闭；需要时仍可手动开启。相比单纯继续增加 DPI，Gemini 3 的 `MEDIA_RESOLUTION_ULTRA_HIGH` 会给每张图片分配更高的视觉 token 预算，更适合小字号公式、上下标和矩阵。
