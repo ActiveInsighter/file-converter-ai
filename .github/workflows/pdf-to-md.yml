@@ -98,6 +98,12 @@ on:
 permissions:
   contents: read
 
+# All PDF conversion runs share the same Gemini key pool.
+# Queue runs instead of letting separate Actions race the same API quotas.
+concurrency:
+  group: md-to-pdf-gemini-api
+  queue: max
+
 jobs:
   convert:
     runs-on: ubuntu-latest
