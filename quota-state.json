@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:04:31.352936Z",
+  "updated_at": "2026-09-27T16:05:20.498541Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -27,32 +27,27 @@
       "errors": 0
     },
     "project-3": {
-      "requests_today": 82,
+      "requests_today": 84,
       "recent_requests": [
-        "2026-09-27T16:03:41.141575Z",
-        "2026-09-27T16:03:53.077541Z",
-        "2026-09-27T16:03:59.447976Z",
-        "2026-09-27T16:04:07.625126Z",
-        "2026-09-27T16:04:13.908071Z",
         "2026-09-27T16:04:23.853112Z",
-        "2026-09-27T16:04:31.352928Z"
+        "2026-09-27T16:04:31.352928Z",
+        "2026-09-27T16:04:40.606448Z",
+        "2026-09-27T16:05:20.498534Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 78,
+      "success": 79,
       "http_429": 0,
       "errors": 1
     },
     "project-4": {
       "requests_today": 42,
       "recent_requests": [
-        "2026-09-27T16:04:07.782760Z",
-        "2026-09-27T16:04:14.959026Z",
         "2026-09-27T16:04:25.025743Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 40,
+      "success": 41,
       "http_429": 0,
       "errors": 1
     },
@@ -138,8 +133,8 @@
     },
     "3": {
       "project": "project-3",
-      "requests": 82,
-      "success": 78,
+      "requests": 84,
+      "success": 79,
       "http_429": 0,
       "errors": 1,
       "disabled": false
@@ -147,7 +142,7 @@
     "4": {
       "project": "project-4",
       "requests": 42,
-      "success": 40,
+      "success": 41,
       "http_429": 0,
       "errors": 1,
       "disabled": false
