@@ -63,7 +63,8 @@ class KeyPool:
             raise ValueError("rpd_per_key must be > 0")
 
         self.keys = keys
-        self.interval = 60.0 / rpm_per_key
+        # Keep a small safety margin for provider sliding-window accounting.
+        self.interval = (60.0 / rpm_per_key) * 1.08
         self.rpd_per_key = rpd_per_key
         self.next_allowed = [0.0 for _ in keys]
         self.cooldown_until = [0.0 for _ in keys]
@@ -162,7 +163,9 @@ def render_pdf(
     dpi: int,
     jpeg_quality: int,
     image_format: str,
-) -> tuple[list[Path], int]:
+    start_page: int | None,
+    end_page: int | None,
+) -> tuple[list[Path], int, int]:
     image_dir.mkdir(parents=True, exist_ok=True)
     document = fitz.open(pdf_path)
     total_pages = document.page_count
@@ -173,19 +176,31 @@ def render_pdf(
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     paths: list[Path] = []
 
+    first = 1 if start_page is None else start_page
+    last = total_pages if end_page is None else end_page
+    if first < 1 or last > total_pages or first > last:
+        document.close()
+        raise ValueError(
+            f"Invalid page range {first}-{last}; PDF has {total_pages} pages"
+        )
+
     extension = "png" if image_format == "png" else "jpg"
-    for index, page in enumerate(document, start=1):
+    for page_number in range(first, last + 1):
+        page = document[page_number - 1]
         pix = page.get_pixmap(matrix=matrix, alpha=False)
-        path = image_dir / f"{index:0{width}d}.{extension}"
+        path = image_dir / f"{page_number:0{width}d}.{extension}"
         if image_format == "png":
             path.write_bytes(pix.tobytes("png"))
         else:
             path.write_bytes(pix.tobytes("jpeg", jpg_quality=jpeg_quality))
         paths.append(path)
-        print(f"[render] {index}/{total_pages}: {path.name}", flush=True)
+        print(
+            f"[render] {page_number}/{total_pages}: {path.name}",
+            flush=True,
+        )
 
     document.close()
-    return paths, width
+    return paths, width, total_pages
 
 
 def build_chunks(
@@ -194,8 +209,8 @@ def build_chunks(
     chunks = []
     for offset in range(0, len(image_paths), images_per_request):
         batch = tuple(image_paths[offset : offset + images_per_request])
-        start_page = offset + 1
-        end_page = offset + len(batch)
+        start_page = int(batch[0].stem)
+        end_page = int(batch[-1].stem)
         stem = (
             f"{start_page:0{width}d}"
             if start_page == end_page
@@ -337,6 +352,67 @@ def extract_response_text(payload: dict) -> str:
     return result
 
 
+def _single_dollar_positions(line: str) -> list[int]:
+    positions = []
+    i = 0
+    while i < len(line):
+        if line[i] != "$":
+            i += 1
+            continue
+        if i > 0 and line[i - 1] == "\\":
+            i += 1
+            continue
+        if i + 1 < len(line) and line[i + 1] == "$":
+            i += 2
+            continue
+        if i > 0 and line[i - 1] == "$":
+            i += 1
+            continue
+        positions.append(i)
+        i += 1
+    return positions
+
+
+def repair_multiline_math_delimiters(text: str) -> tuple[str, list[int]]:
+    """Repair the common case where display math uses one $ across lines.
+
+    We only touch paired odd-dollar lines that are close together. Any
+    remaining suspicious lines are returned as warnings instead of causing
+    a full-page model retry.
+    """
+    lines = text.splitlines()
+    odd = [
+        i
+        for i, line in enumerate(lines)
+        if len(_single_dollar_positions(line)) % 2 == 1
+    ]
+
+    repaired = set()
+    for left, right in zip(odd[0::2], odd[1::2]):
+        if right - left > 12:
+            continue
+        left_pos = _single_dollar_positions(lines[left])
+        right_pos = _single_dollar_positions(lines[right])
+        if not left_pos or not right_pos:
+            continue
+
+        lp = left_pos[0]
+        rp = right_pos[-1]
+        lines[left] = lines[left][:lp] + "$" + lines[left][lp + 1 :]
+        # right position may shift only within its own line, so original index is fine.
+        lines[right] = lines[right][:rp] + "$" + lines[right][rp + 1 :]
+        repaired.add(left)
+        repaired.add(right)
+
+    result = "\n".join(lines)
+    remaining = [
+        i + 1
+        for i, line in enumerate(result.splitlines())
+        if len(_single_dollar_positions(line)) % 2 == 1
+    ]
+    return result, remaining
+
+
 def validate_markdown_output(text: str) -> None:
     """Reject clear formatting failures so the request can be retried."""
     if "\ufffd" in text:
@@ -344,21 +420,6 @@ def validate_markdown_output(text: str) -> None:
 
     if "此行视具体排版" in text:
         raise RuntimeError("Markdown contains model-side layout commentary")
-
-    # Inline math must open and close on the same line. Display math ($$) is
-    # removed before counting single-dollar delimiters.
-    bad_math_lines = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        without_display = line.replace("$$", "")
-        without_escaped = without_display.replace("\\$", "")
-        if without_escaped.count("$") % 2:
-            bad_math_lines.append(line_no)
-            if len(bad_math_lines) >= 5:
-                break
-    if bad_math_lines:
-        raise RuntimeError(
-            f"Markdown has unbalanced inline-math delimiters on lines {bad_math_lines}"
-        )
 
     # Catch OCR/model artifacts such as a four-digit code repeated as its own
     # line many times in one response.
@@ -411,6 +472,14 @@ async def call_gemini(
             if response.status_code == 200:
                 try:
                     text = extract_response_text(response.json())
+                    text, math_warnings = repair_multiline_math_delimiters(text)
+                    if math_warnings:
+                        print(
+                            f"[warning] {chunk_name}: suspicious math delimiters "
+                            f"remain on lines {math_warnings}; keeping content "
+                            "instead of re-running the full page",
+                            flush=True,
+                        )
                     validate_markdown_output(text)
                     return text
                 except RuntimeError as exc:
@@ -614,11 +683,16 @@ async def process_chunks(
 def merge_markdown(
     chunks: list[Chunk], pages_dir: Path, destination: Path
 ) -> None:
-    blocks = []
-    for chunk in chunks:
-        path = pages_dir / f"{chunk.stem}.md"
-        if path.exists():
-            blocks.append(path.read_text(encoding="utf-8").strip())
+    def sort_key(path: Path) -> tuple[int, str]:
+        match = re.match(r"(\\d+)", path.stem)
+        return (int(match.group(1)) if match else 10**9, path.name)
+
+    page_files = sorted(pages_dir.glob("*.md"), key=sort_key)
+    blocks = [
+        path.read_text(encoding="utf-8").strip()
+        for path in page_files
+        if path.stat().st_size > 0
+    ]
     destination.write_text(
         "\n\n".join(blocks).rstrip() + "\n", encoding="utf-8"
     )
@@ -669,6 +743,18 @@ def parser() -> argparse.ArgumentParser:
         default=500,
         help="Per-key daily request guard within this workflow run.",
     )
+    p.add_argument(
+        "--start-page",
+        type=int,
+        default=None,
+        help="1-based first PDF page to process. Default: first page.",
+    )
+    p.add_argument(
+        "--end-page",
+        type=int,
+        default=None,
+        help="1-based last PDF page to process. Default: last page.",
+    )
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output")
     return p
@@ -689,6 +775,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("verification_passes must be between 0 and 3")
     if args.thinking_level not in {"minimal", "low", "medium", "high"}:
         raise ValueError("thinking_level must be minimal, low, medium, or high")
+    if args.start_page is not None and args.start_page < 1:
+        raise ValueError("start_page must be >= 1")
+    if args.end_page is not None and args.end_page < 1:
+        raise ValueError("end_page must be >= 1")
+    if (
+        args.start_page is not None
+        and args.end_page is not None
+        and args.start_page > args.end_page
+    ):
+        raise ValueError("start_page must be <= end_page")
     if args.rpm_per_key <= 0:
         raise ValueError("rpm_per_key must be > 0")
     if args.rpd_per_key <= 0:
@@ -729,7 +825,8 @@ async def async_main(args: argparse.Namespace) -> int:
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
-        f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key}",
+        f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key} "
+        f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -740,13 +837,15 @@ async def async_main(args: argparse.Namespace) -> int:
                 "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
             )
 
-    image_paths, width = await asyncio.to_thread(
+    image_paths, width, pdf_total_pages = await asyncio.to_thread(
         render_pdf,
         source_pdf,
         images_dir,
         args.dpi,
         args.jpeg_quality,
         args.image_format,
+        args.start_page,
+        args.end_page,
     )
     chunks = build_chunks(image_paths, args.images_per_request, width)
     print(
@@ -775,7 +874,10 @@ async def async_main(args: argparse.Namespace) -> int:
     manifest = {
         "source_url": args.source_url,
         "model": args.model,
-        "total_pages": len(image_paths),
+        "total_pages": pdf_total_pages,
+        "processed_pages": len(image_paths),
+        "start_page": args.start_page,
+        "end_page": args.end_page,
         "images_per_request": args.images_per_request,
         "concurrency": args.concurrency,
         "thinking_level": args.thinking_level,
