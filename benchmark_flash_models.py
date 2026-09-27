@@ -44,12 +44,12 @@ def download_pdf(url: str, out: Path) -> None:
 def render_pages(pdf_path: Path, out_dir: Path) -> dict[int, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf_path)
-    matrix = fitz.Matrix(300 / 72.0, 300 / 72.0)
+    matrix = fitz.Matrix(240 / 72.0, 240 / 72.0)
     result: dict[int, Path] = {}
     for page_no in PAGES:
         pix = doc[page_no - 1].get_pixmap(matrix=matrix, alpha=False)
         path = out_dir / f"{page_no:03d}.jpg"
-        path.write_bytes(pix.tobytes("jpeg", jpg_quality=96))
+        path.write_bytes(pix.tobytes("jpeg", jpg_quality=95))
         result[page_no] = path
         print(f"[render] page={page_no} bytes={path.stat().st_size}", flush=True)
     doc.close()
@@ -69,7 +69,7 @@ def build_parts(batch_pages: list[int], images: dict[int, Path]) -> list[dict]:
                 "data": base64.b64encode(data).decode("ascii"),
             },
             "mediaResolution": {
-                "level": "MEDIA_RESOLUTION_ULTRA_HIGH"
+                "level": "MEDIA_RESOLUTION_HIGH"
             },
         })
     return parts
@@ -168,7 +168,17 @@ async def run_model(
 
                 req_started = time.time()
                 response = None
-                for attempt in range(1, 4):
+                for attempt in range(1, 6):
+                    retry_wait = min_interval - (
+                        time.monotonic() - last_request_at
+                    )
+                    if retry_wait > 0:
+                        print(
+                            f"[rate] model={model} retry_sleep={retry_wait:.2f}s",
+                            flush=True,
+                        )
+                        await asyncio.sleep(retry_wait)
+
                     last_request_at = time.monotonic()
                     requests_used += 1
                     response = await client.post(
@@ -198,7 +208,13 @@ async def run_model(
                                 pass
                         await asyncio.sleep(delay)
                     elif response.status_code >= 500:
-                        await asyncio.sleep(5 * attempt)
+                        delay = min(20.0 * attempt, 60.0)
+                        print(
+                            f"[backoff] model={model} status={response.status_code} "
+                            f"sleep={delay:.0f}s",
+                            flush=True,
+                        )
+                        await asyncio.sleep(delay)
                     else:
                         raise RuntimeError(
                             f"{model} HTTP {response.status_code}: {body}"
