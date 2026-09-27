@@ -157,6 +157,56 @@ def download_pdf(source_url: str, destination: Path) -> None:
                 handle.write(data)
 
 
+def split_pdf_pages(
+    pdf_path: Path,
+    pages_dir: Path,
+    start_page: int | None,
+    end_page: int | None,
+) -> tuple[list[Path], int, int]:
+    """Split a source PDF into single-page PDFs without rasterizing/re-encoding."""
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    document = fitz.open(pdf_path)
+    total_pages = document.page_count
+    if total_pages < 1:
+        raise ValueError("PDF has no pages")
+
+    width = max(3, len(str(total_pages)))
+    first = 1 if start_page is None else start_page
+    last = total_pages if end_page is None else end_page
+    if first < 1 or last > total_pages or first > last:
+        document.close()
+        raise ValueError(
+            f"Invalid page range {first}-{last}; PDF has {total_pages} pages"
+        )
+
+    paths: list[Path] = []
+    for page_number in range(first, last + 1):
+        path = pages_dir / f"{page_number:0{width}d}.pdf"
+        single = fitz.open()
+        single.insert_pdf(
+            document,
+            from_page=page_number - 1,
+            to_page=page_number - 1,
+        )
+        single.save(
+            path,
+            garbage=0,
+            deflate=False,
+            clean=False,
+            pretty=False,
+        )
+        single.close()
+        paths.append(path)
+        print(
+            f"[split] {page_number}/{total_pages}: "
+            f"{path.name} ({path.stat().st_size} bytes)",
+            flush=True,
+        )
+
+    document.close()
+    return paths, width, total_pages
+
+
 def render_pdf(
     pdf_path: Path,
     image_dir: Path,
@@ -249,14 +299,24 @@ def make_request_parts(
     for path in chunk.image_paths:
         data = path.read_bytes()
         raw_bytes += len(data)
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            mime_type = "application/pdf"
+        elif suffix == ".png":
+            mime_type = "image/png"
+        else:
+            mime_type = "image/jpeg"
         image_part = {
             "inlineData": {
                 "mimeType": mime_type,
                 "data": base64.b64encode(data).decode("ascii"),
             }
         }
-        resolution = media_resolution_payload(media_resolution)
+        effective_resolution = media_resolution
+        if suffix == ".pdf" and effective_resolution == "ultra_high":
+            # Gemini PDF document processing currently documents low/medium/high.
+            effective_resolution = "high"
+        resolution = media_resolution_payload(effective_resolution)
         if resolution is not None:
             image_part["mediaResolution"] = resolution
         parts.append(image_part)
@@ -296,14 +356,23 @@ def make_verification_parts(
     for path in chunk.image_paths:
         data = path.read_bytes()
         raw_bytes += len(data)
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            mime_type = "application/pdf"
+        elif suffix == ".png":
+            mime_type = "image/png"
+        else:
+            mime_type = "image/jpeg"
         image_part = {
             "inlineData": {
                 "mimeType": mime_type,
                 "data": base64.b64encode(data).decode("ascii"),
             }
         }
-        resolution = media_resolution_payload(media_resolution)
+        effective_resolution = media_resolution
+        if suffix == ".pdf" and effective_resolution == "ultra_high":
+            effective_resolution = "high"
+        resolution = media_resolution_payload(effective_resolution)
         if resolution is not None:
             image_part["mediaResolution"] = resolution
         parts.append(image_part)
@@ -704,6 +773,12 @@ def parser() -> argparse.ArgumentParser:
         default="high",
         help="Gemini 3 thinking level. Default: high.",
     )
+    p.add_argument(
+        "--input-mode",
+        choices=["image", "pdf"],
+        default="image",
+        help="image: rasterize pages first; pdf: split into native single-page PDFs.",
+    )
     p.add_argument("--dpi", type=int, default=240)
     p.add_argument(
         "--image-format",
@@ -758,6 +833,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("images_per_request must be between 1 and 20")
     if not 1 <= args.concurrency <= 100:
         raise ValueError("concurrency must be between 1 and 100")
+    if args.input_mode not in {"image", "pdf"}:
+        raise ValueError("input_mode must be image or pdf")
     if not 72 <= args.dpi <= 300:
         raise ValueError("dpi must be between 72 and 300")
     if not 50 <= args.jpeg_quality <= 100:
@@ -809,12 +886,14 @@ async def async_main(args: argparse.Namespace) -> int:
 
     source_pdf = work_dir / "source.pdf"
     images_dir = work_dir / "images"
+    pdf_pages_dir = work_dir / "pdf-pages"
 
     print(
         f"[config] model={args.model} keys={len(keys)} "
         f"concurrency={args.concurrency} "
         f"images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
+        f"input_mode={args.input_mode} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
@@ -830,19 +909,31 @@ async def async_main(args: argparse.Namespace) -> int:
                 "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
             )
 
-    image_paths, width, pdf_total_pages = await asyncio.to_thread(
-        render_pdf,
-        source_pdf,
-        images_dir,
-        args.dpi,
-        args.jpeg_quality,
-        args.image_format,
-        args.start_page,
-        args.end_page,
-    )
+    preprocess_started = time.time()
+    if args.input_mode == "pdf":
+        image_paths, width, pdf_total_pages = await asyncio.to_thread(
+            split_pdf_pages,
+            source_pdf,
+            pdf_pages_dir,
+            args.start_page,
+            args.end_page,
+        )
+    else:
+        image_paths, width, pdf_total_pages = await asyncio.to_thread(
+            render_pdf,
+            source_pdf,
+            images_dir,
+            args.dpi,
+            args.jpeg_quality,
+            args.image_format,
+            args.start_page,
+            args.end_page,
+        )
+    preprocess_seconds = round(time.time() - preprocess_started, 2)
     chunks = build_chunks(image_paths, args.images_per_request, width)
     print(
-        f"[plan] pages={len(image_paths)} chunks={len(chunks)}",
+        f"[plan] pages={len(image_paths)} chunks={len(chunks)} "
+        f"preprocess_seconds={preprocess_seconds}",
         flush=True,
     )
 
@@ -874,6 +965,8 @@ async def async_main(args: argparse.Namespace) -> int:
         "images_per_request": args.images_per_request,
         "concurrency": args.concurrency,
         "thinking_level": args.thinking_level,
+        "input_mode": args.input_mode,
+        "preprocess_seconds": preprocess_seconds,
         "dpi": args.dpi,
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality,
