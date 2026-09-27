@@ -1,8 +1,18 @@
 name: PDF to Markdown with Gemini
+run-name: pdf-to-md-${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
+      request_id:
+        description: "External task ID for dispatch reconciliation"
+        required: false
+        type: string
+      output_name:
+        description: "Merged Markdown filename without extension"
+        required: false
+        default: "merged"
+        type: string
       source_url:
         description: "PDF download URL (Google Drive shared link is supported)"
         required: true
@@ -110,6 +120,7 @@ jobs:
     timeout-minutes: 350
 
     env:
+      OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
       IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '5' }}
@@ -183,6 +194,10 @@ jobs:
             args+=(--end-page "${END_PAGE}")
           fi
           python pdf2md.py "${args[@]}"
+
+      - name: Name Markdown result
+        if: always()
+        run: python prepare_result.py
 
       - name: Upload Markdown result
         if: always()

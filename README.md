@@ -214,3 +214,24 @@ rpd_per_key = 500
 调度器不会简单机械轮询，而是保证同一个 Key 两次请求至少间隔约 `60 / rpm_per_key` 秒。遇到 HTTP 429 时会暂停该 Key；如果错误详情显示是每日配额，则该 Key 在本次运行中会被停用并继续尝试其它 Key。
 
 > Google 官方说明 Gemini API 的限额实际按 **Project** 计算，而不是按 API Key。只有这些 Key 分属不同 Project 时，才能把它们视为真正独立配额；如果多个 Key 属于同一 Project，它们仍共享项目级 RPM/RPD。
+
+## AnyWorkflow Remote integration
+
+`workflow_dispatch` accepts `request_id` (an external job identity) and
+`output_name` (the merged Markdown basename, default `merged`). The run title is
+`pdf-to-md-<request_id>` so a caller can recover the run after a lost dispatch
+response without dispatching twice. The artifact name stays
+`pdf-to-md-<github.run_id>`; its ZIP contains `<output_name>.md` (or
+`<output_name>.partial.md`), page Markdown and conversion metadata. Only
+`output/` is uploaded; the source PDF and rendered images stay in the temporary
+runner's `work/` directory.
+
+The Remote frontend creates owner-scoped `aw_pdf_to_md_jobs` records in
+PocketBase. The n8n PDF workflow invokes the private PDF worker every minute;
+it dispatches queued jobs, reconciles GitHub status, downloads the artifact ZIP,
+and uploads it to the protected PocketBase `file` field. The final download
+filename is configurable independently of the task title.
+
+The GitHub REST API version `2026-03-10` returns `workflow_run_id` from
+[workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+The worker credential needs repository **Actions: write** permission.
