@@ -173,7 +173,7 @@ def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
     if estimated > MAX_INLINE_REQUEST_BYTES:
         raise ValueError(
             f"Chunk {chunk.stem} is about {estimated / 1024 / 1024:.1f} MiB after base64, "
-            "too large for inline image input. Lower images_per_request, dpi, or jpeg_quality."
+            "too large for inline image input. Lower images_per_request or dpi; for JPEG you can also lower jpeg_quality."
         )
     return parts, estimated
 
