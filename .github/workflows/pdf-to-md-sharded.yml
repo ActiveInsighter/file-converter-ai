@@ -1,0 +1,348 @@
+name: PDF to Markdown Sharded
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "PDF download URL"
+        required: true
+        type: string
+      shard_size:
+        description: "Target pages per parallel job"
+        required: true
+        default: "100"
+        type: string
+      max_jobs:
+        description: "Maximum parallel shard jobs"
+        required: true
+        default: "10"
+        type: string
+      concurrency_per_key:
+        description: "Maximum in-flight requests per assigned API key"
+        required: true
+        default: "6"
+        type: string
+      prompt:
+        description: "Prompt; leave empty for built-in transcription prompt"
+        required: false
+        default: ""
+        type: string
+      model:
+        description: "Gemini model ID"
+        required: true
+        default: "gemini-3.5-flash-lite"
+        type: string
+      thinking_level:
+        description: "Gemini thinking level"
+        required: true
+        default: "high"
+        type: choice
+        options: [high, medium, low, minimal]
+      dpi:
+        description: "PDF render DPI"
+        required: true
+        default: "240"
+        type: string
+      image_format:
+        description: "Rendered page format"
+        required: true
+        default: "png"
+        type: choice
+        options: [png, jpeg]
+      media_resolution:
+        description: "Gemini per-image media resolution"
+        required: true
+        default: "ultra_high"
+        type: choice
+        options: [ultra_high, high, medium, low, unspecified]
+      rpm_per_key:
+        description: "Configured RPM for each independent key"
+        required: true
+        default: "15"
+        type: string
+      rpd_per_key:
+        description: "Per-key daily request guard for this run"
+        required: true
+        default: "500"
+        type: string
+
+  repository_dispatch:
+    types: [pdf_to_md_sharded]
+
+  # Temporary branch-only trigger used to benchmark the sharded implementation.
+  push:
+    branches:
+      - feat/sharded-parallel
+    paths:
+      - ".github/workflows/pdf-to-md-sharded.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TEST_SOURCE_URL: "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total_pages: ${{ steps.plan.outputs.total_pages }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+    env:
+      SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url || 'https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk' }}
+      SHARD_SIZE: ${{ github.event.inputs.shard_size || github.event.client_payload.shard_size || '100' }}
+      MAX_JOBS: ${{ github.event.inputs.max_jobs || github.event.client_payload.max_jobs || '10' }}
+      CONCURRENCY_PER_KEY: ${{ github.event.inputs.concurrency_per_key || github.event.client_payload.concurrency_per_key || '6' }}
+      ALL_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - id: plan
+        name: Inspect PDF and build shard matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          import fitz
+
+          from pdf2md import download_pdf, parse_api_keys
+
+          source_url = os.environ["SOURCE_URL"]
+          shard_size = max(1, int(os.environ["SHARD_SIZE"]))
+          max_jobs = max(1, int(os.environ["MAX_JOBS"]))
+          concurrency_per_key = max(1, int(os.environ["CONCURRENCY_PER_KEY"]))
+          keys = parse_api_keys(os.environ.get("ALL_GEMINI_API_KEYS"))
+
+          if not keys:
+              raise SystemExit("GEMINI_API_KEYS is empty")
+
+          pdf_path = Path("prepare-source.pdf")
+          download_pdf(source_url, pdf_path)
+          with fitz.open(pdf_path) as document:
+              total_pages = document.page_count
+
+          desired_jobs = max(1, math.ceil(total_pages / shard_size))
+          shard_count = min(desired_jobs, max_jobs, len(keys))
+
+          base = total_pages // shard_count
+          remainder = total_pages % shard_count
+          start = 1
+          include = []
+
+          for shard in range(shard_count):
+              size = base + (1 if shard < remainder else 0)
+              end = start + size - 1
+              key_indices = [
+                  index
+                  for index in range(len(keys))
+                  if index % shard_count == shard
+              ]
+              concurrency = min(
+                  24,
+                  max(1, len(key_indices) * concurrency_per_key),
+              )
+              include.append(
+                  {
+                      "shard": shard,
+                      "start": start,
+                      "end": end,
+                      "key_indices": ",".join(map(str, key_indices)),
+                      "key_count": len(key_indices),
+                      "concurrency": concurrency,
+                  }
+              )
+              start = end + 1
+
+          matrix = {"include": include}
+          print(
+              f"[plan] pages={total_pages} shard_size={shard_size} "
+              f"jobs={shard_count} keys={len(keys)}"
+          )
+          for item in include:
+              print(
+                  f"[plan] shard={item['shard']} pages={item['start']}-{item['end']} "
+                  f"keys={item['key_indices']} concurrency={item['concurrency']}"
+              )
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(
+                  "matrix="
+                  + json.dumps(matrix, separators=(",", ":"))
+                  + "\n"
+              )
+              handle.write(f"total_pages={total_pages}\n")
+              handle.write(f"shard_count={shard_count}\n")
+          PY
+
+  convert:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    env:
+      SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url || 'https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk' }}
+      USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
+      MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
+      THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
+      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
+      IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
+      MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
+      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '15' }}
+      RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || github.event.client_payload.rpd_per_key || '500' }}
+      ALL_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Select keys assigned to this shard
+        env:
+          KEY_INDICES: ${{ matrix.key_indices }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from pdf2md import parse_api_keys
+
+          keys = parse_api_keys(os.environ["ALL_GEMINI_API_KEYS"])
+          indices = [
+              int(value)
+              for value in os.environ["KEY_INDICES"].split(",")
+              if value.strip()
+          ]
+          selected = [keys[index] for index in indices]
+
+          if not selected:
+              raise SystemExit("No API keys assigned to this shard")
+
+          with Path(os.environ["GITHUB_ENV"]).open(
+              "a", encoding="utf-8"
+          ) as handle:
+              handle.write("GEMINI_API_KEYS<<__GEMINI_KEYS__\n")
+              handle.write("\n".join(selected))
+              handle.write("\n__GEMINI_KEYS__\n")
+
+          print(
+              f"[keys] assigned_indices={indices} "
+              f"assigned_count={len(selected)}"
+          )
+          PY
+
+      - name: Convert shard ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          START_TIME=$(date +%s)
+          args=(
+            --source-url "${SOURCE_URL}"
+            --start-page "${{ matrix.start }}"
+            --end-page "${{ matrix.end }}"
+            --images-per-request 1
+            --concurrency "${{ matrix.concurrency }}"
+            --model "${MODEL}"
+            --thinking-level "${THINKING_LEVEL}"
+            --dpi "${DPI}"
+            --image-format "${IMAGE_FORMAT}"
+            --jpeg-quality 95
+            --verification-passes 0
+            --media-resolution "${MEDIA_RESOLUTION}"
+            --rpm-per-key "${RPM_PER_KEY}"
+            --rpd-per-key "${RPD_PER_KEY}"
+            --work-dir "work-${{ matrix.shard }}"
+            --output-dir "output-${{ matrix.shard }}"
+          )
+          if [[ -n "${USER_PROMPT}" ]]; then
+            args+=(--prompt "${USER_PROMPT}")
+          fi
+          python pdf2md.py "${args[@]}"
+          END_TIME=$(date +%s)
+          echo "[timing] shard=${{ matrix.shard }} seconds=$((END_TIME-START_TIME))"
+
+      - name: Upload shard result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: output-${{ matrix.shard }}/
+          if-no-files-found: warn
+          retention-days: 1
+
+  merge:
+    needs: [prepare, convert]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download shard artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+
+      - name: Merge page Markdown
+        id: merge
+        continue-on-error: true
+        run: |
+          python merge_shards.py             --shards-dir shards             --output-dir final             --total-pages "${{ needs.prepare.outputs.total_pages }}"
+
+      - name: Upload final result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-to-md-sharded-${{ github.run_id }}
+          path: final/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Verify complete merge
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("final/manifest.json").read_text(encoding="utf-8")
+          )
+          missing = manifest.get("missing_pages", [])
+          duplicates = manifest.get("duplicates", {})
+          if missing or duplicates:
+              raise SystemExit(
+                  f"Incomplete result: missing={missing}, duplicates={duplicates}"
+              )
+          print(
+              f"[result] complete pages={manifest['found_pages']}/"
+              f"{manifest['total_pages']}"
+          )
+          PY
