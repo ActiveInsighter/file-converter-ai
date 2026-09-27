@@ -200,3 +200,17 @@ verification_passes = 0
 ```
 
 原因：同一模型进行第二次“整段重写式审校”有时会修正错误，也可能把原本正确的公式改错，所以默认关闭；需要时仍可手动开启。相比单纯继续增加 DPI，Gemini 3 的 `MEDIA_RESOLUTION_ULTRA_HIGH` 会给每张图片分配更高的视觉 token 预算，更适合小字号公式、上下标和矩阵。
+
+
+### API Key 限速
+
+默认按“每个 Key 独立配额”调度：
+
+```text
+rpm_per_key = 15
+rpd_per_key = 500
+```
+
+调度器不会简单机械轮询，而是保证同一个 Key 两次请求至少间隔约 `60 / rpm_per_key` 秒。遇到 HTTP 429 时会暂停该 Key；如果错误详情显示是每日配额，则该 Key 在本次运行中会被停用并继续尝试其它 Key。
+
+> Google 官方说明 Gemini API 的限额实际按 **Project** 计算，而不是按 API Key。只有这些 Key 分属不同 Project 时，才能把它们视为真正独立配额；如果多个 Key 属于同一 Project，它们仍共享项目级 RPM/RPD。

@@ -42,18 +42,83 @@ class Chunk:
 
 
 class KeyPool:
-    def __init__(self, keys: list[str]) -> None:
+    """Quota-aware scheduler for independent Gemini API keys.
+
+    Each key is paced independently. With the default 15 RPM, a key is never
+    assigned more often than once every 4 seconds. 429 responses can temporarily
+    cool down or permanently exhaust one key for the current run.
+    """
+
+    def __init__(
+        self,
+        keys: list[str],
+        rpm_per_key: float,
+        rpd_per_key: int,
+    ) -> None:
         if not keys:
             raise ValueError("No Gemini API keys configured")
+        if rpm_per_key <= 0:
+            raise ValueError("rpm_per_key must be > 0")
+        if rpd_per_key <= 0:
+            raise ValueError("rpd_per_key must be > 0")
+
         self.keys = keys
-        self.index = 0
+        self.interval = 60.0 / rpm_per_key
+        self.rpd_per_key = rpd_per_key
+        self.next_allowed = [0.0 for _ in keys]
+        self.cooldown_until = [0.0 for _ in keys]
+        self.used = [0 for _ in keys]
+        self.disabled = [False for _ in keys]
         self.lock = asyncio.Lock()
 
-    async def next(self) -> str:
+    async def acquire(self) -> tuple[int, str]:
+        while True:
+            wait_for = 0.0
+            async with self.lock:
+                now = time.monotonic()
+                candidates: list[tuple[float, int]] = []
+                for index in range(len(self.keys)):
+                    if self.disabled[index] or self.used[index] >= self.rpd_per_key:
+                        continue
+                    ready_at = max(
+                        self.next_allowed[index],
+                        self.cooldown_until[index],
+                    )
+                    candidates.append((ready_at, index))
+
+                if not candidates:
+                    raise RuntimeError(
+                        "All Gemini API keys reached their configured per-run "
+                        "daily limit or were disabled by quota errors."
+                    )
+
+                ready_at, index = min(candidates)
+                if ready_at <= now:
+                    self.used[index] += 1
+                    self.next_allowed[index] = now + self.interval
+                    return index, self.keys[index]
+
+                wait_for = max(0.05, ready_at - now)
+
+            await asyncio.sleep(wait_for)
+
+    async def rate_limited(
+        self,
+        index: int,
+        cooldown_seconds: float,
+        daily_exhausted: bool = False,
+    ) -> None:
         async with self.lock:
-            key = self.keys[self.index % len(self.keys)]
-            self.index += 1
-            return key
+            if daily_exhausted:
+                self.disabled[index] = True
+                return
+            self.cooldown_until[index] = max(
+                self.cooldown_until[index],
+                time.monotonic() + cooldown_seconds,
+            )
+
+    def usage_summary(self) -> list[int]:
+        return list(self.used)
 
 
 def parse_api_keys(raw: str | None) -> list[str]:
@@ -333,7 +398,7 @@ async def call_gemini(
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
-        api_key = await key_pool.next()
+        key_index, api_key = await key_pool.acquire()
         try:
             response = await client.post(
                 url,
@@ -368,11 +433,62 @@ async def call_gemini(
             last_error = RuntimeError(
                 f"Gemini HTTP {response.status_code}: {message}"
             )
-            print(
-                f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
-                f"HTTP {response.status_code}; rotating key",
-                flush=True,
-            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                cooldown_seconds = 60.0
+                if retry_after:
+                    try:
+                        cooldown_seconds = max(
+                            cooldown_seconds,
+                            float(retry_after),
+                        )
+                    except ValueError:
+                        pass
+
+                retry_match = re.search(
+                    r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"',
+                    message,
+                )
+                if retry_match:
+                    cooldown_seconds = max(
+                        cooldown_seconds,
+                        float(retry_match.group(1)),
+                    )
+
+                lower_message = message.lower()
+                daily_exhausted = any(
+                    marker in lower_message
+                    for marker in (
+                        "perday",
+                        "per_day",
+                        "per day",
+                        "requestsperday",
+                        "daily",
+                    )
+                )
+                await key_pool.rate_limited(
+                    key_index,
+                    cooldown_seconds,
+                    daily_exhausted=daily_exhausted,
+                )
+                quota_kind = (
+                    "daily quota"
+                    if daily_exhausted
+                    else f"rate quota; cooldown={cooldown_seconds:.0f}s"
+                )
+                print(
+                    f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
+                    f"HTTP 429 on key#{key_index + 1} ({quota_kind}); "
+                    f"detail={message[:700]}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
+                    f"HTTP {response.status_code}; rotating key",
+                    flush=True,
+                )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_error = exc
             print(
@@ -399,13 +515,19 @@ async def process_chunks(
     thinking_level: str,
     verification_passes: int,
     media_resolution: str,
+    rpm_per_key: float,
+    rpd_per_key: int,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
-    key_pool = KeyPool(keys)
+    key_pool = KeyPool(
+        keys,
+        rpm_per_key=rpm_per_key,
+        rpd_per_key=rpd_per_key,
+    )
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
@@ -531,6 +653,18 @@ def parser() -> argparse.ArgumentParser:
         default="ultra_high",
         help="Gemini per-image media resolution. ultra_high allocates the most vision detail.",
     )
+    p.add_argument(
+        "--rpm-per-key",
+        type=float,
+        default=15.0,
+        help="Maximum requests per minute for each independent key.",
+    )
+    p.add_argument(
+        "--rpd-per-key",
+        type=int,
+        default=500,
+        help="Per-key daily request guard within this workflow run.",
+    )
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output")
     return p
@@ -551,6 +685,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("verification_passes must be between 0 and 3")
     if args.thinking_level not in {"minimal", "low", "medium", "high"}:
         raise ValueError("thinking_level must be minimal, low, medium, or high")
+    if args.rpm_per_key <= 0:
+        raise ValueError("rpm_per_key must be > 0")
+    if args.rpd_per_key <= 0:
+        raise ValueError("rpd_per_key must be > 0")
     if args.media_resolution not in {
         "unspecified",
         "low",
@@ -586,7 +724,8 @@ async def async_main(args: argparse.Namespace) -> int:
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
-        f"media_resolution={args.media_resolution}",
+        f"media_resolution={args.media_resolution} "
+        f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -621,6 +760,8 @@ async def async_main(args: argparse.Namespace) -> int:
         args.thinking_level,
         args.verification_passes,
         args.media_resolution,
+        args.rpm_per_key,
+        args.rpd_per_key,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -639,6 +780,8 @@ async def async_main(args: argparse.Namespace) -> int:
         "jpeg_quality": args.jpeg_quality,
         "verification_passes": args.verification_passes,
         "media_resolution": args.media_resolution,
+        "rpm_per_key": args.rpm_per_key,
+        "rpd_per_key": args.rpd_per_key,
         "chunks": [
             {
                 **asdict(chunk),

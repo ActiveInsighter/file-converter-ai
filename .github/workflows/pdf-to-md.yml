@@ -71,6 +71,16 @@ on:
           - medium
           - low
           - unspecified
+      rpm_per_key:
+        description: "Per-key requests/minute. Use 15 for independent free-tier projects."
+        required: true
+        default: "15"
+        type: string
+      rpd_per_key:
+        description: "Per-key daily request guard for this run"
+        required: true
+        default: "500"
+        type: string
 
   repository_dispatch:
     types: [pdf_to_md]
@@ -95,6 +105,8 @@ jobs:
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
       VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '0' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
+      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '15' }}
+      RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || github.event.client_payload.rpd_per_key || '500' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
     steps:
@@ -138,6 +150,8 @@ jobs:
             --jpeg-quality "${JPEG_QUALITY}"
             --verification-passes "${VERIFICATION_PASSES}"
             --media-resolution "${MEDIA_RESOLUTION}"
+            --rpm-per-key "${RPM_PER_KEY}"
+            --rpd-per-key "${RPD_PER_KEY}"
             --work-dir work
             --output-dir output
           )
