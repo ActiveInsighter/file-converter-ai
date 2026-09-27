@@ -1,0 +1,47 @@
+name: Temporary QA page export
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/qa-export-pages.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Export selected source pages
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import fitz, gdown
+          pages = [6,11,20,64,66,72,83,86,128,149,151,156,160,185,186,215,269,270,295,312,330,402,416]
+          url = "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+          src = Path("source.pdf")
+          out = Path("qa_pages")
+          out.mkdir(exist_ok=True)
+          gdown.download(url=url, output=str(src), quiet=True, fuzzy=True)
+          doc=fitz.open(src)
+          matrix=fitz.Matrix(300/72,300/72)
+          for n in pages:
+              pix=doc[n-1].get_pixmap(matrix=matrix, alpha=False)
+              path=out/f"{n:03d}.jpg"
+              path.write_bytes(pix.tobytes("jpeg", jpg_quality=96))
+              print(f"[qa] {n}: {pix.width}x{pix.height} {path.stat().st_size}")
+          doc.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa-source-pages-${{ github.run_id }}
+          path: qa_pages/
+          retention-days: 1
