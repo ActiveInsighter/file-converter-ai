@@ -10,7 +10,7 @@ on:
       shard_size:
         description: "Target pages per parallel job"
         required: true
-        default: "100"
+        default: "50"
         type: string
       max_jobs:
         description: "Maximum parallel shard jobs"
@@ -20,7 +20,7 @@ on:
       concurrency_per_key:
         description: "Maximum in-flight requests per assigned API key"
         required: true
-        default: "6"
+        default: "4"
         type: string
       prompt:
         description: "Prompt; leave empty for built-in transcription prompt"
@@ -58,7 +58,7 @@ on:
       rpm_per_key:
         description: "Configured RPM for each independent key"
         required: true
-        default: "15"
+        default: "12"
         type: string
       rpd_per_key:
         description: "Per-key daily request guard for this run"
@@ -93,9 +93,9 @@ jobs:
       shard_count: ${{ steps.plan.outputs.shard_count }}
     env:
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url || 'https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk' }}
-      SHARD_SIZE: ${{ github.event.inputs.shard_size || github.event.client_payload.shard_size || '100' }}
+      SHARD_SIZE: ${{ github.event.inputs.shard_size || github.event.client_payload.shard_size || '50' }}
       MAX_JOBS: ${{ github.event.inputs.max_jobs || github.event.client_payload.max_jobs || '10' }}
-      CONCURRENCY_PER_KEY: ${{ github.event.inputs.concurrency_per_key || github.event.client_payload.concurrency_per_key || '6' }}
+      CONCURRENCY_PER_KEY: ${{ github.event.inputs.concurrency_per_key || github.event.client_payload.concurrency_per_key || '4' }}
       ALL_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
     steps:
@@ -207,7 +207,7 @@ jobs:
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
-      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '15' }}
+      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '12' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || github.event.client_payload.rpd_per_key || '500' }}
       ALL_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
 
