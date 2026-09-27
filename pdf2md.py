@@ -208,11 +208,11 @@ def validate_markdown_output(text: str) -> None:
     if "此行视具体排版" in text:
         raise RuntimeError("Markdown contains model-side layout commentary")
 
-    # Inline math must open and close on the same line. Display math ($) is
+    # Inline math must open and close on the same line. Display math ($$) is
     # removed before counting single-dollar delimiters.
     bad_math_lines = []
     for line_no, line in enumerate(text.splitlines(), start=1):
-        without_display = line.replace("$", "")
+        without_display = line.replace("$$", "")
         without_escaped = without_display.replace("\\$", "")
         if without_escaped.count("$") % 2:
             bad_math_lines.append(line_no)
