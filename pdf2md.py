@@ -140,7 +140,17 @@ def build_chunks(
     return chunks
 
 
-def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
+def media_resolution_payload(level: str) -> dict | None:
+    if level == "unspecified":
+        return None
+    return {
+        "level": f"MEDIA_RESOLUTION_{level.upper()}",
+    }
+
+
+def make_request_parts(
+    chunk: Chunk, prompt: str, media_resolution: str
+) -> tuple[list[dict], int]:
     page_label = (
         f"第 {chunk.start_page} 页"
         if chunk.start_page == chunk.end_page
@@ -160,14 +170,16 @@ def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
         data = path.read_bytes()
         raw_bytes += len(data)
         mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        parts.append(
-            {
-                "inlineData": {
-                    "mimeType": mime_type,
-                    "data": base64.b64encode(data).decode("ascii"),
-                }
+        image_part = {
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": base64.b64encode(data).decode("ascii"),
             }
-        )
+        }
+        resolution = media_resolution_payload(media_resolution)
+        if resolution is not None:
+            image_part["mediaResolution"] = resolution
+        parts.append(image_part)
 
     estimated = int(raw_bytes * 4 / 3) + len(prompt.encode("utf-8")) + 64 * 1024
     if estimated > MAX_INLINE_REQUEST_BYTES:
@@ -179,7 +191,7 @@ def make_request_parts(chunk: Chunk, prompt: str) -> tuple[list[dict], int]:
 
 
 def make_verification_parts(
-    chunk: Chunk, prompt: str, draft: str
+    chunk: Chunk, prompt: str, draft: str, media_resolution: str
 ) -> tuple[list[dict], int]:
     verify_prompt = f"""请逐页对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
 
@@ -205,14 +217,16 @@ def make_verification_parts(
         data = path.read_bytes()
         raw_bytes += len(data)
         mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        parts.append(
-            {
-                "inlineData": {
-                    "mimeType": mime_type,
-                    "data": base64.b64encode(data).decode("ascii"),
-                }
+        image_part = {
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": base64.b64encode(data).decode("ascii"),
             }
-        )
+        }
+        resolution = media_resolution_payload(media_resolution)
+        if resolution is not None:
+            image_part["mediaResolution"] = resolution
+        parts.append(image_part)
     estimated = (
         int(raw_bytes * 4 / 3)
         + len(verify_prompt.encode("utf-8"))
@@ -384,6 +398,7 @@ async def process_chunks(
     keys: list[str],
     thinking_level: str,
     verification_passes: int,
+    media_resolution: str,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
@@ -403,7 +418,9 @@ async def process_chunks(
             started = time.time()
 
             try:
-                parts, estimated = make_request_parts(chunk, prompt)
+                parts, estimated = make_request_parts(
+                    chunk, prompt, media_resolution
+                )
                 async with semaphore:
                     text = await call_gemini(
                         client,
@@ -416,7 +433,9 @@ async def process_chunks(
                     )
 
                 for verify_index in range(verification_passes):
-                    verify_parts, _ = make_verification_parts(chunk, prompt, text)
+                    verify_parts, _ = make_verification_parts(
+                        chunk, prompt, text, media_resolution
+                    )
                     async with semaphore:
                         text = await call_gemini(
                             client,
@@ -492,7 +511,7 @@ def parser() -> argparse.ArgumentParser:
         default="high",
         help="Gemini 3 thinking level. Default: high.",
     )
-    p.add_argument("--dpi", type=int, default=220)
+    p.add_argument("--dpi", type=int, default=240)
     p.add_argument(
         "--image-format",
         choices=["png", "jpeg"],
@@ -503,8 +522,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--verification-passes",
         type=int,
-        default=1,
+        default=0,
         help="Extra image-vs-Markdown verification passes after initial transcription.",
+    )
+    p.add_argument(
+        "--media-resolution",
+        choices=["unspecified", "low", "medium", "high", "ultra_high"],
+        default="ultra_high",
+        help="Gemini per-image media resolution. ultra_high allocates the most vision detail.",
     )
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output")
@@ -526,6 +551,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("verification_passes must be between 0 and 3")
     if args.thinking_level not in {"minimal", "low", "medium", "high"}:
         raise ValueError("thinking_level must be minimal, low, medium, or high")
+    if args.media_resolution not in {
+        "unspecified",
+        "low",
+        "medium",
+        "high",
+        "ultra_high",
+    }:
+        raise ValueError(
+            "media_resolution must be unspecified, low, medium, high, or ultra_high"
+        )
 
 
 async def async_main(args: argparse.Namespace) -> int:
@@ -550,7 +585,8 @@ async def async_main(args: argparse.Namespace) -> int:
         f"images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
-        f"verification_passes={args.verification_passes}",
+        f"verification_passes={args.verification_passes} "
+        f"media_resolution={args.media_resolution}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -584,6 +620,7 @@ async def async_main(args: argparse.Namespace) -> int:
         keys,
         args.thinking_level,
         args.verification_passes,
+        args.media_resolution,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -601,6 +638,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality,
         "verification_passes": args.verification_passes,
+        "media_resolution": args.media_resolution,
         "chunks": [
             {
                 **asdict(chunk),
