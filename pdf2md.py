@@ -334,7 +334,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=5)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
-    p.add_argument("--model", default="gemini-3.8-flash")
+    p.add_argument("--model", default="gemini-3.5-flash-lite")
     p.add_argument("--dpi", type=int, default=180)
     p.add_argument("--jpeg-quality", type=int, default=88)
     p.add_argument("--work-dir", default="work")
