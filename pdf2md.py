@@ -16,14 +16,18 @@ import fitz
 import gdown
 import httpx
 
-DEFAULT_PROMPT = """请按图片原始顺序准确阅读这些 PDF 页面，并将页面内容转换为 Markdown。
+DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
+
 要求：
-1. 不要遗漏正文、标题、列表、表格、公式、题目、选项、注释等有效内容。
-2. 保持原始结构和顺序，不要凭空补充原文不存在的内容。
-3. 数学公式使用 LaTeX：行内公式使用 $...$，独立公式使用 $$...$$。
-4. 表格尽量转换为 Markdown 表格；无法可靠转换时保留清晰的文本结构。
-5. 忽略无意义的页眉、页脚和纯页码。
-6. 直接输出 Markdown，不要使用 Markdown 代码围栏，不要解释处理过程。
+1. 不要遗漏正文、标题、列表、表格、公式、题目、选项、注释、评分等有效内容，并严格保持原始顺序。
+2. 数学内容必须逐字符核对图片：重点检查正负号、等号/不等号、上下标、根号、分数、积分/求和上下限、导数阶数、矩阵元素、向量转置、希腊字母和括号。不要仅凭上下文猜公式。
+3. 不要自行修正原文、补全推导或加入解释。看不清时写 [无法辨认]，不要编造。
+4. 数学公式使用标准 LaTeX。行内公式只用成对的 $...$；多行公式、aligned、cases、matrix 等必须使用成对的 $$...$$，禁止用单个 $ 跨多行包裹。
+5. 不要输出处理备注、模型解释、占位说明或类似“此行视具体排版”的元信息。
+6. 忽略页眉、页脚、纯页码、扫描水印、装饰性字符和无意义的重复数字/编码；除非它们明显属于正文。
+7. 表格尽量转换为 Markdown 表格；无法可靠转换时按原有阅读顺序保留文本，不要虚构表格结构。
+8. 输出前自行复核一遍图片与 Markdown，尤其复核所有数学公式和数字。
+9. 直接输出 Markdown，不要使用 Markdown 代码围栏。
 """
 GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -190,9 +194,17 @@ async def call_gemini(
     model: str,
     parts: list[dict],
     chunk_name: str,
+    thinking_level: str,
 ) -> str:
     url = f"{GOOGLE_API_BASE}/{model}:generateContent"
-    payload = {"contents": [{"role": "user", "parts": parts}]}
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "thinkingConfig": {
+                "thinkingLevel": thinking_level,
+            }
+        },
+    }
     max_attempts = max(4, min(12, key_count * 2))
     last_error: Exception | None = None
 
@@ -247,6 +259,7 @@ async def process_chunks(
     model: str,
     concurrency: int,
     keys: list[str],
+    thinking_level: str,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
@@ -275,6 +288,7 @@ async def process_chunks(
                         model,
                         parts,
                         chunk.stem,
+                        thinking_level,
                     )
 
                 md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
@@ -335,6 +349,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--concurrency", type=int, default=5)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--model", default="gemini-3.5-flash-lite")
+    p.add_argument(
+        "--thinking-level",
+        choices=["minimal", "low", "medium", "high"],
+        default="high",
+        help="Gemini 3 thinking level. Default: high.",
+    )
     p.add_argument("--dpi", type=int, default=180)
     p.add_argument("--jpeg-quality", type=int, default=88)
     p.add_argument("--work-dir", default="work")
@@ -351,6 +371,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("dpi must be between 72 and 300")
     if not 50 <= args.jpeg_quality <= 100:
         raise ValueError("jpeg_quality must be between 50 and 100")
+    if args.thinking_level not in {"minimal", "low", "medium", "high"}:
+        raise ValueError("thinking_level must be minimal, low, medium, or high")
 
 
 async def async_main(args: argparse.Namespace) -> int:
@@ -372,7 +394,8 @@ async def async_main(args: argparse.Namespace) -> int:
     print(
         f"[config] model={args.model} keys={len(keys)} "
         f"concurrency={args.concurrency} "
-        f"images_per_request={args.images_per_request}",
+        f"images_per_request={args.images_per_request} "
+        f"thinking_level={args.thinking_level}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -403,6 +426,7 @@ async def async_main(args: argparse.Namespace) -> int:
         args.model,
         args.concurrency,
         keys,
+        args.thinking_level,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -415,6 +439,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "total_pages": len(image_paths),
         "images_per_request": args.images_per_request,
         "concurrency": args.concurrency,
+        "thinking_level": args.thinking_level,
         "dpi": args.dpi,
         "jpeg_quality": args.jpeg_quality,
         "chunks": [

@@ -55,6 +55,7 @@ AIza...key10
 | `concurrency` | 最大 Gemini 并发请求数 | `5` |
 | `prompt` | 自定义提示词；留空使用内置 Markdown 转换提示词 | 空 |
 | `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
+| `thinking_level` | Gemini 思考深度 | `high` |
 | `dpi` | PDF 渲染 DPI | `180` |
 | `jpeg_quality` | JPEG 质量 | `88` |
 
@@ -101,6 +102,7 @@ Content-Type: application/json
     "concurrency": 10,
     "prompt": "请准确识别页面内容并转换为 Markdown，公式使用 LaTeX。",
     "model": "gemini-3.5-flash-lite",
+    "thinking_level": "high",
     "dpi": 180,
     "jpeg_quality": 88
   }
@@ -151,5 +153,20 @@ export GEMINI_API_KEYS=$'key1\nkey2\nkey3'
 python pdf2md.py \
   --source-url 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
   --images-per-request 3 \
-  --concurrency 10
+  --concurrency 10 \
+  --thinking-level high
 ```
+
+
+## 高精度模式
+
+默认使用 `gemini-3.5-flash-lite` 并将 Gemini 3 的 `thinkingLevel` 设置为 `high`。对于数学 PDF，建议优先使用：
+
+```text
+thinking_level = high
+images_per_request = 1~2
+dpi = 200~220
+jpeg_quality = 90
+```
+
+这会牺牲一些速度和额度，但更适合公式密集文档。默认提示词也要求逐符号核对公式、禁止猜测、禁止跨行单美元符号数学环境，并忽略无意义的扫描水印或重复编码。
