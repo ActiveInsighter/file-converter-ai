@@ -1,4 +1,5 @@
 name: Temporary high-thinking PDF2MD test
+# rerun after output-validation fix
 
 on:
   push:
