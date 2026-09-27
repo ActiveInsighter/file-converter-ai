@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:10:20.698199Z",
+  "updated_at": "2026-09-27T16:10:52.452407Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -44,37 +44,35 @@
       "errors": 1
     },
     "project-4": {
-      "requests_today": 73,
+      "requests_today": 78,
       "recent_requests": [
-        "2026-09-27T16:09:23.395052Z",
-        "2026-09-27T16:09:29.323922Z",
-        "2026-09-27T16:09:35.169122Z",
-        "2026-09-27T16:09:39.561069Z",
-        "2026-09-27T16:09:44.020096Z",
-        "2026-09-27T16:09:48.839434Z",
         "2026-09-27T16:09:53.703772Z",
         "2026-09-27T16:09:58.761459Z",
         "2026-09-27T16:10:03.725631Z",
         "2026-09-27T16:10:14.636416Z",
-        "2026-09-27T16:10:20.698190Z"
+        "2026-09-27T16:10:20.698190Z",
+        "2026-09-27T16:10:25.148423Z",
+        "2026-09-27T16:10:32.377733Z",
+        "2026-09-27T16:10:37.755403Z",
+        "2026-09-27T16:10:43.890947Z",
+        "2026-09-27T16:10:52.452399Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 68,
+      "success": 73,
       "http_429": 0,
       "errors": 1
     },
     "project-5": {
-      "requests_today": 24,
+      "requests_today": 25,
       "recent_requests": [
-        "2026-09-27T16:09:24.679245Z",
-        "2026-09-27T16:09:35.448138Z",
         "2026-09-27T16:10:00.211148Z",
-        "2026-09-27T16:10:18.102383Z"
+        "2026-09-27T16:10:18.102383Z",
+        "2026-09-27T16:10:35.934967Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 23,
+      "success": 24,
       "http_429": 0,
       "errors": 0
     },
@@ -159,16 +157,16 @@
     },
     "4": {
       "project": "project-4",
-      "requests": 73,
-      "success": 68,
+      "requests": 78,
+      "success": 73,
       "http_429": 0,
       "errors": 1,
       "disabled": false
     },
     "5": {
       "project": "project-5",
-      "requests": 24,
-      "success": 23,
+      "requests": 25,
+      "success": 24,
       "http_429": 0,
       "errors": 0,
       "disabled": false
