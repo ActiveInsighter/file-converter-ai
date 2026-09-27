@@ -604,6 +604,10 @@ async def process_chunks(
         results = []
         for future in asyncio.as_completed(tasks):
             results.append(await future)
+        print(
+            f"[keys] request_counts={key_pool.usage_summary()}",
+            flush=True,
+        )
         return results
 
 
