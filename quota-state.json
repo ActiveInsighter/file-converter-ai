@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T16:26:33.814625Z",
+  "updated_at": "2026-09-27T16:26:47.794320Z",
   "projects": {
     "project-1": {
       "requests_today": 500,
@@ -61,34 +61,34 @@
       "errors": 2
     },
     "project-5": {
-      "requests_today": 96,
+      "requests_today": 500,
       "recent_requests": [
-        "2026-09-27T16:25:39.098469Z",
-        "2026-09-27T16:25:44.196184Z",
         "2026-09-27T16:25:57.594913Z",
         "2026-09-27T16:26:03.038084Z",
         "2026-09-27T16:26:09.406319Z",
         "2026-09-27T16:26:14.080538Z",
         "2026-09-27T16:26:19.180999Z",
         "2026-09-27T16:26:24.437068Z",
-        "2026-09-27T16:26:33.814617Z"
+        "2026-09-27T16:26:33.814617Z",
+        "2026-09-27T16:26:41.978830Z",
+        "2026-09-27T16:26:47.571029Z"
       ],
       "cooldown_until": null,
-      "daily_exhausted": false,
-      "success": 91,
-      "http_429": 0,
+      "daily_exhausted": true,
+      "success": 94,
+      "http_429": 1,
       "errors": 0
     },
     "project-6": {
-      "requests_today": 36,
+      "requests_today": 38,
       "recent_requests": [
-        "2026-09-27T16:25:39.724957Z",
-        "2026-09-27T16:25:46.731341Z",
-        "2026-09-27T16:25:59.547631Z"
+        "2026-09-27T16:25:59.547631Z",
+        "2026-09-27T16:26:35.931527Z",
+        "2026-09-27T16:26:42.309052Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 36,
+      "success": 37,
       "http_429": 0,
       "errors": 0
     },
@@ -170,16 +170,16 @@
     },
     "5": {
       "project": "project-5",
-      "requests": 96,
-      "success": 91,
-      "http_429": 0,
+      "requests": 98,
+      "success": 94,
+      "http_429": 1,
       "errors": 0,
       "disabled": false
     },
     "6": {
       "project": "project-6",
-      "requests": 36,
-      "success": 36,
+      "requests": 38,
+      "success": 37,
       "http_429": 0,
       "errors": 0,
       "disabled": false
