@@ -63,7 +63,8 @@ class KeyPool:
             raise ValueError("rpd_per_key must be > 0")
 
         self.keys = keys
-        self.interval = 60.0 / rpm_per_key
+        # Keep a small safety margin for provider sliding-window accounting.
+        self.interval = (60.0 / rpm_per_key) * 1.08
         self.rpd_per_key = rpd_per_key
         self.next_allowed = [0.0 for _ in keys]
         self.cooldown_until = [0.0 for _ in keys]
