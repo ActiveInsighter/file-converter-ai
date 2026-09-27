@@ -27,6 +27,16 @@ on:
         required: true
         default: "gemini-3.5-flash-lite"
         type: string
+      thinking_level:
+        description: "Gemini thinking level"
+        required: true
+        default: "high"
+        type: choice
+        options:
+          - high
+          - medium
+          - low
+          - minimal
       dpi:
         description: "PDF render DPI"
         required: true
@@ -55,6 +65,7 @@ jobs:
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '5' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
+      THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '180' }}
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '88' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
@@ -94,6 +105,7 @@ jobs:
             --images-per-request "${IMAGES_PER_REQUEST}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
+            --thinking-level "${THINKING_LEVEL}"
             --dpi "${DPI}"
             --jpeg-quality "${JPEG_QUALITY}"
             --work-dir work
