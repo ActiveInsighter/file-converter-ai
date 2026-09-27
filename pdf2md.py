@@ -579,18 +579,21 @@ async def process_chunks(
     media_resolution: str,
     rpm_per_key: float,
     rpd_per_key: int,
+    shared_key_pool: KeyPool | None = None,
+    shared_semaphore: asyncio.Semaphore | None = None,
+    log_key_usage: bool = True,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
-    key_pool = KeyPool(
+    key_pool = shared_key_pool or KeyPool(
         keys,
         rpm_per_key=rpm_per_key,
         rpd_per_key=rpd_per_key,
     )
-    semaphore = asyncio.Semaphore(concurrency)
+    semaphore = shared_semaphore or asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(240.0, connect=30.0)
@@ -602,10 +605,10 @@ async def process_chunks(
             started = time.time()
 
             try:
-                parts, estimated = make_request_parts(
-                    chunk, prompt, media_resolution
-                )
                 async with semaphore:
+                    parts, estimated = make_request_parts(
+                        chunk, prompt, media_resolution
+                    )
                     text = await call_gemini(
                         client,
                         key_pool,
@@ -666,10 +669,11 @@ async def process_chunks(
         results = []
         for future in asyncio.as_completed(tasks):
             results.append(await future)
-        print(
-            f"[keys] request_counts={key_pool.usage_summary()}",
-            flush=True,
-        )
+        if log_key_usage:
+            print(
+                f"[keys] request_counts={key_pool.usage_summary()}",
+                flush=True,
+            )
         return results
 
 
@@ -737,6 +741,15 @@ def parser() -> argparse.ArgumentParser:
         help="Per-key daily request guard within this workflow run.",
     )
     p.add_argument(
+        "--render-batch-size",
+        type=int,
+        default=24,
+        help=(
+            "Render this many pages, then immediately start model processing "
+            "while the next batch renders. Set 0 to use the old eager mode."
+        ),
+    )
+    p.add_argument(
         "--start-page",
         type=int,
         default=None,
@@ -768,6 +781,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("verification_passes must be between 0 and 3")
     if args.thinking_level not in {"minimal", "low", "medium", "high"}:
         raise ValueError("thinking_level must be minimal, low, medium, or high")
+    if args.render_batch_size < 0:
+        raise ValueError("render_batch_size must be >= 0")
     if args.start_page is not None and args.start_page < 1:
         raise ValueError("start_page must be >= 1")
     if args.end_page is not None and args.end_page < 1:
@@ -819,7 +834,8 @@ async def async_main(args: argparse.Namespace) -> int:
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
         f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key} "
-        f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
+        f"page_range={args.start_page or 1}-{args.end_page or 'end'} "
+        f"render_batch_size={args.render_batch_size}",
         flush=True,
     )
     print(f"[download] {args.source_url}", flush=True)
@@ -830,35 +846,139 @@ async def async_main(args: argparse.Namespace) -> int:
                 "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
             )
 
-    image_paths, width, pdf_total_pages = await asyncio.to_thread(
-        render_pdf,
-        source_pdf,
-        images_dir,
-        args.dpi,
-        args.jpeg_quality,
-        args.image_format,
-        args.start_page,
-        args.end_page,
-    )
-    chunks = build_chunks(image_paths, args.images_per_request, width)
-    print(
-        f"[plan] pages={len(image_paths)} chunks={len(chunks)}",
-        flush=True,
-    )
+    if args.render_batch_size == 0:
+        image_paths, width, pdf_total_pages = await asyncio.to_thread(
+            render_pdf,
+            source_pdf,
+            images_dir,
+            args.dpi,
+            args.jpeg_quality,
+            args.image_format,
+            args.start_page,
+            args.end_page,
+        )
+        chunks = build_chunks(image_paths, args.images_per_request, width)
+        print(
+            f"[plan] pages={len(image_paths)} chunks={len(chunks)} mode=eager",
+            flush=True,
+        )
+        results = await process_chunks(
+            chunks,
+            output_dir,
+            args.prompt,
+            args.model,
+            args.concurrency,
+            keys,
+            args.thinking_level,
+            args.verification_passes,
+            args.media_resolution,
+            args.rpm_per_key,
+            args.rpd_per_key,
+        )
+    else:
+        with fitz.open(source_pdf) as metadata_doc:
+            pdf_total_pages = metadata_doc.page_count
 
-    results = await process_chunks(
-        chunks,
-        output_dir,
-        args.prompt,
-        args.model,
-        args.concurrency,
-        keys,
-        args.thinking_level,
-        args.verification_passes,
-        args.media_resolution,
-        args.rpm_per_key,
-        args.rpd_per_key,
-    )
+        first_page = 1 if args.start_page is None else args.start_page
+        last_page = (
+            pdf_total_pages
+            if args.end_page is None
+            else args.end_page
+        )
+        if (
+            first_page < 1
+            or last_page > pdf_total_pages
+            or first_page > last_page
+        ):
+            raise ValueError(
+                f"Invalid page range {first_page}-{last_page}; "
+                f"PDF has {pdf_total_pages} pages"
+            )
+
+        width = max(3, len(str(pdf_total_pages)))
+        shared_key_pool = KeyPool(
+            keys,
+            rpm_per_key=args.rpm_per_key,
+            rpd_per_key=args.rpd_per_key,
+        )
+        shared_semaphore = asyncio.Semaphore(args.concurrency)
+        processing_tasks: list[asyncio.Task] = []
+        chunks: list[Chunk] = []
+        rendered_pages = 0
+        stream_started = time.time()
+
+        for batch_start in range(
+            first_page,
+            last_page + 1,
+            args.render_batch_size,
+        ):
+            batch_end = min(
+                last_page,
+                batch_start + args.render_batch_size - 1,
+            )
+            batch_paths, _, _ = await asyncio.to_thread(
+                render_pdf,
+                source_pdf,
+                images_dir,
+                args.dpi,
+                args.jpeg_quality,
+                args.image_format,
+                batch_start,
+                batch_end,
+            )
+            rendered_pages += len(batch_paths)
+            batch_chunks = build_chunks(
+                batch_paths,
+                args.images_per_request,
+                width,
+            )
+            chunks.extend(batch_chunks)
+
+            processing_tasks.append(
+                asyncio.create_task(
+                    process_chunks(
+                        batch_chunks,
+                        output_dir,
+                        args.prompt,
+                        args.model,
+                        args.concurrency,
+                        keys,
+                        args.thinking_level,
+                        args.verification_passes,
+                        args.media_resolution,
+                        args.rpm_per_key,
+                        args.rpd_per_key,
+                        shared_key_pool=shared_key_pool,
+                        shared_semaphore=shared_semaphore,
+                        log_key_usage=False,
+                    )
+                )
+            )
+
+            print(
+                f"[stream] rendered={rendered_pages}/"
+                f"{last_page - first_page + 1} "
+                f"scheduled_chunks={len(chunks)} "
+                f"elapsed={time.time() - stream_started:.1f}s",
+                flush=True,
+            )
+
+        nested_results = await asyncio.gather(*processing_tasks)
+        results = [
+            item
+            for batch_results in nested_results
+            for item in batch_results
+        ]
+        print(
+            f"[keys] request_counts={shared_key_pool.usage_summary()}",
+            flush=True,
+        )
+        print(
+            f"[plan] pages={rendered_pages} chunks={len(chunks)} "
+            f"mode=streaming total_stream_seconds="
+            f"{time.time() - stream_started:.1f}",
+            flush=True,
+        )
     failures = [x for x in results if x.get("status") == "failed"]
 
     merged_name = "merged.md" if not failures else "merged.partial.md"
@@ -878,6 +998,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality,
         "verification_passes": args.verification_passes,
+        "render_batch_size": args.render_batch_size,
         "media_resolution": args.media_resolution,
         "rpm_per_key": args.rpm_per_key,
         "rpd_per_key": args.rpd_per_key,
