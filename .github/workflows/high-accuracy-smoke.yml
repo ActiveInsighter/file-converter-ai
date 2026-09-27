@@ -26,14 +26,17 @@ jobs:
         run: |
           python pdf2md.py \
             --source-url "https://drive.google.com/file/d/14EPNh_iAdchuEcz7Y-jBMXVZJ9AA2aoi/view?usp=drivesdk" \
-            --images-per-request 3 \
+            --images-per-request 1 \
             --concurrency 10 \
             --model "gemini-3.5-flash-lite" \
             --thinking-level high \
-            --dpi 220 \
+            --dpi 240 \
             --image-format png \
             --jpeg-quality 95 \
-            --verification-passes 1 \
+            --verification-passes 0 \
+            --media-resolution ultra_high \
+            --rpm-per-key 15 \
+            --rpd-per-key 500 \
             --work-dir work \
             --output-dir output
       - name: Upload result
