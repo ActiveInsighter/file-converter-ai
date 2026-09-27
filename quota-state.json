@@ -1,17 +1,17 @@
 {
   "version": 1,
   "pacific_date": "2026-09-27",
-  "updated_at": "2026-09-27T14:10:10.373854Z",
+  "updated_at": "2026-09-27T14:10:50.102436Z",
   "projects": {
     "project-1": {
-      "requests_today": 1,
+      "requests_today": 500,
       "recent_requests": [
-        "2026-09-27T14:09:27.782543Z"
+        "2026-09-27T14:10:49.819928Z"
       ],
       "cooldown_until": null,
-      "daily_exhausted": false,
+      "daily_exhausted": true,
       "success": 1,
-      "http_429": 0,
+      "http_429": 1,
       "errors": 0
     },
     "project-2": {
@@ -99,9 +99,9 @@
   "keys": {
     "1": {
       "project": "project-1",
-      "requests": 1,
+      "requests": 2,
       "success": 1,
-      "http_429": 0,
+      "http_429": 1,
       "errors": 0,
       "disabled": false
     },
