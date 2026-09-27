@@ -16,6 +16,8 @@ import fitz
 import gdown
 import httpx
 
+from quota_state import ProjectQuotaPool, parse_key_groups
+
 DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
 
 要求：
@@ -432,7 +434,7 @@ def validate_markdown_output(text: str) -> None:
 
 async def call_gemini(
     client: httpx.AsyncClient,
-    key_pool: KeyPool,
+    key_pool: ProjectQuotaPool,
     key_count: int,
     model: str,
     parts: list[dict],
@@ -474,8 +476,10 @@ async def call_gemini(
                             flush=True,
                         )
                     validate_markdown_output(text)
+                    await key_pool.mark_success(key_index)
                     return text
                 except RuntimeError as exc:
+                    await key_pool.mark_error(key_index)
                     last_error = exc
                     print(
                         f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
@@ -488,6 +492,7 @@ async def call_gemini(
 
             message = response.text[:2000]
             if response.status_code in {400, 404}:
+                await key_pool.mark_error(key_index)
                 raise RuntimeError(
                     f"Gemini request rejected ({response.status_code}): {message}"
                 )
@@ -518,16 +523,8 @@ async def call_gemini(
                         float(retry_match.group(1)),
                     )
 
-                lower_message = message.lower()
-                daily_exhausted = any(
-                    marker in lower_message
-                    for marker in (
-                        "perday",
-                        "per_day",
-                        "per day",
-                        "requestsperday",
-                        "daily",
-                    )
+                daily_exhausted = key_pool.is_daily_quota_message(
+                    message
                 )
                 await key_pool.rate_limited(
                     key_index,
@@ -546,12 +543,14 @@ async def call_gemini(
                     flush=True,
                 )
             else:
+                await key_pool.mark_error(key_index)
                 print(
                     f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
                     f"HTTP {response.status_code}; rotating key",
                     flush=True,
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
+            await key_pool.mark_error(key_index)
             last_error = exc
             print(
                 f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
@@ -585,10 +584,20 @@ async def process_chunks(
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
-    key_pool = KeyPool(
+    groups = parse_key_groups(
+        len(keys),
+        os.getenv("GEMINI_KEY_GROUPS"),
+    )
+    print(
+        f"[quota] keys={len(keys)} projects={len(set(groups))} "
+        f"mapping={groups}",
+        flush=True,
+    )
+    key_pool = await ProjectQuotaPool.create(
         keys,
-        rpm_per_key=rpm_per_key,
-        rpd_per_key=rpd_per_key,
+        groups,
+        rpm_per_project=rpm_per_key,
+        rpd_per_project=rpd_per_key,
     )
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -666,8 +675,18 @@ async def process_chunks(
         results = []
         for future in asyncio.as_completed(tasks):
             results.append(await future)
+        await key_pool.close()
+        quota_summary = key_pool.usage_summary()
+        (output_dir / "quota-usage.json").write_text(
+            json.dumps(quota_summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         print(
-            f"[keys] request_counts={key_pool.usage_summary()}",
+            "[quota] " + json.dumps(
+                quota_summary,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             flush=True,
         )
         return results
@@ -728,13 +747,13 @@ def parser() -> argparse.ArgumentParser:
         "--rpm-per-key",
         type=float,
         default=15.0,
-        help="Maximum requests per minute for each independent key.",
+        help="Compatibility name: maximum requests/minute for each project quota pool.",
     )
     p.add_argument(
         "--rpd-per-key",
         type=int,
         default=500,
-        help="Per-key daily request guard within this workflow run.",
+        help="Compatibility name: requests/day guard for each project quota pool.",
     )
     p.add_argument(
         "--start-page",
