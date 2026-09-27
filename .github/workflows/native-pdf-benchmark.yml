@@ -1,0 +1,55 @@
+name: Native PDF page benchmark
+
+on:
+  push:
+    branches:
+      - perf/native-pdf-pages
+    paths:
+      - ".github/workflows/native-pdf-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run native PDF page conversion
+        run: |
+          START=$(date +%s)
+          python pdf2md.py \
+            --source-url "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk" \
+            --input-mode pdf \
+            --images-per-request 1 \
+            --concurrency 40 \
+            --model "gemini-3.5-flash-lite" \
+            --thinking-level high \
+            --verification-passes 0 \
+            --media-resolution high \
+            --rpm-per-key 12 \
+            --rpd-per-key 500 \
+            --work-dir work \
+            --output-dir output
+          END=$(date +%s)
+          echo "[timing] total_seconds=$((END-START))"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-pdf-result-${{ github.run_id }}
+          path: output/
+          retention-days: 1
