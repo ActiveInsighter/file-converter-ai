@@ -1,7 +1,181 @@
 {
   "version": 1,
-  "pacific_date": "",
-  "updated_at": null,
-  "projects": {},
-  "keys": {}
+  "pacific_date": "2026-09-27",
+  "updated_at": "2026-09-27T14:10:10.373854Z",
+  "projects": {
+    "project-1": {
+      "requests_today": 1,
+      "recent_requests": [
+        "2026-09-27T14:09:27.782543Z"
+      ],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 1,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-2": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-3": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-4": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-5": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-6": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-7": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-8": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-9": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    },
+    "project-10": {
+      "requests_today": 0,
+      "recent_requests": [],
+      "cooldown_until": null,
+      "daily_exhausted": false,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0
+    }
+  },
+  "keys": {
+    "1": {
+      "project": "project-1",
+      "requests": 1,
+      "success": 1,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "2": {
+      "project": "project-2",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "3": {
+      "project": "project-3",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "4": {
+      "project": "project-4",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "5": {
+      "project": "project-5",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "6": {
+      "project": "project-6",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "7": {
+      "project": "project-7",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "8": {
+      "project": "project-8",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "9": {
+      "project": "project-9",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    },
+    "10": {
+      "project": "project-10",
+      "requests": 0,
+      "success": 0,
+      "http_429": 0,
+      "errors": 0,
+      "disabled": false
+    }
+  }
 }
