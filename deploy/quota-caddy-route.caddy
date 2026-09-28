@@ -1,0 +1,11 @@
+handle_path /file-converter-quota/* {
+    request_body {
+        max_size 16KB
+    }
+    reverse_proxy 127.0.0.1:18788 {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 40s
+        }
+    }
+}

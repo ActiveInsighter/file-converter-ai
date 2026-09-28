@@ -7,6 +7,7 @@ import random
 import re
 import time
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import httpx
 
@@ -97,7 +98,7 @@ def parse_key_groups(key_count: int, raw: str | None) -> list[str]:
 
 
 class ProjectQuotaPool:
-    """Client for the globally coordinated Cloudflare Durable Object pool."""
+    """Client for the globally coordinated Valkey quota API."""
 
     def __init__(
         self,
@@ -106,8 +107,8 @@ class ProjectQuotaPool:
         rpm_per_project: float,
         rpd_per_project: int,
         client: httpx.AsyncClient,
-        worker_url: str,
-        worker_token: str,
+        api_url: str,
+        api_token: str,
     ) -> None:
         if not keys:
             raise ValueError("No Gemini API keys configured")
@@ -117,7 +118,7 @@ class ProjectQuotaPool:
             raise ValueError("Project RPM and RPD limits must be > 0")
         if len(set(groups)) != len(groups):
             raise ValueError(
-                "The Cloudflare pool requires one independent Google Cloud Project per API key."
+                "The quota pool requires one independent Google Cloud Project per API key."
             )
 
         self.keys = keys
@@ -125,8 +126,8 @@ class ProjectQuotaPool:
         self.rpm_per_project = rpm_per_project
         self.rpd_per_project = rpd_per_project
         self.client = client
-        self.worker_url = worker_url.rstrip("/")
-        self.worker_token = worker_token
+        self.api_url = api_url.rstrip("/")
+        self.api_token = api_token
         self.used = [0 for _ in keys]
         self.successes = [0 for _ in keys]
         self.errors = [0 for _ in keys]
@@ -143,15 +144,18 @@ class ProjectQuotaPool:
         rpd_per_project: int,
         client: httpx.AsyncClient,
     ) -> "ProjectQuotaPool":
-        worker_url = os.getenv("GEMINI_QUOTA_WORKER_URL", "").strip()
-        worker_token = os.getenv("GEMINI_QUOTA_WORKER_TOKEN", "").strip()
-        if not worker_url or not worker_token:
+        api_url = os.getenv("GEMINI_QUOTA_API_URL", "").strip()
+        api_token = os.getenv("GEMINI_QUOTA_API_TOKEN", "").strip()
+        if not api_url or not api_token:
             raise RuntimeError(
-                "GEMINI_QUOTA_WORKER_URL and GEMINI_QUOTA_WORKER_TOKEN are required."
+                "GEMINI_QUOTA_API_URL and GEMINI_QUOTA_API_TOKEN are required."
             )
-        parsed_url = urlparse(worker_url)
-        if parsed_url.scheme != "https" and parsed_url.hostname not in {"localhost", "127.0.0.1"}:
-            raise ValueError("GEMINI_QUOTA_WORKER_URL must use HTTPS")
+        parsed_url = urlparse(api_url)
+        if not (
+            parsed_url.scheme == "https"
+            or (parsed_url.scheme == "http" and parsed_url.hostname in {"localhost", "127.0.0.1"})
+        ):
+            raise ValueError("GEMINI_QUOTA_API_URL must use HTTPS")
 
         pool = cls(
             keys,
@@ -159,8 +163,8 @@ class ProjectQuotaPool:
             rpm_per_project,
             rpd_per_project,
             client,
-            worker_url,
-            worker_token,
+            api_url,
+            api_token,
         )
         result = await pool._post(
             "/v1/configure",
@@ -171,9 +175,9 @@ class ProjectQuotaPool:
             },
         )
         if result.get("keyCount") != len(keys) or result.get("projectCount") != len(set(groups)):
-            raise RuntimeError("Cloudflare quota pool returned an unexpected key/project count")
+            raise RuntimeError("Quota API returned an unexpected key/project count")
         print(
-            "[quota] Cloudflare pool ready "
+            "[quota] Valkey pool ready "
             f"keys={result['keyCount']} projects={result['projectCount']} "
             f"pacific_date={result.get('pacificDate')}",
             flush=True,
@@ -187,9 +191,9 @@ class ProjectQuotaPool:
         accepted_statuses: tuple[int, ...] = (200,),
     ) -> dict:
         response = await self.client.post(
-            self.worker_url + path,
+            self.api_url + path,
             headers={
-                "Authorization": f"Bearer {self.worker_token}",
+                "Authorization": f"Bearer {self.api_token}",
                 "User-Agent": "file-converter-ai/1.0",
             },
             json=payload,
@@ -198,28 +202,38 @@ class ProjectQuotaPool:
         if response.status_code not in accepted_statuses:
             detail = response.text[:1000]
             raise RuntimeError(
-                f"Cloudflare quota Worker {path} returned HTTP "
+                f"Quota API {path} returned HTTP "
                 f"{response.status_code}: {detail}"
             )
         try:
             body = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"Cloudflare quota Worker {path} returned invalid JSON") from exc
+            raise RuntimeError(f"Quota API {path} returned invalid JSON") from exc
         if not isinstance(body, dict):
-            raise RuntimeError(f"Cloudflare quota Worker {path} returned an invalid response")
+            raise RuntimeError(f"Quota API {path} returned an invalid response")
         return body
 
     async def acquire(self) -> tuple[int, str, str]:
+        request_id = str(uuid4())
+        transport_failures = 0
         while True:
-            response = await self.client.post(
-                self.worker_url + "/v1/lease",
-                headers={
-                    "Authorization": f"Bearer {self.worker_token}",
-                    "User-Agent": "file-converter-ai/1.0",
-                },
-                json={},
-                timeout=35.0,
-            )
+            try:
+                response = await self.client.post(
+                    self.api_url + "/v1/lease",
+                    headers={
+                        "Authorization": f"Bearer {self.api_token}",
+                        "User-Agent": "file-converter-ai/1.0",
+                    },
+                    json={"requestId": request_id},
+                    timeout=15.0,
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                transport_failures += 1
+                if transport_failures >= 5:
+                    raise RuntimeError("Quota API lease request failed repeatedly") from exc
+                await asyncio.sleep(random.uniform(0.5, min(8.0, 2 ** transport_failures)))
+                continue
+            transport_failures = 0
             if response.status_code == 202:
                 try:
                     wait_ms = int(response.json().get("waitMs", 250))
@@ -234,7 +248,7 @@ class ProjectQuotaPool:
                 )
             if response.status_code != 200:
                 raise RuntimeError(
-                    "Cloudflare quota Worker /v1/lease returned HTTP "
+                    "Quota API /v1/lease returned HTTP "
                     f"{response.status_code}: {response.text[:1000]}"
                 )
             body = response.json()
@@ -242,12 +256,13 @@ class ProjectQuotaPool:
             lease_id = body.get("leaseId")
             if (
                 not isinstance(key_index, int)
+                or isinstance(key_index, bool)
                 or key_index < 0
                 or key_index >= len(self.keys)
                 or not isinstance(lease_id, str)
                 or not lease_id
             ):
-                raise RuntimeError("Cloudflare quota Worker returned an invalid lease")
+                raise RuntimeError("Quota API returned an invalid lease")
             self.used[key_index] += 1
             return key_index, self.keys[key_index], lease_id
 
@@ -280,7 +295,7 @@ class ProjectQuotaPool:
                 if attempt < 5:
                     await asyncio.sleep(min(attempt, 4))
         raise RuntimeError(
-            f"Could not report the Gemini response to Cloudflare for key#{key_index + 1}: "
+            f"Could not report the Gemini response to quota API for key#{key_index + 1}: "
             f"{last_error}"
         ) from last_error
 

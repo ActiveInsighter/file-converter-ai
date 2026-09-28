@@ -1,6 +1,7 @@
 # Node.js
 node_modules/
 .wrangler/
+deploy/valkey/data/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

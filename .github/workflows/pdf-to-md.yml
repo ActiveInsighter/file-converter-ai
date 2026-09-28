@@ -30,7 +30,7 @@ on:
         default: "1"
         type: string
       concurrency:
-        description: "Local page workers; the quota Worker applies the shared Gemini request limit"
+        description: "Local page workers; the quota API applies the shared Gemini request limit"
         required: true
         default: "50"
         type: string
@@ -140,8 +140,8 @@ jobs:
       END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
-      GEMINI_QUOTA_WORKER_URL: ${{ vars.GEMINI_QUOTA_WORKER_URL }}
-      GEMINI_QUOTA_WORKER_TOKEN: ${{ secrets.GEMINI_QUOTA_WORKER_TOKEN }}
+      GEMINI_QUOTA_API_URL: ${{ vars.GEMINI_QUOTA_API_URL }}
+      GEMINI_QUOTA_API_TOKEN: ${{ secrets.GEMINI_QUOTA_API_TOKEN }}
 
     steps:
       - name: Checkout
@@ -172,12 +172,12 @@ jobs:
             echo "Repository secret GEMINI_API_KEYS is required" >&2
             exit 1
           fi
-          if [[ -z "${GEMINI_QUOTA_WORKER_URL}" ]]; then
-            echo "Repository variable GEMINI_QUOTA_WORKER_URL is required" >&2
+          if [[ -z "${GEMINI_QUOTA_API_URL}" ]]; then
+            echo "Repository variable GEMINI_QUOTA_API_URL is required" >&2
             exit 1
           fi
-          if [[ -z "${GEMINI_QUOTA_WORKER_TOKEN}" ]]; then
-            echo "Repository secret GEMINI_QUOTA_WORKER_TOKEN is required" >&2
+          if [[ -z "${GEMINI_QUOTA_API_TOKEN}" ]]; then
+            echo "Repository secret GEMINI_QUOTA_API_TOKEN is required" >&2
             exit 1
           fi
 

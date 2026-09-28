@@ -1,0 +1,3 @@
+fastapi==0.141.1
+redis==7.4.1
+uvicorn==0.54.0

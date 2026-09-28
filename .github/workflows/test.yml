@@ -5,11 +5,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:9.1.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VALKEY_TEST_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt -r quota_api/requirements.txt
       - run: python -m unittest discover -s tests
-      - run: python -m py_compile pdf2md.py prepare_result.py
+      - run: python -m py_compile pdf2md.py prepare_result.py quota_client.py quota_api/*.py

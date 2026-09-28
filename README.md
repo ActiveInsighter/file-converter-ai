@@ -154,7 +154,7 @@ media_resolution = ultra_high
 verification_passes = 0
 ```
 
-其中 `concurrency = 50` 是客户端同时处理的页面任务数；真正的 Gemini 请求由 Durable Object 统一限制为最多 24 个在途、持续 2 req/s。
+其中 `concurrency = 50` 是客户端同时处理的页面任务数；真正的 Gemini 请求由 quota API 统一限制为最多 24 个在途、持续 2 req/s。
 
 ## 本地运行
 
@@ -208,47 +208,26 @@ verification_passes = 0
 
 ### Project 级配额与跨 Action 调度
 
-Gemini RPM/RPD 按 **Google Cloud Project** 计算。全局配额池运行在 `worker/` 下的 Cloudflare Worker + SQLite Durable Object 中；DO 为所有 GitHub Actions 原子发放 lease、计数并记录 cooldown。Worker 只保存项目编号、配额状态和 lease，**不接收或保存 Gemini API Key**。
-
-此仓库配置为 66 个 key 对应 66 个独立 Project。Worker 会拒绝 key 数或唯一 Project 数不等于 66 的配置。`GEMINI_API_KEYS` 继续只放在 GitHub Actions Secret 中；`GEMINI_KEY_GROUPS` 可选，与 key 按行对应。若不设置，它会按 `project-1` 至 `project-66` 生成映射。更换或重排 key 时，必须保持对应的项目组顺序不变。
+Gemini RPM/RPD 按 **Google Cloud Project** 计算。66 个 key 分属 66 个独立 Project。所有 GitHub Actions 通过 HTTPS 调用 `quota_api/`，服务在本机访问 Valkey。`quota_api/scheduler.lua` 原子发放 lease、增加当日计数、控制 RPM 和全局速率，并处理 429/503。Valkey 只保存 Project 编号、配额状态和 lease；**Gemini API Key 仍只存在 GitHub Secret 中**。
 
 Actions 需要以下仓库设置：
 
 | 类型 | 名称 | 用途 |
 | --- | --- | --- |
-| Variable | `GEMINI_QUOTA_WORKER_URL` | `https://file-converter-gemini-quota.2212148739lbw.workers.dev` |
-| Secret | `GEMINI_QUOTA_WORKER_TOKEN` | Worker 的 Bearer 认证令牌 |
+| Variable | `GEMINI_QUOTA_API_URL` | quota API 的 HTTPS 根地址 |
+| Secret | `GEMINI_QUOTA_API_TOKEN` | quota API 的 Bearer 认证令牌 |
 | Secret | `GEMINI_API_KEYS` | 66 个 Gemini API Key，每行一个 |
 | Variable（可选） | `GEMINI_KEY_GROUPS` | 每个 key 对应的 Project 组名，每行一个 |
 
-现有 `rpm_per_key` / `rpd_per_key` workflow 参数保留以兼容 n8n；它们实际配置每个 **Project** 的限额，默认分别为 15 RPM 和 500 RPD。所有并发 Action 使用同一个额度池和配置。
+当前 HTTPS 入口为 `https://n8n.any1.tech/file-converter-quota`；quota API 和 Valkey 实际运行在本机回环地址，经现有网关的 SSH 反向隧道转发。
 
-除 Project 配额外，DO 还对所有 Action 统一整形：最多 24 个 Gemini 请求在途，持续启动速率 2 req/s，空闲时最多突发 8 个。发现最近 20 个结果中 503 占比达到 20%（至少 5 个结果）时，会分阶段把在途上限降至 12、再降至 8，并分别增加 5–15 秒、15–30 秒、30–60 秒的随机全局冷却；连续稳定成功后再逐步恢复。lease 超时为 180 秒，Gemini HTTP 超时为 120 秒。
+如果不设置 `GEMINI_KEY_GROUPS`，会按 `project-1` 至 `project-66` 生成映射。服务拒绝不等于 66 个或不唯一的 Project 映射，初始化后也拒绝重排。`rpm_per_key` / `rpd_per_key` workflow 参数保留以兼容 n8n；它们实际配置每个 Project 的限额，默认 15 RPM 和 500 RPD。
 
-Cloudflare Workers Free 计划的 SQLite Durable Objects 每天有 500 万行读取额度，按 00:00 UTC 重置。调度器在全局等待时不会扫描 66 个 Project，并为活跃 lease 查询建立索引，以降低这一额度的消耗。若账号当天额度耗尽，Cloudflare 会拒绝 DO 存储读取，转换任务会在配置阶段失败；需要等额度重置或改用 Workers Paid 计划。
+全局调度最多允许 24 个 Gemini 请求在途，持续启动速率 2 req/s，空闲时突发上限 8 个。近 20 个结果中 503 占比达到 20%（至少 5 个结果）时，自动将上限降至 12、再降至 8，并加入随机全局冷却；持续成功后恢复。lease 超时 180 秒，Gemini HTTP 超时 120 秒。Valkey Sorted Set 维护每个 Project 的下次可用时间，正常发放 lease 时无需扫描 66 个 Project。
 
-每页每轮只请求一次：先完成所有页面的首轮，再把可重试失败页放入两轮 deferred retry；两轮分别随机等待 30–60 秒和 60–120 秒。400/401/403/404、超过请求体限制和全局 RPD 耗尽会直接记为最终失败。日志每 15 秒输出一次聚合请求数、429/503、p50/p95 延迟和 DO 状态，避免逐次重试刷屏。
+每页每轮只请求一次：先完成全部页面首轮，再分两轮重试可恢复的失败页。429 按 error details 分类，尊重 `Retry-After` / `RetryInfo`；只有明确的每日请求额度错误才停用该 Project 至 Pacific Time 次日。API 的 `/v1/lease` 支持 `requestId`，请求超时后以相同 ID 重试会返回原 lease；`/v1/report` 重复提交不会重复计数。`/v1/status` 提供 Project 与全局状态；日志每 15 秒汇总进度、429/503 和 p50/p95 延迟。
 
-调度过程：
-
-- `/v1/lease` 由 DO 按可用时间、当日用量和 round-robin 顺序原子挑选 Project，并在发放 lease 时增加 RPD 计数；
-- `/v1/lease` 同时检查共享在途上限、全局 token bucket 和全局冷却，只有真正取得 lease 的调用会占用在途名额；
-- Gemini 返回后，Action 通过 `/v1/report` 回报状态；429 按 error details 分类，尊重 `Retry-After` / `RetryInfo`，泛化 429 暂停对应 Project 并触发短暂全局退避；明确的每日请求额度错误会停用该 Project 至 Pacific Time 次日；
-- 503 不会通过换 key 反复冲击同一模型后端；DO 根据近期 503 占比启动全局冷却和动态降并发，失败页面之后再进入 deferred retry；
-- 每个 Pacific Time 新日首次访问时自动重置每日计数和 cooldown；
-- GitHub Actions 不再读取或提交 `quota-state` 分支；`quota-usage.json` 记录本次 Action 的用量，`/v1/status` 返回 Project 和全局控制状态。
-
-部署 Worker：
-
-```bash
-cd worker
-wrangler deploy
-wrangler secret put QUOTA_API_TOKEN
-```
-
-把 Worker URL 保存到 Repository Variable `GEMINI_QUOTA_WORKER_URL`，并把同一个 `QUOTA_API_TOKEN` 保存为 Repository Secret `GEMINI_QUOTA_WORKER_TOKEN`。
-
-当前已部署的 Worker 地址为 `https://file-converter-gemini-quota.2212148739lbw.workers.dev`。旧 `quota-state` 分支中 2026-09-28 Pacific 日的 66 个项目用量已导入 Durable Object；该分支仅保留作历史备份。
+`deploy/valkey/docker-compose.yml` 使用官方 Valkey 9.1.2 镜像、AOF `everysec` 与 RDB 快照，6379 仅映射到 `127.0.0.1`。没有 Docker 的 Ubuntu 主机也可使用发行版 `valkey-server` 包，启用相同的持久化配置。`deploy/quota-api.service` 将 API 绑定到本机 `127.0.0.1:8788`；由现有 HTTPS 入口反向代理，不向公网开放 Valkey 或 Uvicorn 端口。具体部署步骤见 `deploy/README.md`。
 
 ## AnyWorkflow Remote integration
 

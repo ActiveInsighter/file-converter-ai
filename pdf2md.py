@@ -17,7 +17,7 @@ import fitz
 import gdown
 import httpx
 
-from quota_worker import (
+from quota_client import (
     ProjectQuotaPool,
     QuotaPoolExhaustedError,
     classify_quota_error,
