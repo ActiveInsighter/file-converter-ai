@@ -1,0 +1,80 @@
+name: benchmark-50x2
+
+on:
+  push:
+    branches:
+      - "feat/high-throughput-defaults-50x2"
+    paths:
+      - ".github/workflows/benchmark-50x2.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GEMINI_API_KEYS_ALL: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/14EPNh_iAdchuEcz7Y-jBMXVZJ9AA2aoi/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run matched 20-page benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTIVE_KEYS="$(printf '%s\n' "$GEMINI_API_KEYS_ALL" | sed -n '7,9p')"
+          if [[ "$(printf '%s\n' "$ACTIVE_KEYS" | sed '/^$/d' | wc -l)" -ne 3 ]]; then
+            echo "Expected active benchmark keys 7-9" >&2
+            exit 1
+          fi
+
+          common=(
+            --source-url "$SOURCE_URL"
+            --model gemini-3.5-flash-lite
+            --thinking-level high
+            --dpi 240
+            --image-format png
+            --jpeg-quality 95
+            --verification-passes 0
+            --media-resolution ultra_high
+            --rpm-per-key 15
+            --rpd-per-key 500
+            --start-page 1
+            --end-page 20
+          )
+
+          start_old="$(date +%s)"
+          GITHUB_TOKEN="" GEMINI_KEY_GROUPS="" GEMINI_API_KEYS="$ACTIVE_KEYS" \
+            python pdf2md.py "${common[@]}" \
+              --images-per-request 1 \
+              --concurrency 5 \
+              --work-dir work-old \
+              --output-dir output-old
+          end_old="$(date +%s)"
+
+          start_new="$(date +%s)"
+          GITHUB_TOKEN="" GEMINI_KEY_GROUPS="" GEMINI_API_KEYS="$ACTIVE_KEYS" \
+            python pdf2md.py "${common[@]}" \
+              --images-per-request 2 \
+              --concurrency 50 \
+              --work-dir work-new \
+              --output-dir output-new
+          end_new="$(date +%s)"
+
+          old_seconds="$((end_old - start_old))"
+          new_seconds="$((end_new - start_new))"
+          python - <<PY
+          old_seconds = int("$old_seconds")
+          new_seconds = int("$new_seconds")
+          speedup = old_seconds / new_seconds if new_seconds else 0
+          reduction = (1 - new_seconds / old_seconds) * 100 if old_seconds else 0
+          print(f"BENCHMARK_RESULT old_seconds={old_seconds} new_seconds={new_seconds} speedup={speedup:.2f}x time_reduction={reduction:.1f}%")
+          PY
