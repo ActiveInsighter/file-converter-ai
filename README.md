@@ -297,3 +297,109 @@ The worker credential needs repository **Actions: write** permission.
 ### 高吞吐默认值
 
 默认值已调整为 `images_per_request = 2` 与 `concurrency = 50`。HTTP 客户端同时扩大连接池与 keep-alive 池；请求图片的 Base64 构造也放入并发槽内，避免长 PDF 在排队阶段提前把所有图片载荷常驻内存。图像质量保持 `240 DPI + PNG + ultra_high`，没有通过降低图片质量换取吞吐。
+
+## NVIDIA API / DeepSeek V4.1 Flash 实验分支
+
+本仓库额外提供 NVIDIA API Catalog 的独立转换链路，不会影响现有 Gemini workflow：
+
+- 脚本：`pdf2md_nvidia.py`
+- Action：`PDF to Markdown with NVIDIA DeepSeek`
+- 快速测试：`scripts/test_nvidia_api.py`
+- 默认模型：`deepseek-ai/deepseek-v4.1-flash`
+- API Base：`https://integrate.api.nvidia.com/v1`
+- 图片通过 OpenAI 兼容 Chat Completions 的 `image_url` + Base64 data URL 发送。
+
+### 添加 NVIDIA API Key
+
+先在 NVIDIA Build 模型页面登录，点击 **Generate API Key** 生成 Key。然后进入本仓库：
+
+**Settings → Secrets and variables → Actions → New repository secret**
+
+Secret 名称必须是：
+
+```text
+NVIDIA_API_KEYS
+```
+
+只有一个 Key 时直接粘贴即可；如果以后有多个 Key，可以每行一个：
+
+```text
+nvapi-xxxxxxxx
+nvapi-yyyyyyyy
+```
+
+不要把 Key 写进代码、README、workflow input 或普通 Repository Variable。
+
+### GitHub Actions 运行
+
+进入：
+
+**Actions → PDF to Markdown with NVIDIA DeepSeek → Run workflow**
+
+建议第一次只跑 1～4 页验证：
+
+```text
+images_per_request = 2
+concurrency = 4~8
+model = deepseek-ai/deepseek-v4.1-flash
+dpi = 240
+image_format = png
+max_tokens = 32768
+temperature = 0.1
+top_p = 0.95
+```
+
+确认没有 429 后再逐步提高 `concurrency`。NVIDIA workflow 和 Gemini workflow 使用不同的 concurrency group，不会互相排队。
+
+### 本地快速测试
+
+只测试 API 连通性：
+
+```bash
+export NVIDIA_API_KEY='nvapi-...'
+python scripts/test_nvidia_api.py
+```
+
+测试图片输入：
+
+```bash
+python scripts/test_nvidia_api.py --image page.png
+```
+
+完整 PDF 转 Markdown：
+
+```bash
+export NVIDIA_API_KEYS='nvapi-...'
+python pdf2md_nvidia.py \
+  --source-url 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
+  --images-per-request 2 \
+  --concurrency 8 \
+  --model deepseek-ai/deepseek-v4.1-flash
+```
+
+### 从 n8n / 外部程序触发
+
+NVIDIA Action 使用独立事件类型：
+
+```text
+pdf_to_md_nvidia
+```
+
+例如：
+
+```json
+{
+  "event_type": "pdf_to_md_nvidia",
+  "client_payload": {
+    "source_url": "https://drive.google.com/file/d/FILE_ID/view?usp=drivesdk",
+    "images_per_request": 2,
+    "concurrency": 8,
+    "model": "deepseek-ai/deepseek-v4.1-flash",
+    "max_tokens": 32768,
+    "temperature": 0.1,
+    "top_p": 0.95
+  }
+}
+```
+
+输出结构与 Gemini 版本一致，额外包含 `nvidia-usage.json`；`manifest.json` 会记录 `provider=nvidia`、模型、并发和采样参数。
