@@ -45,6 +45,11 @@ on:
         required: true
         default: "0.95"
         type: string
+      nvidia_rpm_per_key:
+        description: "NVIDIA client-side requests/minute per API key"
+        required: true
+        default: "40"
+        type: string
       images_per_request:
         description: "How many consecutive PDF pages/images to send in one provider request"
         required: true
@@ -154,6 +159,7 @@ jobs:
       NVIDIA_MAX_TOKENS: ${{ github.event.inputs.nvidia_max_tokens || github.event.client_payload.nvidia_max_tokens || '32768' }}
       NVIDIA_TEMPERATURE: ${{ github.event.inputs.nvidia_temperature || github.event.client_payload.nvidia_temperature || '0.1' }}
       NVIDIA_TOP_P: ${{ github.event.inputs.nvidia_top_p || github.event.client_payload.nvidia_top_p || '0.95' }}
+      NVIDIA_RPM_PER_KEY: ${{ github.event.inputs.nvidia_rpm_per_key || github.event.client_payload.nvidia_rpm_per_key || '40' }}
       IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
@@ -240,6 +246,7 @@ jobs:
               --max-tokens "${NVIDIA_MAX_TOKENS}"
               --temperature "${NVIDIA_TEMPERATURE}"
               --top-p "${NVIDIA_TOP_P}"
+              --rpm-per-key "${NVIDIA_RPM_PER_KEY}"
             )
             python pdf2md_nvidia.py "${common_args[@]}" "${provider_args[@]}"
           else
