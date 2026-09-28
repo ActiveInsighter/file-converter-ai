@@ -20,12 +20,12 @@ on:
       images_per_request:
         description: "How many consecutive PDF pages/images to send in one Gemini request"
         required: true
-        default: "1"
+        default: "2"
         type: string
       concurrency:
         description: "Maximum simultaneous Gemini requests"
         required: true
-        default: "5"
+        default: "50"
         type: string
       prompt:
         description: "Prompt. Leave empty to use the built-in faithful Markdown conversion prompt"
@@ -122,8 +122,8 @@ jobs:
     env:
       OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
-      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
-      CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '5' }}
+      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '2' }}
+      CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
