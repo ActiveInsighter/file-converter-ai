@@ -113,13 +113,7 @@ on:
     types: [pdf_to_md]
 
 permissions:
-  contents: write
-
-# All file conversion runs share the same Gemini key pool.
-# Queue runs instead of letting separate Actions race the same API quotas.
-concurrency:
-  group: file-converter-gemini-api
-  queue: max
+  contents: read
 
 jobs:
   convert:
@@ -146,9 +140,8 @@ jobs:
       END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
-      GEMINI_QUOTA_STATE_BRANCH: quota-state
-      GEMINI_QUOTA_STATE_PATH: quota-state.json
-      GITHUB_TOKEN: ${{ github.token }}
+      GEMINI_QUOTA_WORKER_URL: ${{ vars.GEMINI_QUOTA_WORKER_URL }}
+      GEMINI_QUOTA_WORKER_TOKEN: ${{ secrets.GEMINI_QUOTA_WORKER_TOKEN }}
 
     steps:
       - name: Checkout
@@ -177,6 +170,14 @@ jobs:
           fi
           if [[ -z "${GEMINI_API_KEYS}" ]]; then
             echo "Repository secret GEMINI_API_KEYS is required" >&2
+            exit 1
+          fi
+          if [[ -z "${GEMINI_QUOTA_WORKER_URL}" ]]; then
+            echo "Repository variable GEMINI_QUOTA_WORKER_URL is required" >&2
+            exit 1
+          fi
+          if [[ -z "${GEMINI_QUOTA_WORKER_TOKEN}" ]]; then
+            echo "Repository secret GEMINI_QUOTA_WORKER_TOKEN is required" >&2
             exit 1
           fi
 
