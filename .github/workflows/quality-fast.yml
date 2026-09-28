@@ -1,0 +1,84 @@
+name: quality-fast-math-ab
+
+on:
+  push:
+    branches:
+      - "bench/quality-1x-vs-2x"
+    paths:
+      - ".github/workflows/quality-fast.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GEMINI_API_KEYS_ALL: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/14EPNh_iAdchuEcz7Y-jBMXVZJ9AA2aoi/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run fast matched math quality A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path
+          import fitz, gdown, httpx
+          from pdf2md import Chunk, DEFAULT_PROMPT, call_gemini, make_request_parts
+          from quota_state import ProjectQuotaPool
+
+          TARGETS=[11,13,16,17,20]
+          EXTRA="""\n10. 为便于逐页核对，每页开始前输出：===== PAGE NNN =====。严格核对公式中的正负号、上下标、分式、根号、积分/求和上下限、矩阵元素、转置与区间端点。"""
+
+          async def main():
+              raw=[x.strip() for x in os.environ["GEMINI_API_KEYS_ALL"].splitlines() if x.strip()]
+              keys=raw[6:9]
+              if len(keys)!=3: raise RuntimeError("expected keys 7-9")
+              root=Path("quality-fast"); images=root/"images"; old=root/"old"; new=root/"new"
+              for d in (images,old,new): d.mkdir(parents=True,exist_ok=True)
+              pdf=root/"source.pdf"
+              gdown.download(url=os.environ["SOURCE_URL"],output=str(pdf),quiet=True,fuzzy=True)
+              doc=fitz.open(pdf)
+              for p in sorted(set(TARGETS+[x+1 for x in TARGETS])):
+                  pix=doc[p-1].get_pixmap(matrix=fitz.Matrix(240/72,240/72),alpha=False)
+                  (images/f"{p:03}.png").write_bytes(pix.tobytes("png"))
+              doc.close()
+              pool=await ProjectQuotaPool.create(keys,["q1","q2","q3"],15,500)
+              prompt=DEFAULT_PROMPT+EXTRA
+              async with httpx.AsyncClient(timeout=httpx.Timeout(300.0,connect=30.0),limits=httpx.Limits(max_connections=20,max_keepalive_connections=10)) as client:
+                  for p in TARGETS:
+                      c=Chunk(p,p,(images/f"{p:03}.png",),f"{p:03}")
+                      parts,_=make_request_parts(c,prompt,"ultra_high")
+                      t=await call_gemini(client,pool,len(keys),"gemini-3.5-flash-lite",parts,f"old-{p:03}","high")
+                      (old/f"{p:03}.md").write_text(t+"\n",encoding="utf-8")
+                  for p in TARGETS:
+                      c=Chunk(p,p+1,(images/f"{p:03}.png",images/f"{p+1:03}.png"),f"{p:03}-{p+1:03}")
+                      parts,_=make_request_parts(c,prompt,"ultra_high")
+                      t=await call_gemini(client,pool,len(keys),"gemini-3.5-flash-lite",parts,f"new-{p:03}-{p+1:03}","high")
+                      (new/f"{p:03}-{p+1:03}.md").write_text(t+"\n",encoding="utf-8")
+              await pool.close()
+              for p in TARGETS:
+                  print(f"===== OLD_{p:03} =====")
+                  print((old/f"{p:03}.md").read_text(encoding="utf-8"))
+                  print(f"===== NEW_{p:03}_{p+1:03} =====")
+                  print((new/f"{p:03}-{p+1:03}.md").read_text(encoding="utf-8"))
+          asyncio.run(main())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-fast-${{ github.run_id }}
+          path: quality-fast/
+          retention-days: 2
