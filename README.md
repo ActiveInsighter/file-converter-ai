@@ -7,7 +7,7 @@
 - 支持普通 HTTP(S) PDF 下载地址。
 - 支持 Google Drive 公开分享链接，例如：
   `https://drive.google.com/file/d/FILE_ID/view?usp=drivesdk`
-- PDF 按页渲染为 JPEG。
+- PDF 按页渲染为 PNG（默认无损）；也可显式选择 JPEG。
 - `images_per_request` 控制一次请求发送多少张连续页面图片。
 - `concurrency` 控制同时进行的 Gemini 请求数。
 - 支持自定义提示词、模型、DPI 和 JPEG 质量。
@@ -51,8 +51,8 @@ AIza...key10
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
-| `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
-| `concurrency` | 最大 Gemini 并发请求数 | `5` |
+| `images_per_request` | 每次请求发送几张连续页面图片 | `2` |
+| `concurrency` | 最大 Gemini 并发请求数 | `50` |
 | `prompt` | 自定义提示词；留空使用内置 Markdown 转换提示词 | 空 |
 | `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
 | `thinking_level` | Gemini 思考深度 | `high` |
@@ -101,8 +101,8 @@ Content-Type: application/json
   "event_type": "pdf_to_md",
   "client_payload": {
     "source_url": "https://drive.google.com/file/d/12DMkT6QkZSad5_SsxvcsHgFKsQrxf9JN/view?usp=drivesdk",
-    "images_per_request": 3,
-    "concurrency": 10,
+    "images_per_request": 2,
+    "concurrency": 50,
     "prompt": "请准确识别页面内容并转换为 Markdown，公式使用 LaTeX。",
     "model": "gemini-3.5-flash-lite",
     "thinking_level": "high",
@@ -139,18 +139,19 @@ output/errors/<页码范围>.json
 
 Gemini 内联图片请求存在总请求大小限制，脚本会估算 Base64 后体积，过大时要求降低图片数或图片质量。
 
-建议先用：
+当前默认吞吐配置：
 
 ```text
-images_per_request = 2~4
-concurrency = 5~10
-dpi = 220
+images_per_request = 2
+concurrency = 50
+dpi = 240
 image_format = png
 jpeg_quality = 95
+media_resolution = ultra_high
 verification_passes = 0
 ```
 
-确认你的 Google AI Studio 项目实际限流后，再逐步增加并发。
+其中 `concurrency = 50` 是客户端同时在途请求的上限；实际发起速率仍由 Project 级 RPM/RPD 调度器约束，因此不会为了凑满 50 并发而绕过配额。
 
 ## 本地运行
 
@@ -159,8 +160,8 @@ pip install -r requirements.txt
 export GEMINI_API_KEYS=$'key1\nkey2\nkey3'
 python pdf2md.py \
   --source-url 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
-  --images-per-request 3 \
-  --concurrency 10 \
+  --images-per-request 2 \
+  --concurrency 50 \
   --thinking-level high
 ```
 
@@ -181,7 +182,7 @@ jpeg_quality = 90
 
 ### 默认图像质量
 
-当前默认使用 **240 DPI + PNG 无损**。PNG 仍会进行无损压缩，但不会损失像素信息；相比真正的未压缩位图，体积小很多而视觉内容完全一致。对于本次 110 页数学 PDF，抽样页约 0.68 MB/页，3 页一组经过 Base64 后仍远低于 Gemini 内联请求大小限制。
+当前默认使用 **240 DPI + PNG 无损**。PNG 仍会进行无损压缩，但不会损失像素信息；相比真正的未压缩位图，体积小很多而视觉内容完全一致。对于本次 110 页数学 PDF，抽样页约 0.68 MB/页，2 页一组经过 Base64 后仍远低于 Gemini 内联请求大小限制。
 
 默认不会执行额外图片对照审校（`verification_passes = 0`）；如手动开启，则会在初次转录后执行额外审校，也就是同一页组会经过“转录 → 再对照原图修正”的两阶段处理。可将 `verification_passes` 设为 0 关闭，或提高到 2~3（会增加耗时和 API 用量）。
 
@@ -191,7 +192,7 @@ jpeg_quality = 90
 对公式密集型 PDF，默认配置现在是：
 
 ```text
-images_per_request = 1
+images_per_request = 2
 dpi = 240
 image_format = png
 thinking_level = high
@@ -291,3 +292,8 @@ filename is configurable independently of the task title.
 The GitHub REST API version `2026-03-10` returns `workflow_run_id` from
 [workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
 The worker credential needs repository **Actions: write** permission.
+
+
+### 高吞吐默认值
+
+默认值已调整为 `images_per_request = 2` 与 `concurrency = 50`。HTTP 客户端同时扩大连接池与 keep-alive 池；请求图片的 Base64 构造也放入并发槽内，避免长 PDF 在排队阶段提前把所有图片载荷常驻内存。图像质量保持 `240 DPI + PNG + ultra_high`，没有通过降低图片质量换取吞吐。

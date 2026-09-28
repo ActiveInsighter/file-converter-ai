@@ -602,7 +602,12 @@ async def process_chunks(
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(240.0, connect=30.0)
+        timeout=httpx.Timeout(240.0, connect=30.0),
+        limits=httpx.Limits(
+            max_connections=max(100, concurrency * 2),
+            max_keepalive_connections=max(50, concurrency),
+            keepalive_expiry=30.0,
+        ),
     ) as client:
 
         async def run_one(chunk: Chunk) -> dict:
@@ -611,10 +616,10 @@ async def process_chunks(
             started = time.time()
 
             try:
-                parts, estimated = make_request_parts(
-                    chunk, prompt, media_resolution
-                )
                 async with semaphore:
+                    parts, estimated = make_request_parts(
+                        chunk, prompt, media_resolution
+                    )
                     text = await call_gemini(
                         client,
                         key_pool,
@@ -626,10 +631,10 @@ async def process_chunks(
                     )
 
                 for verify_index in range(verification_passes):
-                    verify_parts, _ = make_verification_parts(
-                        chunk, prompt, text, media_resolution
-                    )
                     async with semaphore:
+                        verify_parts, _ = make_verification_parts(
+                            chunk, prompt, text, media_resolution
+                        )
                         text = await call_gemini(
                             client,
                             key_pool,
@@ -713,8 +718,8 @@ def merge_markdown(
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--source-url", required=True)
-    p.add_argument("--images-per-request", type=int, default=1)
-    p.add_argument("--concurrency", type=int, default=5)
+    p.add_argument("--images-per-request", type=int, default=2)
+    p.add_argument("--concurrency", type=int, default=50)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--model", default="gemini-3.5-flash-lite")
     p.add_argument(
