@@ -67,14 +67,17 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reports_are_idempotent_and_503s_reduce_global_capacity(self):
         await self.configure()
-        leases = [(await self.scheduler.lease()).body for _ in range(5)]
+        leases = []
+        for _ in range(10):
+            self.now[0] += 1_000
+            leases.append((await self.scheduler.lease()).body)
         for lease in leases:
             result = await self.scheduler.report(lease["leaseId"], 503)
             self.assertEqual(result.status, 200)
         duplicate = await self.scheduler.report(leases[0]["leaseId"], 503)
         self.assertTrue(duplicate.body["duplicate"])
         state = (await self.scheduler.status()).body["global"]
-        self.assertEqual(state["recentOutcomes"], 5)
+        self.assertEqual(state["recentOutcomes"], 10)
         self.assertEqual(state["maxInflight"], 12)
         self.assertGreater(state["cooldownRemainingMs"], 0)
         self.now[0] += 31_000
@@ -83,6 +86,35 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         state = (await self.scheduler.status()).body["global"]
         self.assertEqual(state["maxInflight"], 8)
         self.assertEqual(state["adaptiveStage"], 2)
+
+    async def test_partial_success_recovery_lifts_capacity_off_the_floor(self):
+        """A ~70% success window must be enough to climb back.
+
+        The previous gate demanded 19 successes out of the last 20 outcomes,
+        which a free tier answering 503 on a third of its calls can never
+        satisfy, so the pool stayed at 8 in-flight plus cooldowns forever.
+        """
+        await self.configure()
+        for _ in range(10):
+            self.now[0] += 1_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 503)
+        self.now[0] += 31_000
+        lease = (await self.scheduler.lease()).body
+        await self.scheduler.report(lease["leaseId"], 503)
+        state = (await self.scheduler.status()).body["global"]
+        self.assertEqual(state["maxInflight"], 8)
+
+        for index in range(15):
+            self.now[0] += 1_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 200)
+            if index % 5 == 4:
+                self.now[0] += 21_000
+
+        state = (await self.scheduler.status()).body["global"]
+        self.assertGreater(state["maxInflight"], 8)
+        self.assertLess(state["adaptiveStage"], 2)
 
     async def test_explicit_daily_exhaustion_removes_only_that_project(self):
         await self.configure()

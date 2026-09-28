@@ -222,7 +222,13 @@ if op == 'report' then
   local last_change = number_field(global, 'controller_changed_at', 0)
   local current_max = math.min(configured_max,
     number_field(global, 'max_inflight_current', configured_max))
-  if count >= 5 and unavailable / count >= 0.2 and
+  -- Backpressure controller, graded in both directions. The previous recovery
+  -- gate required 19 successes out of the last 20 outcomes, which a free-tier
+  -- model that answers 503 on roughly half of its calls can never satisfy, so
+  -- the pool pinned itself at 8 in-flight plus a long global cooldown forever.
+  local degrade_ratio = tonumber(ARGV[11]) or 0.35
+  local recover_ratio = tonumber(ARGV[12]) or 0.60
+  if count >= 10 and unavailable / count >= degrade_ratio and
     now - last_change >= 30000 then
     local stage = math.min(3, number_field(global, 'adaptive_stage', 0) + 1)
     local next_max = math.min(configured_max, current_max > 12 and 12 or 8)
@@ -233,11 +239,18 @@ if op == 'report' then
       'adaptive_stage', stage, 'controller_changed_at', now,
       'cooldown_until', math.max(until_time,
       number_field(global, 'cooldown_until', 0)))
-  elseif status == 200 and count >= 20 and successes >= 19 and
-    current_max < configured_max and now - last_change >= 60000 then
-    local next_max = current_max <= 8 and 12 or configured_max
+  elseif status == 200 and count >= 10 and
+    successes / count >= recover_ratio and
+    current_max < configured_max and now - last_change >= 20000 then
+    local next_max = configured_max
+    if current_max <= 8 then
+      next_max = 12
+    elseif current_max <= 12 then
+      next_max = 16
+    end
     redis.call('HSET', global, 'max_inflight_current',
-      math.min(configured_max, next_max), 'adaptive_stage', 0,
+      math.min(configured_max, next_max),
+      'adaptive_stage', math.max(0, number_field(global, 'adaptive_stage', 0) - 1),
       'controller_changed_at', now)
   end
   return result(200, {reported = true, duplicate = false,
