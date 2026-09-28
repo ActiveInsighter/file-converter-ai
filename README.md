@@ -206,74 +206,42 @@ verification_passes = 0
 原因：同一模型进行第二次“整段重写式审校”有时会修正错误，也可能把原本正确的公式改错，所以默认关闭；需要时仍可手动开启。相比单纯继续增加 DPI，Gemini 3 的 `MEDIA_RESOLUTION_ULTRA_HIGH` 会给每张图片分配更高的视觉 token 预算，更适合小字号公式、上下标和矩阵。
 
 
-### Project 级配额与跨 Action 持久化
+### Project 级配额与跨 Action 调度
 
-Gemini API 的 RPM/RPD 按 **Google Cloud Project** 计算，而不是按 API Key。仓库现在使用 Project 配额池调度，并把使用状态持久化到专用的 `quota-state` 分支：
+Gemini RPM/RPD 按 **Google Cloud Project** 计算。全局配额池运行在 `worker/` 下的 Cloudflare Worker + SQLite Durable Object 中；DO 为所有 GitHub Actions 原子发放 lease、计数并记录 cooldown。Worker 只保存项目编号、配额状态和 lease，**不接收或保存 Gemini API Key**。
 
-```text
-quota-state
-└── quota-state.json
+此仓库配置为 66 个 key 对应 66 个独立 Project。Worker 会拒绝 key 数或唯一 Project 数不等于 66 的配置。`GEMINI_API_KEYS` 继续只放在 GitHub Actions Secret 中；`GEMINI_KEY_GROUPS` 可选，与 key 按行对应。若不设置，它会按 `project-1` 至 `project-66` 生成映射。更换或重排 key 时，必须保持对应的项目组顺序不变。
+
+Actions 需要以下仓库设置：
+
+| 类型 | 名称 | 用途 |
+| --- | --- | --- |
+| Variable | `GEMINI_QUOTA_WORKER_URL` | `https://file-converter-gemini-quota.2212148739lbw.workers.dev` |
+| Secret | `GEMINI_QUOTA_WORKER_TOKEN` | Worker 的 Bearer 认证令牌 |
+| Secret | `GEMINI_API_KEYS` | 66 个 Gemini API Key，每行一个 |
+| Variable（可选） | `GEMINI_KEY_GROUPS` | 每个 key 对应的 Project 组名，每行一个 |
+
+现有 `rpm_per_key` / `rpd_per_key` workflow 参数保留以兼容 n8n；它们实际配置每个 **Project** 的限额，默认分别为 15 RPM 和 500 RPD。所有并发 Action 使用同一个额度池和配置。
+
+调度过程：
+
+- `/v1/lease` 由 DO 按可用时间、当日用量和 round-robin 顺序原子挑选 Project，并在发放 lease 时增加 RPD 计数；
+- Gemini 返回后，Action 通过 `/v1/report` 回报状态；429 立即更新该 Project 的 cooldown；明确的每日额度错误会停用该 Project 至 Pacific Time 次日；
+- 503 和网络错误只记为请求错误，不触发 quota cooldown；重试会重新申请 lease，切换到其它可用 Project；
+- 每个 Pacific Time 新日首次访问时自动重置每日计数和 cooldown；
+- GitHub Actions 不再串行排队，也不再读取或提交 `quota-state` 分支；`quota-usage.json` 记录本次 Action 的用量，`/v1/status` 返回全局状态。
+
+部署 Worker：
+
+```bash
+cd worker
+wrangler deploy
+wrangler secret put QUOTA_API_TOKEN
 ```
 
-状态文件只保存 `key#1`、`key#2` 这样的编号和统计信息，**不会保存真实 API Key**。每次 Action 启动都会读取上一次状态；运行中每 10 次请求或约 30 秒 checkpoint，一旦遇到 429 会立即 checkpoint，Action 结束时再强制保存一次。
+把 Worker URL 保存到 Repository Variable `GEMINI_QUOTA_WORKER_URL`，并把同一个 `QUOTA_API_TOKEN` 保存为 Repository Secret `GEMINI_QUOTA_WORKER_TOKEN`。
 
-需要在：
-
-**Settings → Secrets and variables → Actions → Variables**
-
-新增 Repository Variable：
-
-```text
-GEMINI_KEY_GROUPS
-```
-
-它与 `GEMINI_API_KEYS` 按行一一对应。例如：
-
-```text
-GEMINI_API_KEYS              GEMINI_KEY_GROUPS
-key1                         p1
-key2                         p1
-key3                         p2
-key4                         p3
-...
-```
-
-表示 `key1` 和 `key2` 属于同一个 Project，共享同一份 RPM/RPD；`key3` 属于另一 Project。
-
-实际 Variable 只填写右侧组名，每行一个：
-
-```text
-p1
-p1
-p2
-p3
-p4
-p5
-p6
-p7
-p8
-p9
-```
-
-如果不设置 `GEMINI_KEY_GROUPS`，为了兼容旧配置，程序会暂时把每个 Key 当成独立 Project。
-
-现有 workflow input 名 `rpm_per_key` / `rpd_per_key` 为了兼容 n8n 调用暂时保留，但**现在语义是每个 Project 配额池的 RPM/RPD**：
-
-```text
-rpm_per_key = 15   # 实际：每个 Project 15 RPM
-rpd_per_key = 500  # 实际：每个 Project 500 RPD
-```
-
-调度器会：
-
-- 在同一 Project 内轮换多个 Key，但共享同一个 RPM/RPD 计数；
-- 跨 Action 继承当天已经消耗的请求数和最近一分钟请求时间；
-- Google 返回项目级 429 时，立即更新该 Project 的 cooldown；
-- 识别到 `limit: 500` 等日额度耗尽信息时，把整个 Project 标记为当天 exhausted，跳过其所有 Key；
-- 到 **Pacific Time 新的一天**时自动重置 RPD 状态；
-- 每次 Artifact 额外输出 `quota-usage.json`，便于查看本次/累计 Project 与 Key 使用情况。
-
-GitHub workflow 本身使用同一个 concurrency group 排队，因此多个 PDF 任务可以同时提交，但 Gemini 阶段一次只运行一个 Action，避免跨 Action 抢同一组 Project 配额。
+当前已部署的 Worker 地址为 `https://file-converter-gemini-quota.2212148739lbw.workers.dev`。旧 `quota-state` 分支中 2026-09-28 Pacific 日的 66 个项目用量已导入 Durable Object；该分支仅保留作历史备份。
 
 ## AnyWorkflow Remote integration
 

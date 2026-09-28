@@ -16,7 +16,7 @@ import fitz
 import gdown
 import httpx
 
-from quota_state import ProjectQuotaPool, parse_key_groups
+from quota_worker import ProjectQuotaPool, parse_key_groups
 
 DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
 
@@ -454,7 +454,7 @@ async def call_gemini(
     last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
-        key_index, api_key = await key_pool.acquire()
+        key_index, api_key, lease_id = await key_pool.acquire()
         try:
             response = await client.post(
                 url,
@@ -476,10 +476,10 @@ async def call_gemini(
                             flush=True,
                         )
                     validate_markdown_output(text)
-                    await key_pool.mark_success(key_index)
+                    await key_pool.mark_success(key_index, lease_id)
                     return text
                 except RuntimeError as exc:
-                    await key_pool.mark_error(key_index)
+                    await key_pool.mark_error(key_index, lease_id, http_status=200)
                     last_error = exc
                     print(
                         f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
@@ -492,7 +492,9 @@ async def call_gemini(
 
             message = response.text[:2000]
             if response.status_code in {400, 404}:
-                await key_pool.mark_error(key_index)
+                await key_pool.mark_error(
+                    key_index, lease_id, http_status=response.status_code
+                )
                 raise RuntimeError(
                     f"Gemini request rejected ({response.status_code}): {message}"
                 )
@@ -528,6 +530,7 @@ async def call_gemini(
                 )
                 await key_pool.rate_limited(
                     key_index,
+                    lease_id,
                     cooldown_seconds,
                     daily_exhausted=daily_exhausted,
                 )
@@ -543,14 +546,16 @@ async def call_gemini(
                     flush=True,
                 )
             else:
-                await key_pool.mark_error(key_index)
+                await key_pool.mark_error(
+                    key_index, lease_id, http_status=response.status_code
+                )
                 print(
                     f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
                     f"HTTP {response.status_code}; rotating key",
                     flush=True,
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
-            await key_pool.mark_error(key_index)
+            await key_pool.mark_error(key_index, lease_id, http_status=0)
             last_error = exc
             print(
                 f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
@@ -588,17 +593,7 @@ async def process_chunks(
         len(keys),
         os.getenv("GEMINI_KEY_GROUPS"),
     )
-    print(
-        f"[quota] keys={len(keys)} projects={len(set(groups))} "
-        f"mapping={groups}",
-        flush=True,
-    )
-    key_pool = await ProjectQuotaPool.create(
-        keys,
-        groups,
-        rpm_per_project=rpm_per_key,
-        rpd_per_project=rpd_per_key,
-    )
+    print(f"[quota] keys={len(keys)} projects={len(set(groups))}", flush=True)
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
@@ -609,6 +604,13 @@ async def process_chunks(
             keepalive_expiry=30.0,
         ),
     ) as client:
+        key_pool = await ProjectQuotaPool.create(
+            keys,
+            groups,
+            rpm_per_project=rpm_per_key,
+            rpd_per_project=rpd_per_key,
+            client=client,
+        )
 
         async def run_one(chunk: Chunk) -> dict:
             md_path = pages_dir / f"{chunk.stem}.md"
@@ -687,11 +689,8 @@ async def process_chunks(
             encoding="utf-8",
         )
         print(
-            "[quota] " + json.dumps(
-                quota_summary,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+            f"[quota] action complete keys={len(keys)} "
+            f"requests={sum(key_pool.used)}",
             flush=True,
         )
         return results
