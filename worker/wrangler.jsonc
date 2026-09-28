@@ -13,7 +13,11 @@
     "GeminiQuotaPool": { "type": "durable-object", "storage": "sqlite" }
   },
   "vars": {
-    "EXPECTED_KEY_COUNT": "66"
+    "EXPECTED_KEY_COUNT": "66",
+    "GLOBAL_MAX_INFLIGHT": "24",
+    "GLOBAL_RPS": "2",
+    "GLOBAL_BURST": "8",
+    "GLOBAL_LEASE_TIMEOUT_SECONDS": "180"
   },
   "secrets": {
     "required": ["QUOTA_API_TOKEN"]

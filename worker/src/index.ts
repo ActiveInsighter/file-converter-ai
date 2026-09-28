@@ -18,6 +18,16 @@ type ProjectRow = {
   last_key_index: number;
 };
 
+type LeaseRow = {
+  lease_id: string;
+  group_id: string;
+  key_index: number;
+  created_at: number;
+  http_status: number | null;
+  daily_exhausted: number;
+  reported_at: number | null;
+};
+
 const pacificDate = (timestamp = Date.now()): string => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Los_Angeles",
@@ -43,6 +53,13 @@ const dateEpoch = (value: unknown): number => {
   if (typeof value !== "string") return 0;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const randomInteger = (minimum: number, maximum: number): number => {
+  const range = maximum - minimum + 1;
+  const value = new Uint32Array(1);
+  crypto.getRandomValues(value);
+  return minimum + (value[0] % range);
 };
 
 function secureEquals(left: string, right: string): boolean {
@@ -157,6 +174,11 @@ export class GeminiQuotaPool extends DurableObject<Env> {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS recent_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          http_status INTEGER NOT NULL,
+          reported_at INTEGER NOT NULL
+        );
       `);
     });
   }
@@ -175,6 +197,107 @@ export class GeminiQuotaPool extends DurableObject<Env> {
       key,
       value,
     );
+  }
+
+  private setting(value: string, fallback: number): number {
+    return positiveNumber(value) ?? fallback;
+  }
+
+  private leaseTimeoutMs(): number {
+    return this.setting(this.env.GLOBAL_LEASE_TIMEOUT_SECONDS, 180) * 1000;
+  }
+
+  private currentMaxInflight(): number {
+    const configured = Math.floor(this.setting(this.env.GLOBAL_MAX_INFLIGHT, 24));
+    const stored = Number(this.getMeta("global_max_inflight_current"));
+    if (!Number.isFinite(stored) || stored < 1) {
+      this.setMeta("global_max_inflight_current", String(configured));
+      return configured;
+    }
+    const current = Math.min(configured, Math.floor(stored));
+    if (current !== stored) this.setMeta("global_max_inflight_current", String(current));
+    return current;
+  }
+
+  private activeLeaseCount(now: number): number {
+    return this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM leases WHERE reported_at IS NULL AND created_at > ?",
+        now - this.leaseTimeoutMs(),
+      )
+      .one().count;
+  }
+
+  private recentOutcomeStats(): { count: number; unavailable: number; successes: number } {
+    const rows = this.ctx.storage.sql
+      .exec<{ http_status: number }>(
+        "SELECT http_status FROM recent_outcomes ORDER BY id DESC LIMIT 20",
+      )
+      .toArray();
+    return {
+      count: rows.length,
+      unavailable: rows.filter((row) => row.http_status === 503).length,
+      successes: rows.filter((row) => row.http_status === 200).length,
+    };
+  }
+
+  private recordOutcome(httpStatus: number, now: number): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO recent_outcomes(http_status, reported_at) VALUES(?, ?)",
+      httpStatus,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM recent_outcomes WHERE id NOT IN (SELECT id FROM recent_outcomes ORDER BY id DESC LIMIT 50)",
+    );
+  }
+
+  private updateGlobalController(httpStatus: number, quotaType: string, now: number): void {
+    const current = this.currentMaxInflight();
+    const configured = Math.floor(this.setting(this.env.GLOBAL_MAX_INFLIGHT, 24));
+    const lastChange = Number(this.getMeta("global_controller_changed_at") ?? "0");
+    const stats = this.recentOutcomeStats();
+    const ratio = stats.count === 0 ? 0 : stats.unavailable / stats.count;
+
+    if (httpStatus === 429 && (quotaType === "unknown" || quotaType === "tpm" || quotaType === "spend")) {
+      const cooldownUntil = now + randomInteger(2_000, 5_000);
+      this.setMeta(
+        "global_cooldown_until",
+        String(Math.max(Number(this.getMeta("global_cooldown_until") ?? "0"), cooldownUntil)),
+      );
+    }
+
+    if (
+      stats.count >= 5 &&
+      ratio >= 0.2 &&
+      now - lastChange >= 30_000
+    ) {
+      const stage = Math.min(3, Number(this.getMeta("global_adaptive_stage") ?? "0") + 1);
+      const next = Math.min(configured, current > 12 ? 12 : 8);
+      this.setMeta("global_max_inflight_current", String(next));
+      this.setMeta("global_adaptive_stage", String(stage));
+      this.setMeta("global_controller_changed_at", String(now));
+      const [minimum, maximum] = stage === 1 ? [5, 15] : stage === 2 ? [15, 30] : [30, 60];
+      const cooldownUntil = now + randomInteger(minimum * 1000, maximum * 1000);
+      this.setMeta(
+        "global_cooldown_until",
+        String(Math.max(Number(this.getMeta("global_cooldown_until") ?? "0"), cooldownUntil)),
+      );
+      return;
+    }
+
+    if (
+      httpStatus === 200 &&
+      stats.count >= 20 &&
+      stats.successes >= 19 &&
+      current < configured &&
+      now - lastChange >= 60_000
+    ) {
+      const next = current <= 8 ? 12 : configured;
+      this.setMeta("global_max_inflight_current", String(Math.min(configured, next)));
+      this.setMeta("global_adaptive_stage", "0");
+      this.setMeta("global_controller_changed_at", String(now));
+    }
   }
 
   private ensurePacificDay(): string {
@@ -262,9 +385,7 @@ export class GeminiQuotaPool extends DurableObject<Env> {
 
     const oldRpm = this.getMeta("rpm_per_project");
     const oldRpd = this.getMeta("rpd_per_project");
-    const activeLeases = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM leases WHERE reported_at IS NULL")
-      .one().count;
+    const activeLeases = this.activeLeaseCount(Date.now());
     if (
       activeLeases > 0 &&
       ((oldRpm !== null && Number(oldRpm) !== rpm) ||
@@ -436,6 +557,13 @@ export class GeminiQuotaPool extends DurableObject<Env> {
   acquire(): RpcResult {
     const now = Date.now();
     this.ensurePacificDay();
+    const leaseTimeout = this.leaseTimeoutMs();
+    this.ctx.storage.sql.exec(
+      `UPDATE leases SET http_status = 0, reported_at = ?
+       WHERE reported_at IS NULL AND created_at <= ?`,
+      now,
+      now - leaseTimeout,
+    );
     const groups = this.configuredGroups();
     const rpm = Number(this.getMeta("rpm_per_project") ?? "15");
     const rpd = Number(this.getMeta("rpd_per_project") ?? "500");
@@ -450,9 +578,6 @@ export class GeminiQuotaPool extends DurableObject<Env> {
       requestsToday: number;
       readyAt: number;
       distance: number;
-      oldestRecent: number;
-      recentCount: number;
-      cooldownUntil: number;
     }> = [];
 
     for (let ordinal = 0; ordinal < groups.length; ordinal += 1) {
@@ -493,9 +618,6 @@ export class GeminiQuotaPool extends DurableObject<Env> {
         requestsToday: project.requests_today,
         readyAt,
         distance: (ordinal - cursor + groups.length) % groups.length,
-        oldestRecent: recent[0]?.requested_at ?? 0,
-        recentCount: recent.length,
-        cooldownUntil: project.cooldown_until,
       });
     }
 
@@ -511,14 +633,72 @@ export class GeminiQuotaPool extends DurableObject<Env> {
       left.distance - right.distance,
     );
     const selected = candidates[0];
+
+    const globalCooldownUntil = Number(this.getMeta("global_cooldown_until") ?? "0");
+    if (globalCooldownUntil > now) {
+      return {
+        status: 202,
+        body: {
+          waitMs: Math.min(30_000, globalCooldownUntil - now + randomInteger(0, 500)),
+          reason: "global_cooldown",
+        },
+      };
+    }
+
+    const maxInflight = this.currentMaxInflight();
+    const activeLeases = this.activeLeaseCount(now);
+    if (activeLeases >= maxInflight) {
+      const firstExpiry = this.ctx.storage.sql
+        .exec<{ created_at: number }>(
+          `SELECT MIN(created_at) AS created_at FROM leases
+           WHERE reported_at IS NULL AND created_at > ?`,
+          now - leaseTimeout,
+        )
+        .toArray()[0]?.created_at;
+      const untilExpiry = firstExpiry === undefined ? 1_000 : firstExpiry + leaseTimeout - now;
+      return {
+        status: 202,
+        body: {
+          waitMs: Math.max(250, Math.min(5_000, untilExpiry)),
+          reason: "max_inflight",
+        },
+      };
+    }
+
     if (selected.readyAt > now) {
       return {
         status: 202,
-        body: { waitMs: Math.max(50, Math.min(30_000, Math.ceil(selected.readyAt - now))) },
+        body: {
+          waitMs: Math.max(250, Math.min(30_000, Math.ceil(selected.readyAt - now))),
+          reason: "project_quota",
+        },
+      };
+    }
+
+    const globalRps = this.setting(this.env.GLOBAL_RPS, 2);
+    const globalBurst = this.setting(this.env.GLOBAL_BURST, 8);
+    const previousTokens = this.getMeta("global_tokens");
+    const previousUpdatedAt = Number(this.getMeta("global_tokens_updated_at") ?? String(now));
+    const elapsedSeconds = Math.max(0, now - previousUpdatedAt) / 1000;
+    const tokens = Math.min(
+      globalBurst,
+      (previousTokens === null ? globalBurst : Number(previousTokens)) + elapsedSeconds * globalRps,
+    );
+    if (tokens < 1) {
+      this.setMeta("global_tokens", String(tokens));
+      this.setMeta("global_tokens_updated_at", String(now));
+      return {
+        status: 202,
+        body: {
+          waitMs: Math.ceil(((1 - tokens) / globalRps) * 1000) + randomInteger(0, 200),
+          reason: "global_rate",
+        },
       };
     }
 
     const leaseId = crypto.randomUUID();
+    this.setMeta("global_tokens", String(tokens - 1));
+    this.setMeta("global_tokens_updated_at", String(now));
     this.ctx.storage.sql.exec(
       `INSERT INTO leases(lease_id, group_id, key_index, created_at)
        VALUES(?, ?, ?, ?)`,
@@ -547,6 +727,7 @@ export class GeminiQuotaPool extends DurableObject<Env> {
         projectIndex: selected.ordinal,
         keyIndex: selected.keyIndex,
         leaseId,
+        globalMaxInflight: maxInflight,
       },
     };
   }
@@ -557,6 +738,10 @@ export class GeminiQuotaPool extends DurableObject<Env> {
     const httpStatus = input?.httpStatus;
     const cooldownSeconds = positiveNumber(input?.cooldownSeconds) ?? 0;
     const dailyExhausted = input?.dailyExhausted === true;
+    const allowedQuotaTypes = new Set(["unknown", "rpm", "tpm", "rpd", "spend"]);
+    const quotaType = typeof input?.quotaType === "string" && allowedQuotaTypes.has(input.quotaType)
+      ? input.quotaType
+      : "unknown";
     if (
       typeof leaseId !== "string" ||
       leaseId.length > 80 ||
@@ -568,8 +753,8 @@ export class GeminiQuotaPool extends DurableObject<Env> {
       return { status: 400, body: { error: "invalid_report" } };
     }
     const lease = this.ctx.storage.sql
-      .exec<{ group_id: string; created_at: number; reported_at: number | null }>(
-        "SELECT group_id, created_at, reported_at FROM leases WHERE lease_id = ?",
+      .exec<LeaseRow>(
+        "SELECT lease_id, group_id, key_index, created_at, http_status, daily_exhausted, reported_at FROM leases WHERE lease_id = ?",
         leaseId,
       )
       .toArray()[0];
@@ -577,6 +762,8 @@ export class GeminiQuotaPool extends DurableObject<Env> {
     if (lease.reported_at !== null) return { status: 200, body: { reported: true, duplicate: true } };
 
     const now = Date.now();
+    this.recordOutcome(httpStatus, now);
+    this.updateGlobalController(httpStatus, quotaType, now);
     const sameQuotaDay = pacificDate(lease.created_at) === pacificDate(now);
     if (!sameQuotaDay) {
       this.ctx.storage.sql.exec(
@@ -632,6 +819,7 @@ export class GeminiQuotaPool extends DurableObject<Env> {
   }
 
   status(): RpcResult {
+    const now = Date.now();
     const today = this.ensurePacificDay();
     const projects = this.ctx.storage.sql
       .exec<ProjectRow>("SELECT * FROM projects ORDER BY ordinal")
@@ -644,9 +832,12 @@ export class GeminiQuotaPool extends DurableObject<Env> {
         .toArray()
         .map((row) => [row.group_id, row.count]),
     );
-    const activeLeases = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM leases WHERE reported_at IS NULL")
-      .one().count;
+    const activeLeases = this.activeLeaseCount(now);
+    const outcomeStats = this.recentOutcomeStats();
+    const globalMaxInflight = this.currentMaxInflight();
+    const configuredMaxInflight = Math.floor(this.setting(this.env.GLOBAL_MAX_INFLIGHT, 24));
+    const globalCooldownUntil = Number(this.getMeta("global_cooldown_until") ?? "0");
+    const recentActiveProjects = recentCounts.size;
     return {
       status: 200,
       body: {
@@ -657,6 +848,21 @@ export class GeminiQuotaPool extends DurableObject<Env> {
         rpdPerProject: Number(this.getMeta("rpd_per_project") ?? "500"),
         requestsToday: projects.reduce((sum, project) => sum + project.requests_today, 0),
         activeLeases,
+        global: {
+          maxInflight: globalMaxInflight,
+          configuredMaxInflight,
+          activeLeases,
+          requestsPerSecond: this.setting(this.env.GLOBAL_RPS, 2),
+          burst: this.setting(this.env.GLOBAL_BURST, 8),
+          leaseTimeoutSeconds: Math.floor(this.leaseTimeoutMs() / 1000),
+          cooldownUntil: globalCooldownUntil > now ? globalCooldownUntil : null,
+          cooldownRemainingMs: Math.max(0, globalCooldownUntil - now),
+          adaptiveStage: Number(this.getMeta("global_adaptive_stage") ?? "0"),
+          recentOutcomes: outcomeStats.count,
+          recent503Ratio: outcomeStats.count === 0 ? 0 : outcomeStats.unavailable / outcomeStats.count,
+          recentSuccesses: outcomeStats.successes,
+          activeProjects: recentActiveProjects,
+        },
         projects: projects.map((project) => ({
           projectIndex: project.ordinal,
           requestsToday: project.requests_today,
