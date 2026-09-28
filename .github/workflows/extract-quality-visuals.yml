@@ -1,0 +1,41 @@
+name: extract-quality-visuals
+
+on:
+  push:
+    branches:
+      - "bench/quality-1x-vs-2x"
+    paths:
+      - ".github/workflows/extract-quality-visuals.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download prior 3.5 Lite benchmark
+        uses: actions/download-artifact@v4
+        with:
+          name: flash-benchmark-gemini-3.5-flash-lite-36331942330
+          path: full
+          github-token: ${{ github.token }}
+          run-id: 36331942330
+
+      - name: Keep target page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p visuals
+          for p in 011 020 128 156 270; do
+            cp "full/work/images/${p}.jpg" "visuals/${p}.jpg"
+          done
+          ls -lh visuals
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quality-target-visuals-${{ github.run_id }}
+          path: visuals/
+          retention-days: 2
