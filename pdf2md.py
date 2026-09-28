@@ -718,7 +718,7 @@ def merge_markdown(
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--source-url", required=True)
-    p.add_argument("--images-per-request", type=int, default=2)
+    p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--model", default="gemini-3.5-flash-lite")
