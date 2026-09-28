@@ -46,12 +46,12 @@ on:
         default: "0.95"
         type: string
       images_per_request:
-        description: "How many consecutive PDF pages/images to send in one Gemini request"
+        description: "How many consecutive PDF pages/images to send in one provider request"
         required: true
         default: "1"
         type: string
       concurrency:
-        description: "Maximum simultaneous Gemini requests"
+        description: "Maximum simultaneous provider requests"
         required: true
         default: "50"
         type: string
@@ -235,9 +235,22 @@ jobs:
           fi
 
           if [[ "${PROVIDER}" == "nvidia" ]]; then
-            python pdf2md_nvidia.py               "${common_args[@]}"               --model "${NVIDIA_MODEL}"               --max-tokens "${NVIDIA_MAX_TOKENS}"               --temperature "${NVIDIA_TEMPERATURE}"               --top-p "${NVIDIA_TOP_P}"
+            provider_args=(
+              --model "${NVIDIA_MODEL}"
+              --max-tokens "${NVIDIA_MAX_TOKENS}"
+              --temperature "${NVIDIA_TEMPERATURE}"
+              --top-p "${NVIDIA_TOP_P}"
+            )
+            python pdf2md_nvidia.py "${common_args[@]}" "${provider_args[@]}"
           else
-            python pdf2md.py               "${common_args[@]}"               --model "${MODEL}"               --thinking-level "${THINKING_LEVEL}"               --media-resolution "${MEDIA_RESOLUTION}"               --rpm-per-key "${RPM_PER_KEY}"               --rpd-per-key "${RPD_PER_KEY}"
+            provider_args=(
+              --model "${MODEL}"
+              --thinking-level "${THINKING_LEVEL}"
+              --media-resolution "${MEDIA_RESOLUTION}"
+              --rpm-per-key "${RPM_PER_KEY}"
+              --rpd-per-key "${RPD_PER_KEY}"
+            )
+            python pdf2md.py "${common_args[@]}" "${provider_args[@]}"
           fi
 
       - name: Name Markdown result
