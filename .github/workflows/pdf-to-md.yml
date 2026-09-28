@@ -1,4 +1,4 @@
-name: PDF to Markdown with Gemini
+name: PDF to Markdown (Gemini or NVIDIA)
 run-name: pdf-to-md-${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
 
 on:
@@ -16,6 +16,34 @@ on:
       source_url:
         description: "PDF download URL (Google Drive shared link is supported)"
         required: true
+        type: string
+      provider:
+        description: "Inference provider"
+        required: true
+        default: "gemini"
+        type: choice
+        options:
+          - gemini
+          - nvidia
+      nvidia_model:
+        description: "NVIDIA model ID (used only when provider=nvidia)"
+        required: true
+        default: "deepseek-ai/deepseek-v4.1-flash"
+        type: string
+      nvidia_max_tokens:
+        description: "NVIDIA maximum output tokens"
+        required: true
+        default: "32768"
+        type: string
+      nvidia_temperature:
+        description: "NVIDIA sampling temperature"
+        required: true
+        default: "0.1"
+        type: string
+      nvidia_top_p:
+        description: "NVIDIA top-p"
+        required: true
+        default: "0.95"
         type: string
       images_per_request:
         description: "How many consecutive PDF pages/images to send in one Gemini request"
@@ -108,10 +136,9 @@ on:
 permissions:
   contents: write
 
-# All PDF conversion runs share the same Gemini key pool.
-# Queue runs instead of letting separate Actions race the same API quotas.
+# Keep each provider's conversion runs in its own queue.
 concurrency:
-  group: md-to-pdf-gemini-api
+  group: md-to-pdf-${{ inputs.provider || github.event.client_payload.provider || 'gemini' }}-api
   queue: max
 
 jobs:
@@ -122,6 +149,11 @@ jobs:
     env:
       OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
+      PROVIDER: ${{ github.event.inputs.provider || github.event.client_payload.provider || 'gemini' }}
+      NVIDIA_MODEL: ${{ github.event.inputs.nvidia_model || github.event.client_payload.nvidia_model || 'deepseek-ai/deepseek-v4.1-flash' }}
+      NVIDIA_MAX_TOKENS: ${{ github.event.inputs.nvidia_max_tokens || github.event.client_payload.nvidia_max_tokens || '32768' }}
+      NVIDIA_TEMPERATURE: ${{ github.event.inputs.nvidia_temperature || github.event.client_payload.nvidia_temperature || '0.1' }}
+      NVIDIA_TOP_P: ${{ github.event.inputs.nvidia_top_p || github.event.client_payload.nvidia_top_p || '0.95' }}
       IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
@@ -137,6 +169,8 @@ jobs:
       START_PAGE: ${{ github.event.inputs.start_page || github.event.client_payload.start_page || '' }}
       END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      NVIDIA_API_KEYS: ${{ secrets.NVIDIA_API_KEYS }}
+      NVIDIA_API_BASE: https://integrate.api.nvidia.com/v1
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
       GEMINI_QUOTA_STATE_BRANCH: quota-state
       GEMINI_QUOTA_STATE_PATH: quota-state.json
@@ -163,41 +197,48 @@ jobs:
             echo "source_url is required" >&2
             exit 1
           fi
-          if [[ -z "${GEMINI_API_KEYS}" ]]; then
-            echo "Repository secret GEMINI_API_KEYS is required" >&2
-            exit 1
+          if [[ "${PROVIDER}" == "nvidia" ]]; then
+            if [[ -z "${NVIDIA_API_KEYS}" ]]; then
+              echo "Repository secret NVIDIA_API_KEYS is required for provider=nvidia" >&2
+              exit 1
+            fi
+          else
+            if [[ -z "${GEMINI_API_KEYS}" ]]; then
+              echo "Repository secret GEMINI_API_KEYS is required for provider=gemini" >&2
+              exit 1
+            fi
           fi
 
       - name: Convert PDF to Markdown
         shell: bash
         run: |
           set -euo pipefail
-          args=(
+          common_args=(
             --source-url "${SOURCE_URL}"
             --images-per-request "${IMAGES_PER_REQUEST}"
             --concurrency "${CONCURRENCY}"
-            --model "${MODEL}"
-            --thinking-level "${THINKING_LEVEL}"
             --dpi "${DPI}"
             --image-format "${IMAGE_FORMAT}"
             --jpeg-quality "${JPEG_QUALITY}"
             --verification-passes "${VERIFICATION_PASSES}"
-            --media-resolution "${MEDIA_RESOLUTION}"
-            --rpm-per-key "${RPM_PER_KEY}"
-            --rpd-per-key "${RPD_PER_KEY}"
             --work-dir work
             --output-dir output
           )
           if [[ -n "${USER_PROMPT}" ]]; then
-            args+=(--prompt "${USER_PROMPT}")
+            common_args+=(--prompt "${USER_PROMPT}")
           fi
           if [[ -n "${START_PAGE}" ]]; then
-            args+=(--start-page "${START_PAGE}")
+            common_args+=(--start-page "${START_PAGE}")
           fi
           if [[ -n "${END_PAGE}" ]]; then
-            args+=(--end-page "${END_PAGE}")
+            common_args+=(--end-page "${END_PAGE}")
           fi
-          python pdf2md.py "${args[@]}"
+
+          if [[ "${PROVIDER}" == "nvidia" ]]; then
+            python pdf2md_nvidia.py               "${common_args[@]}"               --model "${NVIDIA_MODEL}"               --max-tokens "${NVIDIA_MAX_TOKENS}"               --temperature "${NVIDIA_TEMPERATURE}"               --top-p "${NVIDIA_TOP_P}"
+          else
+            python pdf2md.py               "${common_args[@]}"               --model "${MODEL}"               --thinking-level "${THINKING_LEVEL}"               --media-resolution "${MEDIA_RESOLUTION}"               --rpm-per-key "${RPM_PER_KEY}"               --rpd-per-key "${RPD_PER_KEY}"
+          fi
 
       - name: Name Markdown result
         if: always()
