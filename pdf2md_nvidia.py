@@ -30,12 +30,16 @@ MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
 
 
 class NvidiaKeyPool:
-    def __init__(self, keys: list[str]) -> None:
+    def __init__(self, keys: list[str], rpm_per_key: float) -> None:
         if not keys:
             raise ValueError("No NVIDIA API keys configured")
+        if rpm_per_key <= 0:
+            raise ValueError("rpm_per_key must be > 0")
         self.keys = keys
+        self.interval = (60.0 / rpm_per_key) * 1.05
         self.next_index = 0
         self.cooldown_until = [0.0 for _ in keys]
+        self.next_allowed = [0.0 for _ in keys]
         self.disabled = [False for _ in keys]
         self.requests = [0 for _ in keys]
         self.success = [0 for _ in keys]
@@ -50,7 +54,11 @@ class NvidiaKeyPool:
                 ready = [
                     i
                     for i in range(len(self.keys))
-                    if not self.disabled[i] and self.cooldown_until[i] <= now
+                    if (
+                        not self.disabled[i]
+                        and self.cooldown_until[i] <= now
+                        and self.next_allowed[i] <= now
+                    )
                 ]
                 if ready:
                     index = min(
@@ -59,10 +67,11 @@ class NvidiaKeyPool:
                     )
                     self.next_index = (index + 1) % len(self.keys)
                     self.requests[index] += 1
+                    self.next_allowed[index] = now + self.interval
                     return index, self.keys[index]
 
                 pending = [
-                    self.cooldown_until[i]
+                    max(self.cooldown_until[i], self.next_allowed[i])
                     for i in range(len(self.keys))
                     if not self.disabled[i]
                 ]
@@ -358,12 +367,13 @@ async def process_chunks(
     temperature: float,
     top_p: float,
     api_base: str,
+    rpm_per_key: float,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
-    key_pool = NvidiaKeyPool(keys)
+    key_pool = NvidiaKeyPool(keys, rpm_per_key)
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
@@ -471,6 +481,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tokens", type=int, default=32768)
     p.add_argument("--temperature", type=float, default=0.1)
     p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument(
+        "--rpm-per-key",
+        type=float,
+        default=40.0,
+        help="Client-side request rate limit per NVIDIA API key. Default: 40 RPM.",
+    )
     p.add_argument("--dpi", type=int, default=240)
     p.add_argument("--image-format", choices=["png", "jpeg"], default="png")
     p.add_argument("--jpeg-quality", type=int, default=95)
@@ -503,6 +519,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("temperature must be between 0 and 2")
     if not 0 < args.top_p <= 1:
         raise ValueError("top_p must be > 0 and <= 1")
+    if args.rpm_per_key <= 0:
+        raise ValueError("rpm_per_key must be > 0")
     if args.start_page is not None and args.start_page < 1:
         raise ValueError("start_page must be >= 1")
     if args.end_page is not None and args.end_page < 1:
@@ -538,7 +556,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
         f"max_tokens={args.max_tokens} temperature={args.temperature:g} "
-        f"top_p={args.top_p:g} "
+        f"top_p={args.top_p:g} rpm_per_key={args.rpm_per_key:g} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
@@ -578,6 +596,7 @@ async def async_main(args: argparse.Namespace) -> int:
         args.temperature,
         args.top_p,
         args.api_base,
+        args.rpm_per_key,
     )
     failures = [item for item in results if item.get("status") == "failed"]
     merged_name = "merged.md" if not failures else "merged.partial.md"
@@ -601,6 +620,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "rpm_per_key": args.rpm_per_key,
         "chunks": [
             {
                 **asdict(chunk),
