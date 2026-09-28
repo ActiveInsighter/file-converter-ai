@@ -346,7 +346,8 @@ gh workflow run pdf-to-md.yml \
   -f nvidia_model=deepseek-ai/deepseek-v4.1-flash \
   -f nvidia_max_tokens=32768 \
   -f nvidia_temperature=0.1 \
-  -f nvidia_top_p=0.95
+  -f nvidia_top_p=0.95 \
+  -f nvidia_rpm_per_key=40
 ```
 
 建议第一次只跑 1～4 页，并先使用：
@@ -383,7 +384,8 @@ python pdf2md_nvidia.py \
   --source-url 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
   --images-per-request 2 \
   --concurrency 8 \
-  --model deepseek-ai/deepseek-v4.1-flash
+  --model deepseek-ai/deepseek-v4.1-flash \
+  --rpm-per-key 40
 ```
 
 ### 从 n8n / 外部程序触发
@@ -406,7 +408,8 @@ pdf_to_md_nvidia
     "model": "deepseek-ai/deepseek-v4.1-flash",
     "max_tokens": 32768,
     "temperature": 0.1,
-    "top_p": 0.95
+    "top_p": 0.95,
+    "rpm_per_key": 40
   }
 }
 ```
