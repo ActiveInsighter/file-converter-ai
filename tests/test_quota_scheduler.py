@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from pdf2md import Chunk, PermanentGeminiError, process_chunks
-from quota_worker import QuotaPoolExhaustedError, classify_quota_error, retry_after_seconds
+from quota_client import QuotaPoolExhaustedError, classify_quota_error, retry_after_seconds
 
 
 class QuotaErrorTests(unittest.TestCase):

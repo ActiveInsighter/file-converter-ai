@@ -1,0 +1,29 @@
+[Unit]
+Description=Gemini Valkey quota API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quota-api
+Group=quota-api
+WorkingDirectory=/opt/file-converter-quota-api
+EnvironmentFile=/etc/file-converter-quota-api.env
+ExecStart=/opt/file-converter-quota-api/venv/bin/python -m uvicorn quota_api.main:app --host 127.0.0.1 --port 8788 --workers 1
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

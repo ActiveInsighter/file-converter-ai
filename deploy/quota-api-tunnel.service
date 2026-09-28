@@ -1,0 +1,36 @@
+[Unit]
+Description=SSH reverse tunnel for Gemini quota API
+After=network-online.target file-converter-quota-api.service
+Wants=network-online.target
+Requires=file-converter-quota-api.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+Environment=HOME=/root
+ExecStart=/usr/bin/ssh -N -T \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -R 127.0.0.1:18788:127.0.0.1:8788 \
+  aliyun
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
