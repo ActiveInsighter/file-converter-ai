@@ -1,0 +1,190 @@
+name: PDF to Markdown with NVIDIA DeepSeek
+run-name: pdf-to-md-nvidia-${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "External task ID for dispatch reconciliation"
+        required: false
+        type: string
+      output_name:
+        description: "Merged Markdown filename without extension"
+        required: false
+        default: "merged"
+        type: string
+      source_url:
+        description: "PDF download URL (Google Drive shared link is supported)"
+        required: true
+        type: string
+      images_per_request:
+        description: "How many consecutive PDF pages/images to send in one NVIDIA request"
+        required: true
+        default: "2"
+        type: string
+      concurrency:
+        description: "Maximum simultaneous NVIDIA requests"
+        required: true
+        default: "8"
+        type: string
+      prompt:
+        description: "Prompt. Leave empty to use the built-in faithful Markdown conversion prompt"
+        required: false
+        default: ""
+        type: string
+      model:
+        description: "NVIDIA API Catalog model ID"
+        required: true
+        default: "deepseek-ai/deepseek-v4.1-flash"
+        type: string
+      max_tokens:
+        description: "Maximum output tokens per request"
+        required: true
+        default: "32768"
+        type: string
+      temperature:
+        description: "Sampling temperature"
+        required: true
+        default: "0.1"
+        type: string
+      top_p:
+        description: "Top-p sampling"
+        required: true
+        default: "0.95"
+        type: string
+      dpi:
+        description: "PDF render DPI"
+        required: true
+        default: "240"
+        type: string
+      image_format:
+        description: "Rendered page format; PNG is lossless"
+        required: true
+        default: "png"
+        type: choice
+        options:
+          - png
+          - jpeg
+      jpeg_quality:
+        description: "JPEG quality (50-100; ignored for PNG)"
+        required: true
+        default: "95"
+        type: string
+      verification_passes:
+        description: "Extra image-vs-Markdown verification passes"
+        required: true
+        default: "0"
+        type: string
+      start_page:
+        description: "Optional first PDF page to process (1-based)"
+        required: false
+        default: ""
+        type: string
+      end_page:
+        description: "Optional last PDF page to process (1-based)"
+        required: false
+        default: ""
+        type: string
+
+  repository_dispatch:
+    types: [pdf_to_md_nvidia]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: md-to-pdf-nvidia-api
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
+      SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
+      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '2' }}
+      CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '8' }}
+      USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
+      MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'deepseek-ai/deepseek-v4.1-flash' }}
+      MAX_TOKENS: ${{ github.event.inputs.max_tokens || github.event.client_payload.max_tokens || '32768' }}
+      TEMPERATURE: ${{ github.event.inputs.temperature || github.event.client_payload.temperature || '0.1' }}
+      TOP_P: ${{ github.event.inputs.top_p || github.event.client_payload.top_p || '0.95' }}
+      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
+      IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
+      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
+      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '0' }}
+      START_PAGE: ${{ github.event.inputs.start_page || github.event.client_payload.start_page || '' }}
+      END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
+      NVIDIA_API_KEYS: ${{ secrets.NVIDIA_API_KEYS }}
+      NVIDIA_API_BASE: https://integrate.api.nvidia.com/v1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate trigger payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SOURCE_URL}" ]]; then
+            echo "source_url is required" >&2
+            exit 1
+          fi
+          if [[ -z "${NVIDIA_API_KEYS}" ]]; then
+            echo "Repository secret NVIDIA_API_KEYS is required" >&2
+            exit 1
+          fi
+
+      - name: Convert PDF to Markdown
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --source-url "${SOURCE_URL}"
+            --images-per-request "${IMAGES_PER_REQUEST}"
+            --concurrency "${CONCURRENCY}"
+            --model "${MODEL}"
+            --max-tokens "${MAX_TOKENS}"
+            --temperature "${TEMPERATURE}"
+            --top-p "${TOP_P}"
+            --dpi "${DPI}"
+            --image-format "${IMAGE_FORMAT}"
+            --jpeg-quality "${JPEG_QUALITY}"
+            --verification-passes "${VERIFICATION_PASSES}"
+            --work-dir work
+            --output-dir output
+          )
+          if [[ -n "${USER_PROMPT}" ]]; then
+            args+=(--prompt "${USER_PROMPT}")
+          fi
+          if [[ -n "${START_PAGE}" ]]; then
+            args+=(--start-page "${START_PAGE}")
+          fi
+          if [[ -n "${END_PAGE}" ]]; then
+            args+=(--end-page "${END_PAGE}")
+          fi
+          python pdf2md_nvidia.py "${args[@]}"
+
+      - name: Name Markdown result
+        if: always()
+        run: python prepare_result.py
+
+      - name: Upload Markdown result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-to-md-nvidia-${{ github.run_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 3
