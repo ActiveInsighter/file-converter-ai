@@ -82,6 +82,13 @@ adding or removing one key in `GEMINI_API_KEYS` made `/v1/configure` fail with
 `invalid_project_mapping` and every Action died at startup. Leave it at `0`
 unless you want that strictness.
 
+Adding or removing a key also changes the mapping hash, which covers the whole
+list. `/v1/configure` now rebuilds the pool and resets the current Pacific-day
+per-Project counters when the list changes and no lease is in flight, so a
+one-key edit does not wedge every later Action. It only refuses with 409
+`project_mapping_changed` while a run is mid-flight, and the next idle run then
+adopts the new list.
+
 The global rate and in-flight ceilings apply to the whole account, not per
 Project. They are the only thing standing between "one more Project" and "one
 more request per second against a model that answers 503 when pushed", so

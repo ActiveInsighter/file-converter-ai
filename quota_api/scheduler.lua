@@ -66,17 +66,35 @@ if op == 'configure' then
   local rpd = tonumber(ARGV[7])
   local configured_max = tonumber(ARGV[8])
   local previous_mapping = redis.call('HGET', config, 'mapping_hash')
-  if previous_mapping and previous_mapping ~= mapping then
-    return result(409, {error = 'project_mapping_changed'})
-  end
+  -- HGET answers false (not nil) for a missing key, so test the type before
+  -- concluding that the mapping changed; otherwise the very first configure of
+  -- a fresh pool looks like a remap.
+  local remapped = type(previous_mapping) == 'string' and
+    previous_mapping ~= mapping
   prune_active()
-  if previous_mapping and redis.call('ZCARD', active) > 0 and
+  if remapped and redis.call('ZCARD', active) > 0 then
+    -- Never swap the Project mapping underneath a pool that is mid-run, but do
+    -- not leave later Actions stuck either: adding one API key changes the
+    -- mapping hash, and refusing would break every future job until an
+    -- operator wiped the Valkey state by hand.
+    return result(409, {error = 'project_mapping_changed',
+      activeLeases = redis.call('ZCARD', active)})
+  end
+  if previous_mapping and not remapped and redis.call('ZCARD', active) > 0 and
     (number_field(config, 'rpm_per_project', 0) ~= rpm or
      number_field(config, 'rpd_per_project', 0) ~= rpd) then
     return result(409, {error = 'quota_limits_in_use'})
   end
-  if not previous_mapping then
+  if not previous_mapping or remapped then
+    -- Adopt the new pool. A changed key list invalidates the old ordering, so
+    -- rebuild the ready set and reset today's per-Project counters.
     redis.call('DEL', ready)
+    local stale = number_field(config, 'key_count', 0)
+    if stale > count then
+      for index = count, stale - 1 do
+        redis.call('DEL', project_key(index))
+      end
+    end
     for index = 0, count - 1 do
       redis.call('HSET', project_key(index),
         'requests_today', 0, 'daily_exhausted', 0, 'cooldown_until', 0,
@@ -85,13 +103,19 @@ if op == 'configure' then
     end
     redis.call('HSET', config, 'mapping_hash', mapping, 'key_count', count,
       'pacific_day', today)
+    if remapped then
+      -- A rebuilt pool must not inherit the replaced pool's backpressure state.
+      redis.call('HSET', global, 'adaptive_stage', 0, 'cooldown_until', 0,
+        'controller_changed_at', now)
+    end
     redis.call('HSET', global, 'max_inflight_current', configured_max)
   else
     reset_day_if_needed()
   end
   redis.call('HSET', config, 'rpm_per_project', rpm, 'rpd_per_project', rpd)
-  return result(200, {configured = true, keyCount = count, projectCount = count,
-    pacificDate = today, rpmPerProject = rpm, rpdPerProject = rpd})
+  return result(200, {configured = true, remapped = remapped, keyCount = count,
+    projectCount = count, pacificDate = today, rpmPerProject = rpm,
+    rpdPerProject = rpd})
 end
 
 if not redis.call('HGET', config, 'mapping_hash') then

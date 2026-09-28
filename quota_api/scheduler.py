@@ -163,6 +163,8 @@ class QuotaScheduler:
                 "error": "invalid_project_mapping",
                 "expectedKeyCount": self.expected_key_count or "any",
             })
+        if len(groups) > 1024:
+            return ApiResult(400, {"error": "project_mapping_too_large"})
         if self.expected_key_count and len(groups) != self.expected_key_count:
             return ApiResult(400, {
                 "error": "invalid_project_mapping",

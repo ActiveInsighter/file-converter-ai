@@ -14,7 +14,41 @@ from pdf2md import (
     call_gemini_once,
     process_chunks,
 )
+from quota_api.scheduler import QuotaScheduler
 from quota_client import QuotaPoolExhaustedError, classify_quota_error, retry_after_seconds
+
+
+class _UnusedRedis:
+    """Stands in for a Redis client when only the pure-Python checks run."""
+
+    def register_script(self, _source):
+        def _script(**_kwargs):
+            raise AssertionError("Valkey must not be reached in this test")
+
+        return _script
+
+
+class PinnedKeyCountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pinned_key_count_rejects_a_different_pool_size(self):
+        scheduler = QuotaScheduler(_UnusedRedis(), expected_key_count=66)
+        result = await scheduler.configure(
+            [f"project-{index}" for index in range(67)],
+            rpm_per_project=15,
+            rpd_per_project=500,
+        )
+        self.assertEqual(result.status, 400)
+        self.assertEqual(result.body["error"], "invalid_project_mapping")
+        self.assertEqual(result.body["keyCount"], 67)
+
+    async def test_unpinned_key_count_still_requires_one_project_per_key(self):
+        scheduler = QuotaScheduler(_UnusedRedis())
+        result = await scheduler.configure(
+            ["shared-project", "shared-project"],
+            rpm_per_project=15,
+            rpd_per_project=500,
+        )
+        self.assertEqual(result.status, 409)
+        self.assertEqual(result.body["error"], "expected_one_project_per_key")
 
 
 class QuotaErrorTests(unittest.TestCase):
