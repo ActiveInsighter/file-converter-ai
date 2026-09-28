@@ -52,6 +52,11 @@ on:
         required: true
         default: "0.95"
         type: string
+      rpm_per_key:
+        description: "Client-side requests/minute per NVIDIA API key"
+        required: true
+        default: "40"
+        type: string
       dpi:
         description: "PDF render DPI"
         required: true
@@ -111,6 +116,7 @@ jobs:
       MAX_TOKENS: ${{ github.event.inputs.max_tokens || github.event.client_payload.max_tokens || '32768' }}
       TEMPERATURE: ${{ github.event.inputs.temperature || github.event.client_payload.temperature || '0.1' }}
       TOP_P: ${{ github.event.inputs.top_p || github.event.client_payload.top_p || '0.95' }}
+      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '40' }}
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
@@ -158,6 +164,7 @@ jobs:
             --max-tokens "${MAX_TOKENS}"
             --temperature "${TEMPERATURE}"
             --top-p "${TOP_P}"
+            --rpm-per-key "${RPM_PER_KEY}"
             --dpi "${DPI}"
             --image-format "${IMAGE_FORMAT}"
             --jpeg-quality "${JPEG_QUALITY}"
