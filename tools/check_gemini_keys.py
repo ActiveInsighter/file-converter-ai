@@ -12,7 +12,7 @@ import httpx
 MODEL = "gemini-3.5-flash-lite"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 OUTPUT = Path("reports/gemini-key-health.json")
-MAX_CONCURRENCY = 32
+MAX_CONCURRENCY = 32  # one request per configured key
 
 
 def parse_keys(raw: str | None) -> list[str]:
