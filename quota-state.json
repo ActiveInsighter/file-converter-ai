@@ -1,27 +1,22 @@
 {
   "version": 1,
   "pacific_date": "2026-09-28",
-  "updated_at": "2026-09-28T10:35:01.469210Z",
+  "updated_at": "2026-09-28T10:36:34.374350Z",
   "projects": {
     "project-1": {
-      "requests_today": 4,
+      "requests_today": 6,
       "recent_requests": [
-        "2026-09-28T10:34:11.349957Z",
-        "2026-09-28T10:34:24.511816Z",
-        "2026-09-28T10:34:54.415605Z",
-        "2026-09-28T10:35:01.469204Z"
+        "2026-09-28T10:36:34.374329Z"
       ],
       "cooldown_until": null,
       "daily_exhausted": false,
-      "success": 1,
+      "success": 3,
       "http_429": 0,
-      "errors": 1
+      "errors": 2
     },
     "project-2": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.729135Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -30,9 +25,7 @@
     },
     "project-3": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.936620Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:18.520275Z",
       "daily_exhausted": false,
       "success": 0,
@@ -95,10 +88,7 @@
     },
     "project-10": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.361669Z",
-        "2026-09-28T10:34:24.526233Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -107,22 +97,16 @@
     },
     "project-11": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.374802Z",
-        "2026-09-28T10:34:24.538990Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
       "http_429": 0,
-      "errors": 0
+      "errors": 1
     },
     "project-12": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.389042Z",
-        "2026-09-28T10:34:24.552808Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -131,10 +115,7 @@
     },
     "project-13": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.404466Z",
-        "2026-09-28T10:34:24.568533Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -143,10 +124,7 @@
     },
     "project-14": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.419290Z",
-        "2026-09-28T10:34:24.586123Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -155,10 +133,7 @@
     },
     "project-15": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.434957Z",
-        "2026-09-28T10:34:24.602934Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -167,10 +142,7 @@
     },
     "project-16": {
       "requests_today": 2,
-      "recent_requests": [
-        "2026-09-28T10:34:11.450326Z",
-        "2026-09-28T10:34:25.513242Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 2,
@@ -179,9 +151,7 @@
     },
     "project-17": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:11.463216Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 0,
@@ -190,9 +160,7 @@
     },
     "project-18": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:11.479252Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -201,9 +169,7 @@
     },
     "project-19": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.714912Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -212,9 +178,7 @@
     },
     "project-20": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.743715Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -223,9 +187,7 @@
     },
     "project-21": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.757367Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -234,9 +196,7 @@
     },
     "project-22": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.771516Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -245,9 +205,7 @@
     },
     "project-23": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.784937Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -256,9 +214,7 @@
     },
     "project-24": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.801331Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -267,9 +223,7 @@
     },
     "project-25": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.814840Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -278,9 +232,7 @@
     },
     "project-26": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.828564Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -289,9 +241,7 @@
     },
     "project-27": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:12.842593Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:20.962218Z",
       "daily_exhausted": false,
       "success": 0,
@@ -300,9 +250,7 @@
     },
     "project-28": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.908759Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:17.301898Z",
       "daily_exhausted": false,
       "success": 0,
@@ -311,9 +259,7 @@
     },
     "project-29": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.922146Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:15.123201Z",
       "daily_exhausted": false,
       "success": 0,
@@ -322,9 +268,7 @@
     },
     "project-30": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.949772Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -333,9 +277,7 @@
     },
     "project-31": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.963130Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:22.281556Z",
       "daily_exhausted": false,
       "success": 0,
@@ -344,9 +286,7 @@
     },
     "project-32": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.979860Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -355,9 +295,7 @@
     },
     "project-33": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:13.993528Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": null,
       "daily_exhausted": false,
       "success": 1,
@@ -366,9 +304,7 @@
     },
     "project-34": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:14.005765Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:19.730467Z",
       "daily_exhausted": false,
       "success": 0,
@@ -377,9 +313,7 @@
     },
     "project-35": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:14.020167Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:16.251406Z",
       "daily_exhausted": false,
       "success": 0,
@@ -388,9 +322,7 @@
     },
     "project-36": {
       "requests_today": 1,
-      "recent_requests": [
-        "2026-09-28T10:34:14.033582Z"
-      ],
+      "recent_requests": [],
       "cooldown_until": "2026-09-28T10:35:23.395585Z",
       "daily_exhausted": false,
       "success": 0,
@@ -671,10 +603,10 @@
   "keys": {
     "1": {
       "project": "project-1",
-      "requests": 4,
-      "success": 1,
+      "requests": 6,
+      "success": 3,
       "http_429": 0,
-      "errors": 1,
+      "errors": 2,
       "disabled": false
     },
     "2": {
@@ -754,7 +686,7 @@
       "requests": 2,
       "success": 1,
       "http_429": 0,
-      "errors": 0,
+      "errors": 1,
       "disabled": false
     },
     "12": {
