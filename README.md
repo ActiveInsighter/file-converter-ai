@@ -1,6 +1,6 @@
-# md-to-pdf-ai
+# AnyWorkflow File Converter
 
-用 GitHub Actions 临时 Runner 将 PDF 按页渲染为图片，并并发调用 Google AI Studio / Gemini API，把连续页面转换成 Markdown，最后按原页序合并。
+这是 AnyWorkflow 的文件转换执行仓库。当前首个转换器是 PDF → Markdown：用 GitHub Actions 临时 Runner 将 PDF 按页渲染为图片，并并发调用 Google AI Studio / Gemini API，把连续页面转换成 Markdown，最后按原页序合并。后续转换类型通过 `conversion_type` 扩展。
 
 ## 功能
 
@@ -12,6 +12,7 @@
 - `concurrency` 控制同时进行的 Gemini 请求数。
 - 支持自定义提示词、模型、DPI 和 JPEG 质量。
 - 支持多个 Gemini API Key 轮询，重试时自动换下一个 Key。
+- 通过稳定的 `conversion_type` 输入选择转换器；当前值为 `pdf_to_md`。
 - 输出按原页码命名：`001.md` 或 `001-003.md`。
 - 全部成功生成 `merged.md`；有失败时生成 `merged.partial.md` 和错误详情。
 - Action Artifact 保存 Markdown 分块、合并文件和 `manifest.json`。
@@ -44,12 +45,13 @@ AIza...key10
 
 进入：
 
-**Actions → PDF to Markdown with Gemini → Run workflow**
+**Actions → AnyWorkflow File Converter · PDF to Markdown → Run workflow**
 
 参数：
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
+| `conversion_type` | 文件转换处理器 | `pdf_to_md` |
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
 | `concurrency` | 最大 Gemini 并发请求数 | `50` |
@@ -88,7 +90,7 @@ Workflow 暴露 GitHub `repository_dispatch` 事件：
 调用 GitHub REST API：
 
 ```http
-POST https://api.github.com/repos/ActiveInsighter/md-to-pdf-ai/dispatches
+POST https://api.github.com/repos/ActiveInsighter/file-converter-ai/dispatches
 Authorization: Bearer <GITHUB_TOKEN>
 Accept: application/vnd.github+json
 Content-Type: application/json
@@ -100,6 +102,7 @@ Content-Type: application/json
 {
   "event_type": "pdf_to_md",
   "client_payload": {
+    "conversion_type": "pdf_to_md",
     "source_url": "https://drive.google.com/file/d/12DMkT6QkZSad5_SsxvcsHgFKsQrxf9JN/view?usp=drivesdk",
     "images_per_request": 1,
     "concurrency": 50,
@@ -274,20 +277,23 @@ GitHub workflow 本身使用同一个 concurrency group 排队，因此多个 PD
 
 ## AnyWorkflow Remote integration
 
-`workflow_dispatch` accepts `request_id` (an external job identity) and
+`workflow_dispatch` accepts `conversion_type` and `request_id` (an external job identity) and
 `output_name` (the merged Markdown basename, default `merged`). The run title is
-`pdf-to-md-<request_id>` so a caller can recover the run after a lost dispatch
-response without dispatching twice. The artifact name stays
-`pdf-to-md-<github.run_id>`; its ZIP contains `<output_name>.md` (or
+`file-converter-pdf-to-md-<request_id>` so a caller can recover the run after a lost dispatch
+response without dispatching twice. The artifact name is
+`file-converter-pdf-to-md-<github.run_id>`; its ZIP contains `<output_name>.md` (or
 `<output_name>.partial.md`), page Markdown and conversion metadata. Only
 `output/` is uploaded; the source PDF and rendered images stay in the temporary
 runner's `work/` directory.
 
-The Remote frontend creates owner-scoped `aw_pdf_to_md_jobs` records in
-PocketBase. The n8n PDF workflow invokes the private PDF worker every minute;
-it dispatches queued jobs, reconciles GitHub status, downloads the artifact ZIP,
-and uploads it to the protected PocketBase `file` field. The final download
-filename is configurable independently of the task title.
+The Remote frontend stores owner-scoped reusable profiles in
+`aw_file_conversion_configs`, then creates `aw_pdf_to_md_jobs` with only the
+selected `configId`. The PocketBase hook snapshots the database profile into
+the job; the private worker reads that snapshot and passes flat inputs to this
+workflow. The n8n PDF workflow invokes the worker every minute, reconciles
+GitHub status, downloads the artifact ZIP, and uploads it to the protected
+PocketBase `file` field. The final download filename is configurable
+independently of the task title.
 
 The GitHub REST API version `2026-03-10` returns `workflow_run_id` from
 [workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
