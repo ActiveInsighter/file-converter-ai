@@ -223,13 +223,18 @@ Actions 需要以下仓库设置：
 
 现有 `rpm_per_key` / `rpd_per_key` workflow 参数保留以兼容 n8n；它们实际配置每个 **Project** 的限额，默认分别为 15 RPM 和 500 RPD。所有并发 Action 使用同一个额度池和配置。
 
+除 Project 配额外，DO 还对所有 Action 统一整形：最多 24 个 Gemini 请求在途，持续启动速率 2 req/s，空闲时最多突发 8 个。发现最近 20 个结果中 503 占比达到 20%（至少 5 个结果）时，会分阶段把在途上限降至 12、再降至 8，并分别增加 5–15 秒、15–30 秒、30–60 秒的随机全局冷却；连续稳定成功后再逐步恢复。lease 超时为 180 秒，Gemini HTTP 超时为 120 秒。
+
+每页每轮只请求一次：先完成所有页面的首轮，再把可重试失败页放入两轮 deferred retry；两轮分别随机等待 30–60 秒和 60–120 秒。400/401/403/404、超过请求体限制和全局 RPD 耗尽会直接记为最终失败。日志每 15 秒输出一次聚合请求数、429/503、p50/p95 延迟和 DO 状态，避免逐次重试刷屏。
+
 调度过程：
 
 - `/v1/lease` 由 DO 按可用时间、当日用量和 round-robin 顺序原子挑选 Project，并在发放 lease 时增加 RPD 计数；
-- Gemini 返回后，Action 通过 `/v1/report` 回报状态；429 立即更新该 Project 的 cooldown；明确的每日额度错误会停用该 Project 至 Pacific Time 次日；
-- 503 和网络错误只记为请求错误，不触发 quota cooldown；重试会重新申请 lease，切换到其它可用 Project；
+- `/v1/lease` 同时检查共享在途上限、全局 token bucket 和全局冷却，只有真正取得 lease 的调用会占用在途名额；
+- Gemini 返回后，Action 通过 `/v1/report` 回报状态；429 按 error details 分类，尊重 `Retry-After` / `RetryInfo`，泛化 429 暂停对应 Project 并触发短暂全局退避；明确的每日请求额度错误会停用该 Project 至 Pacific Time 次日；
+- 503 不会通过换 key 反复冲击同一模型后端；DO 根据近期 503 占比启动全局冷却和动态降并发，失败页面之后再进入 deferred retry；
 - 每个 Pacific Time 新日首次访问时自动重置每日计数和 cooldown；
-- GitHub Actions 不再串行排队，也不再读取或提交 `quota-state` 分支；`quota-usage.json` 记录本次 Action 的用量，`/v1/status` 返回全局状态。
+- GitHub Actions 不再读取或提交 `quota-state` 分支；`quota-usage.json` 记录本次 Action 的用量，`/v1/status` 返回 Project 和全局控制状态。
 
 部署 Worker：
 

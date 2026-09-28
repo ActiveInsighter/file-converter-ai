@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -16,7 +17,13 @@ import fitz
 import gdown
 import httpx
 
-from quota_worker import ProjectQuotaPool, parse_key_groups
+from quota_worker import (
+    ProjectQuotaPool,
+    QuotaPoolExhaustedError,
+    classify_quota_error,
+    parse_key_groups,
+    retry_after_seconds,
+)
 
 DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
 
@@ -432,10 +439,13 @@ def validate_markdown_output(text: str) -> None:
             )
 
 
+class PermanentGeminiError(RuntimeError):
+    """A request rejected for a non-transient client or configuration error."""
+
+
 async def call_gemini(
     client: httpx.AsyncClient,
     key_pool: ProjectQuotaPool,
-    key_count: int,
     model: str,
     parts: list[dict],
     chunk_name: str,
@@ -450,125 +460,65 @@ async def call_gemini(
             }
         },
     }
-    max_attempts = max(4, min(12, key_count * 2))
-    last_error: Exception | None = None
+    key_index, api_key, lease_id = await key_pool.acquire()
+    started = time.monotonic()
+    try:
+        response = await client.post(
+            url,
+            headers={
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        key_pool.record_http_result(0, time.monotonic() - started)
+        await key_pool.mark_error(key_index, lease_id, http_status=0)
+        raise RuntimeError(f"Gemini transport failure: {type(exc).__name__}: {exc}") from exc
 
-    for attempt in range(1, max_attempts + 1):
-        key_index, api_key, lease_id = await key_pool.acquire()
+    key_pool.record_http_result(response.status_code, time.monotonic() - started)
+    if response.status_code == 200:
         try:
-            response = await client.post(
-                url,
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            if response.status_code == 200:
-                try:
-                    text = extract_response_text(response.json())
-                    text, math_warnings = repair_multiline_math_delimiters(text)
-                    if math_warnings:
-                        print(
-                            f"[warning] {chunk_name}: suspicious math delimiters "
-                            f"remain on lines {math_warnings}; keeping content "
-                            "instead of re-running the full page",
-                            flush=True,
-                        )
-                    validate_markdown_output(text)
-                    await key_pool.mark_success(key_index, lease_id)
-                    return text
-                except RuntimeError as exc:
-                    await key_pool.mark_error(key_index, lease_id, http_status=200)
-                    last_error = exc
-                    print(
-                        f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
-                        f"{exc}; rotating key",
-                        flush=True,
-                    )
-                    if attempt < max_attempts:
-                        await asyncio.sleep(min(2 ** (attempt - 1), 20))
-                    continue
-
-            message = response.text[:2000]
-            if response.status_code in {400, 404}:
-                await key_pool.mark_error(
-                    key_index, lease_id, http_status=response.status_code
-                )
-                raise RuntimeError(
-                    f"Gemini request rejected ({response.status_code}): {message}"
-                )
-
-            last_error = RuntimeError(
-                f"Gemini HTTP {response.status_code}: {message}"
-            )
-
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                cooldown_seconds = 60.0
-                if retry_after:
-                    try:
-                        cooldown_seconds = max(
-                            cooldown_seconds,
-                            float(retry_after),
-                        )
-                    except ValueError:
-                        pass
-
-                retry_match = re.search(
-                    r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"',
-                    message,
-                )
-                if retry_match:
-                    cooldown_seconds = max(
-                        cooldown_seconds,
-                        float(retry_match.group(1)),
-                    )
-
-                daily_exhausted = key_pool.is_daily_quota_message(
-                    message
-                )
-                await key_pool.rate_limited(
-                    key_index,
-                    lease_id,
-                    cooldown_seconds,
-                    daily_exhausted=daily_exhausted,
-                )
-                quota_kind = (
-                    "daily quota"
-                    if daily_exhausted
-                    else f"rate quota; cooldown={cooldown_seconds:.0f}s"
-                )
+            text = extract_response_text(response.json())
+            text, math_warnings = repair_multiline_math_delimiters(text)
+            if math_warnings:
                 print(
-                    f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
-                    f"HTTP 429 on key#{key_index + 1} ({quota_kind}); "
-                    f"detail={message[:700]}",
+                    f"[warning] {chunk_name}: suspicious math delimiters remain on "
+                    f"lines {math_warnings}; retaining this output for review",
                     flush=True,
                 )
-            else:
-                await key_pool.mark_error(
-                    key_index, lease_id, http_status=response.status_code
-                )
-                print(
-                    f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
-                    f"HTTP {response.status_code}; rotating key",
-                    flush=True,
-                )
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            await key_pool.mark_error(key_index, lease_id, http_status=0)
-            last_error = exc
-            print(
-                f"[retry] {chunk_name} attempt {attempt}/{max_attempts}: "
-                f"{type(exc).__name__}; rotating key",
-                flush=True,
-            )
+            validate_markdown_output(text)
+        except Exception as exc:
+            await key_pool.mark_error(key_index, lease_id, http_status=502)
+            raise RuntimeError(f"Gemini returned unusable Markdown: {exc}") from exc
+        await key_pool.mark_success(key_index, lease_id)
+        return text
 
-        if attempt < max_attempts:
-            await asyncio.sleep(min(2 ** (attempt - 1), 20))
+    message = response.text[:800]
+    if response.status_code == 429:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {"message": message}
+        quota_type = classify_quota_error(error_payload)
+        retry_after = retry_after_seconds(response.headers, error_payload)
+        cooldown_seconds = retry_after if retry_after is not None else 30.0
+        await key_pool.rate_limited(
+            key_index,
+            lease_id,
+            cooldown_seconds,
+            daily_exhausted=quota_type == "rpd",
+            quota_type=quota_type,
+        )
+        raise RuntimeError(
+            f"Gemini HTTP 429 ({quota_type}; project cooldown={cooldown_seconds:.1f}s): {message}"
+        )
 
-    raise RuntimeError(
-        f"Chunk {chunk_name} failed after {max_attempts} attempts: {last_error}"
-    )
+    await key_pool.mark_error(key_index, lease_id, http_status=response.status_code)
+    error = f"Gemini HTTP {response.status_code}: {message}"
+    if response.status_code in {400, 401, 403, 404}:
+        raise PermanentGeminiError(error)
+    raise RuntimeError(error)
 
 
 async def process_chunks(
@@ -594,10 +544,8 @@ async def process_chunks(
         os.getenv("GEMINI_KEY_GROUPS"),
     )
     print(f"[quota] keys={len(keys)} projects={len(set(groups))}", flush=True)
-    semaphore = asyncio.Semaphore(concurrency)
-
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(240.0, connect=30.0),
+        timeout=httpx.Timeout(120.0, connect=30.0),
         limits=httpx.Limits(
             max_connections=max(100, concurrency * 2),
             max_keepalive_connections=max(50, concurrency),
@@ -612,46 +560,46 @@ async def process_chunks(
             client=client,
         )
 
-        async def run_one(chunk: Chunk) -> dict:
+        started_at = {chunk.stem: time.monotonic() for chunk in chunks}
+        chunks_by_name = {chunk.stem: chunk for chunk in chunks}
+        latest_results: dict[str, dict] = {}
+        completed_first_pass: set[str] = set()
+        progress = {"active_chunks": 0}
+        stop_metrics = asyncio.Event()
+
+        async def run_one(chunk: Chunk, round_number: int) -> dict:
             md_path = pages_dir / f"{chunk.stem}.md"
             error_path = errors_dir / f"{chunk.stem}.json"
-            started = time.time()
 
             try:
-                async with semaphore:
-                    parts, estimated = make_request_parts(
-                        chunk, prompt, media_resolution
+                parts, estimated = make_request_parts(chunk, prompt, media_resolution)
+                text = await call_gemini(
+                    client,
+                    key_pool,
+                    model,
+                    parts,
+                    chunk.stem,
+                    thinking_level,
+                )
+
+                for verify_index in range(verification_passes):
+                    verify_parts, _ = make_verification_parts(
+                        chunk, prompt, text, media_resolution
                     )
                     text = await call_gemini(
                         client,
                         key_pool,
-                        len(keys),
                         model,
-                        parts,
-                        chunk.stem,
+                        verify_parts,
+                        f"{chunk.stem}-verify-{verify_index + 1}",
                         thinking_level,
                     )
-
-                for verify_index in range(verification_passes):
-                    async with semaphore:
-                        verify_parts, _ = make_verification_parts(
-                            chunk, prompt, text, media_resolution
-                        )
-                        text = await call_gemini(
-                            client,
-                            key_pool,
-                            len(keys),
-                            model,
-                            verify_parts,
-                            f"{chunk.stem}-verify-{verify_index + 1}",
-                            thinking_level,
-                        )
 
                 md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
                 if error_path.exists():
                     error_path.unlink()
 
-                elapsed = round(time.time() - started, 2)
+                elapsed = round(time.monotonic() - started_at[chunk.stem], 2)
                 print(f"[done] {chunk.stem}.md ({elapsed}s)", flush=True)
                 return {
                     "chunk": chunk.stem,
@@ -659,6 +607,7 @@ async def process_chunks(
                     "path": str(md_path),
                     "estimated_payload_bytes": estimated,
                     "elapsed_seconds": elapsed,
+                    "retryable": False,
                 }
             except Exception as exc:
                 error = {
@@ -666,23 +615,119 @@ async def process_chunks(
                     "start_page": chunk.start_page,
                     "end_page": chunk.end_page,
                     "error": f"{type(exc).__name__}: {exc}",
+                    "round": round_number,
                 }
                 error_path.write_text(
                     json.dumps(error, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                return {
+                    "chunk": chunk.stem,
+                    "status": "failed",
+                    "retryable": not isinstance(
+                        exc,
+                        (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
+                    ),
+                    **error,
+                }
+
+        async def run_round(round_chunks: list[Chunk], round_number: int) -> list[dict]:
+            next_index = 0
+            cursor_lock = asyncio.Lock()
+
+            async def worker() -> None:
+                nonlocal next_index
+                while True:
+                    async with cursor_lock:
+                        if next_index >= len(round_chunks):
+                            return
+                        chunk = round_chunks[next_index]
+                        next_index += 1
+                    progress["active_chunks"] += 1
+                    try:
+                        outcome = await run_one(chunk, round_number)
+                    finally:
+                        progress["active_chunks"] -= 1
+                    latest_results[chunk.stem] = outcome
+                    completed_first_pass.add(chunk.stem)
+
+            worker_count = min(concurrency, len(round_chunks))
+            await asyncio.gather(*(worker() for _ in range(worker_count)))
+            return [latest_results[chunk.stem] for chunk in round_chunks]
+
+        async def emit_metrics() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(stop_metrics.wait(), timeout=15)
+                    return
+                except asyncio.TimeoutError:
+                    performance = key_pool.performance_summary()
+                    successful = sum(item.get("status") == "ok" for item in latest_results.values())
+                    failed = sum(item.get("status") == "failed" for item in latest_results.values())
+                    pending = len(chunks) - len(completed_first_pass)
+                    try:
+                        remote = await key_pool.remote_status()
+                        global_state = remote.get("global", {})
+                        if not isinstance(global_state, dict):
+                            global_state = {}
+                        global_summary = (
+                            f"global_inflight={global_state.get('activeLeases', '?')}/"
+                            f"{global_state.get('maxInflight', '?')} "
+                            f"global_rps={global_state.get('requestsPerSecond', '?')} "
+                            f"active_projects={global_state.get('activeProjects', '?')} "
+                            f"global_cooldown_ms={global_state.get('cooldownRemainingMs', '?')} "
+                            f"recent_503_ratio={global_state.get('recent503Ratio', '?')} "
+                            f"adaptive_stage={global_state.get('adaptiveStage', '?')}"
+                        )
+                    except Exception as exc:
+                        global_summary = f"global_status=unavailable({type(exc).__name__})"
+                    print(
+                        f"[metrics] pending_chunks={pending} active_chunks={progress['active_chunks']} "
+                        f"success={successful} failed={failed} "
+                        f"http_429={performance['429']} http_503={performance['503']} "
+                        f"http_p50={performance['p50_seconds']}s "
+                        f"http_p95={performance['p95_seconds']}s {global_summary}",
+                        flush=True,
+                    )
+
+        metrics_task = asyncio.create_task(emit_metrics())
+        try:
+            first_round = await run_round(chunks, 1)
+            deferred = [
+                chunks_by_name[result["chunk"]]
+                for result in first_round
+                if result["status"] == "failed" and result["retryable"]
+            ]
+            for round_number in range(2, 4):
+                if not deferred:
+                    break
+                delay_scale = 2 ** (round_number - 2)
+                delay = random.uniform(30.0 * delay_scale, 60.0 * delay_scale)
                 print(
-                    f"[failed] {chunk.stem}: {error['error']}",
+                    f"[retry-round] round={round_number}/3 deferred_chunks={len(deferred)} "
+                    f"wait={delay:.0f}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+                round_results = await run_round(deferred, round_number)
+                deferred = [
+                    chunks_by_name[result["chunk"]]
+                    for result in round_results
+                    if result["status"] == "failed" and result["retryable"]
+                ]
+        finally:
+            stop_metrics.set()
+            await metrics_task
+            await key_pool.close()
+
+        results = [latest_results[chunk.stem] for chunk in chunks]
+        for result in results:
+            if result["status"] == "failed":
+                print(
+                    f"[failed] {result['chunk']}: {result['error']}",
                     file=sys.stderr,
                     flush=True,
                 )
-                return {"chunk": chunk.stem, "status": "failed", **error}
-
-        tasks = [asyncio.create_task(run_one(chunk)) for chunk in chunks]
-        results = []
-        for future in asyncio.as_completed(tasks):
-            results.append(await future)
-        await key_pool.close()
         quota_summary = key_pool.usage_summary()
         (output_dir / "quota-usage.json").write_text(
             json.dumps(quota_summary, ensure_ascii=False, indent=2) + "\n",

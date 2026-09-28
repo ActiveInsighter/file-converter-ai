@@ -1,11 +1,79 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import os
+import random
 import re
+import time
 from urllib.parse import urlparse
 
 import httpx
+
+
+class QuotaPoolExhaustedError(RuntimeError):
+    """No project has any remaining requests for the current Pacific day."""
+
+
+def classify_quota_error(payload: object) -> str:
+    """Return a quota category only when Google's error details identify one."""
+    fragments: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                fragments.append(str(key))
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, str):
+            fragments.append(value)
+
+    collect(payload)
+    text = re.sub(r"[^a-z0-9]+", " ", " ".join(fragments).lower())
+    compact = text.replace(" ", "")
+    if "request" in compact and (
+        "perday" in compact or "daily" in compact or "requestsday" in compact
+    ):
+        return "rpd"
+    if "tpm" in compact or ("token" in compact and "perminute" in compact):
+        return "tpm"
+    if "rpm" in compact or ("request" in compact and "perminute" in compact):
+        return "rpm"
+    if any(marker in compact for marker in ("spend", "spending", "costlimit")):
+        return "spend"
+    return "unknown"
+
+
+def retry_after_seconds(headers: httpx.Headers, payload: object) -> float | None:
+    """Read standard Retry-After or Google's google.rpc.RetryInfo delay."""
+    candidates: list[float] = []
+    raw_header = headers.get("Retry-After")
+    if raw_header:
+        try:
+            candidates.append(max(0.0, float(raw_header)))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(raw_header)
+                candidates.append(max(0.0, retry_at.timestamp() - time.time()))
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "retryDelay" and isinstance(item, str):
+                    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s\s*", item)
+                    if match:
+                        candidates.append(float(match.group(1)))
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(payload)
+    return max(candidates) if candidates else None
 
 
 def parse_key_groups(key_count: int, raw: str | None) -> list[str]:
@@ -63,6 +131,8 @@ class ProjectQuotaPool:
         self.successes = [0 for _ in keys]
         self.errors = [0 for _ in keys]
         self.rate_limited_counts = [0 for _ in keys]
+        self.http_counts = {"success": 0, "429": 0, "503": 0, "other_error": 0}
+        self.request_latencies: list[float] = []
 
     @classmethod
     async def create(
@@ -155,10 +225,11 @@ class ProjectQuotaPool:
                     wait_ms = int(response.json().get("waitMs", 250))
                 except (TypeError, ValueError):
                     wait_ms = 250
-                await asyncio.sleep(max(0.05, min(wait_ms, 30_000) / 1000))
+                bounded_wait = max(0.25, min(wait_ms, 30_000) / 1000)
+                await asyncio.sleep(random.uniform(bounded_wait * 0.8, bounded_wait * 1.2))
                 continue
             if response.status_code == 429:
-                raise RuntimeError(
+                raise QuotaPoolExhaustedError(
                     "All Gemini projects reached the configured Pacific-day request limit."
                 )
             if response.status_code != 200:
@@ -188,12 +259,14 @@ class ProjectQuotaPool:
         *,
         cooldown_seconds: float = 0,
         daily_exhausted: bool = False,
+        quota_type: str = "unknown",
     ) -> None:
         payload = {
             "leaseId": lease_id,
             "httpStatus": http_status,
             "cooldownSeconds": max(0, cooldown_seconds),
             "dailyExhausted": daily_exhausted,
+            "quotaType": quota_type,
         }
         last_error: Exception | None = None
         for attempt in range(1, 6):
@@ -230,6 +303,7 @@ class ProjectQuotaPool:
         lease_id: str,
         cooldown_seconds: float,
         daily_exhausted: bool = False,
+        quota_type: str = "unknown",
     ) -> None:
         self.rate_limited_counts[key_index] += 1
         await self._report(
@@ -238,25 +312,40 @@ class ProjectQuotaPool:
             429,
             cooldown_seconds=cooldown_seconds,
             daily_exhausted=daily_exhausted,
+            quota_type=quota_type,
         )
 
-    def is_daily_quota_message(self, message: str) -> bool:
-        lower = message.lower()
-        explicit_daily_markers = (
-            "perday",
-            "per_day",
-            "per day",
-            "requestsperday",
-            "requests per day",
-            "daily",
-        )
-        if any(marker in lower for marker in explicit_daily_markers):
-            return True
-        limit_match = re.search(
-            r"quota exceeded for metric:[^\n]*requests[^\n]*limit:\s*(\d+)",
-            lower,
-        )
-        return bool(limit_match and int(limit_match.group(1)) == int(self.rpd_per_project))
+    def record_http_result(self, status: int, elapsed_seconds: float) -> None:
+        if status == 200:
+            self.http_counts["success"] += 1
+        elif status == 429:
+            self.http_counts["429"] += 1
+        elif status == 503:
+            self.http_counts["503"] += 1
+        else:
+            self.http_counts["other_error"] += 1
+        self.request_latencies.append(max(0.0, elapsed_seconds))
+        if len(self.request_latencies) > 1000:
+            del self.request_latencies[: len(self.request_latencies) - 1000]
+
+    async def remote_status(self) -> dict:
+        return await self._post("/v1/status", {})
+
+    def performance_summary(self) -> dict[str, object]:
+        ordered = sorted(self.request_latencies)
+
+        def percentile(value: float) -> float | None:
+            if not ordered:
+                return None
+            index = round((len(ordered) - 1) * value)
+            return round(ordered[index], 2)
+
+        return {
+            **self.http_counts,
+            "requests": len(ordered),
+            "p50_seconds": percentile(0.5),
+            "p95_seconds": percentile(0.95),
+        }
 
     async def close(self) -> None:
         return None
@@ -264,6 +353,7 @@ class ProjectQuotaPool:
     def usage_summary(self) -> dict[str, object]:
         return {
             "scope": "current_action",
+            "performance": self.performance_summary(),
             "projects": {
                 group: {
                     "requests": self.used[index],

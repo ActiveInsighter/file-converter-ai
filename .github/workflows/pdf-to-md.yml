@@ -30,7 +30,7 @@ on:
         default: "1"
         type: string
       concurrency:
-        description: "Maximum simultaneous Gemini requests"
+        description: "Local page workers; the quota Worker applies the shared Gemini request limit"
         required: true
         default: "50"
         type: string
