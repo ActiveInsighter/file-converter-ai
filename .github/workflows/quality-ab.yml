@@ -1,0 +1,123 @@
+name: quality-ab-1x-vs-2x
+
+on:
+  push:
+    branches:
+      - "bench/quality-1x-vs-2x"
+    paths:
+      - ".github/workflows/quality-ab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GEMINI_API_KEYS_ALL: ${{ secrets.GEMINI_API_KEYS }}
+      SOURCE_URL: "https://drive.google.com/file/d/1Tt-krcZrsVDRMcWLiC1Q9HnBA19oR3zx/view?usp=drivesdk"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run matched math quality A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path
+
+          import fitz
+          import gdown
+          import httpx
+
+          from pdf2md import Chunk, DEFAULT_PROMPT, call_gemini, make_request_parts
+          from quota_state import ProjectQuotaPool
+
+          TARGETS = [11, 20, 128, 156, 270]
+          EXTRA = """\n10. 为便于人工逐页核对，每一页开始前必须输出一行精确标记：===== PAGE NNN =====，NNN 使用三位页码。不要省略标记。"""
+
+          async def main():
+              raw = [x.strip() for x in os.environ["GEMINI_API_KEYS_ALL"].splitlines() if x.strip()]
+              keys = raw[6:9]
+              if len(keys) != 3:
+                  raise RuntimeError(f"expected keys 7-9, got {len(keys)}")
+
+              work = Path("quality")
+              images = work / "images"
+              old_dir = work / "old"
+              new_dir = work / "new"
+              images.mkdir(parents=True, exist_ok=True)
+              old_dir.mkdir(parents=True, exist_ok=True)
+              new_dir.mkdir(parents=True, exist_ok=True)
+
+              pdf = work / "source.pdf"
+              result = gdown.download(url=os.environ["SOURCE_URL"], output=str(pdf), quiet=True, fuzzy=True)
+              if not result:
+                  raise RuntimeError("download failed")
+
+              doc = fitz.open(pdf)
+              needed = sorted(set(TARGETS + [p + 1 for p in TARGETS]))
+              for page_no in needed:
+                  pix = doc[page_no - 1].get_pixmap(matrix=fitz.Matrix(240 / 72, 240 / 72), alpha=False)
+                  (images / f"{page_no:03}.png").write_bytes(pix.tobytes("png"))
+              doc.close()
+
+              prompt = DEFAULT_PROMPT + EXTRA
+              pool = await ProjectQuotaPool.create(
+                  keys=keys,
+                  groups=["qa1", "qa2", "qa3"],
+                  rpm_per_project=15,
+                  rpd_per_project=500,
+              )
+
+              async with httpx.AsyncClient(
+                  timeout=httpx.Timeout(300.0, connect=30.0),
+                  limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+              ) as client:
+                  for page_no in TARGETS:
+                      path = images / f"{page_no:03}.png"
+                      chunk = Chunk(page_no, page_no, (path,), f"{page_no:03}")
+                      parts, _ = make_request_parts(chunk, prompt, "ultra_high")
+                      text = await call_gemini(
+                          client, pool, len(keys), "gemini-3.5-flash-lite",
+                          parts, f"old-{page_no:03}", "high"
+                      )
+                      (old_dir / f"{page_no:03}.md").write_text(text + "\n", encoding="utf-8")
+
+                  for page_no in TARGETS:
+                      p1 = images / f"{page_no:03}.png"
+                      p2 = images / f"{page_no + 1:03}.png"
+                      chunk = Chunk(page_no, page_no + 1, (p1, p2), f"{page_no:03}-{page_no + 1:03}")
+                      parts, _ = make_request_parts(chunk, prompt, "ultra_high")
+                      text = await call_gemini(
+                          client, pool, len(keys), "gemini-3.5-flash-lite",
+                          parts, f"new-{page_no:03}-{page_no + 1:03}", "high"
+                      )
+                      (new_dir / f"{page_no:03}-{page_no + 1:03}.md").write_text(text + "\n", encoding="utf-8")
+
+              await pool.close()
+
+              for page_no in TARGETS:
+                  print(f"===== OLD_{page_no:03} =====")
+                  print((old_dir / f"{page_no:03}.md").read_text(encoding="utf-8"))
+                  print(f"===== NEW_{page_no:03}_{page_no + 1:03} =====")
+                  print((new_dir / f"{page_no:03}-{page_no + 1:03}.md").read_text(encoding="utf-8"))
+
+          asyncio.run(main())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-ab-${{ github.run_id }}
+          path: quality/
+          retention-days: 2
