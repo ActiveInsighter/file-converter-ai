@@ -1,11 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 
-interface Env {
-  QUOTA_POOL: DurableObjectNamespace<GeminiQuotaPool>;
-  QUOTA_API_TOKEN: string;
-  EXPECTED_KEY_COUNT: string;
-}
-
 type RpcResult = {
   status: number;
   body: Record<string, unknown>;

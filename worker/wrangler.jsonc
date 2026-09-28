@@ -14,5 +14,8 @@
   },
   "vars": {
     "EXPECTED_KEY_COUNT": "66"
+  },
+  "secrets": {
+    "required": ["QUOTA_API_TOKEN"]
   }
 }
