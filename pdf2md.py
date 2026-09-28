@@ -717,6 +717,12 @@ def merge_markdown(
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--conversion-type",
+        choices=["pdf_to_md"],
+        default="pdf_to_md",
+        help="Conversion handler selected by the generic file-converter workflow.",
+    )
     p.add_argument("--source-url", required=True)
     p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=50)
@@ -778,6 +784,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.conversion_type != "pdf_to_md":
+        raise ValueError("conversion_type must be pdf_to_md")
     if not 1 <= args.images_per_request <= 20:
         raise ValueError("images_per_request must be between 1 and 20")
     if not 1 <= args.concurrency <= 100:
@@ -835,7 +843,7 @@ async def async_main(args: argparse.Namespace) -> int:
     images_dir = work_dir / "images"
 
     print(
-        f"[config] model={args.model} keys={len(keys)} "
+        f"[config] conversion_type={args.conversion_type} model={args.model} keys={len(keys)} "
         f"concurrency={args.concurrency} "
         f"images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
@@ -889,6 +897,7 @@ async def async_main(args: argparse.Namespace) -> int:
     merge_markdown(chunks, output_dir / "pages", output_dir / merged_name)
 
     manifest = {
+        "conversion_type": args.conversion_type,
         "source_url": args.source_url,
         "model": args.model,
         "total_pages": pdf_total_pages,
