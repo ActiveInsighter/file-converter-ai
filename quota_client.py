@@ -176,6 +176,13 @@ class ProjectQuotaPool:
         )
         if result.get("keyCount") != len(keys) or result.get("projectCount") != len(set(groups)):
             raise RuntimeError("Quota API returned an unexpected key/project count")
+        if result.get("remapped"):
+            print(
+                "[quota] The API key list changed; the quota pool was rebuilt "
+                "for the new Project mapping and today's per-Project counters "
+                "were reset.",
+                flush=True,
+            )
         print(
             "[quota] Valkey pool ready "
             f"keys={result['keyCount']} projects={result['projectCount']} "

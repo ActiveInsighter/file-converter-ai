@@ -22,7 +22,6 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         self.scheduler = QuotaScheduler(
             self.client,
             prefix=self.prefix,
-            expected_key_count=66,
             clock_ms=lambda: self.now[0],
             random_ms=lambda minimum, maximum: minimum,
         )
@@ -48,7 +47,6 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         other_action = QuotaScheduler(
             self.client,
             prefix=self.prefix,
-            expected_key_count=66,
             clock_ms=lambda: self.now[0],
             random_ms=lambda minimum, maximum: minimum,
         )
@@ -67,14 +65,17 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reports_are_idempotent_and_503s_reduce_global_capacity(self):
         await self.configure()
-        leases = [(await self.scheduler.lease()).body for _ in range(5)]
+        leases = []
+        for _ in range(10):
+            self.now[0] += 1_000
+            leases.append((await self.scheduler.lease()).body)
         for lease in leases:
             result = await self.scheduler.report(lease["leaseId"], 503)
             self.assertEqual(result.status, 200)
         duplicate = await self.scheduler.report(leases[0]["leaseId"], 503)
         self.assertTrue(duplicate.body["duplicate"])
         state = (await self.scheduler.status()).body["global"]
-        self.assertEqual(state["recentOutcomes"], 5)
+        self.assertEqual(state["recentOutcomes"], 10)
         self.assertEqual(state["maxInflight"], 12)
         self.assertGreater(state["cooldownRemainingMs"], 0)
         self.now[0] += 31_000
@@ -83,6 +84,36 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         state = (await self.scheduler.status()).body["global"]
         self.assertEqual(state["maxInflight"], 8)
         self.assertEqual(state["adaptiveStage"], 2)
+
+    async def test_partial_success_recovery_lifts_capacity_off_the_floor(self):
+        """A clean-enough success window must lift capacity off the floor.
+
+        The previous gate demanded 19 successes out of the last 20 outcomes,
+        which a free tier answering 503 on a third of its calls can never
+        satisfy, so the pool stayed at 8 in-flight plus cooldowns forever.
+        """
+        await self.configure()
+        for _ in range(10):
+            self.now[0] += 1_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 503)
+        self.now[0] += 31_000
+        lease = (await self.scheduler.lease()).body
+        await self.scheduler.report(lease["leaseId"], 503)
+        state = (await self.scheduler.status()).body["global"]
+        self.assertEqual(state["maxInflight"], 8)
+
+        # Stay out of the cooldown the controller parks while the sampled window
+        # still looks unhealthy, and add enough clean outcomes for the earlier
+        # 503s to age out of that window.
+        for _ in range(20):
+            self.now[0] += 31_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 200)
+
+        state = (await self.scheduler.status()).body["global"]
+        self.assertGreater(state["maxInflight"], 8)
+        self.assertLess(state["adaptiveStage"], 2)
 
     async def test_explicit_daily_exhaustion_removes_only_that_project(self):
         await self.configure()
@@ -108,13 +139,34 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.status, 200)
         self.assertNotEqual(second.body["leaseId"], first.body["leaseId"])
 
-    async def test_mapping_changes_are_rejected(self):
+    async def test_mapping_change_remaps_an_idle_pool(self):
+        """Adding a key must not wedge every later Action.
+
+        The mapping hash covers the whole key list, so adding or removing one
+        key changes it. Refusing the reconfiguration left the pool unusable
+        until an operator wiped the Valkey state by hand.
+        """
         await self.configure()
-        groups = [f"project-{index + 1}" for index in range(66)]
-        groups[0], groups[1] = groups[1], groups[0]
+        groups = [f"project-{index + 1}" for index in range(67)]
+        result = await self.scheduler.configure(groups, rpm_per_project=15, rpd_per_project=500)
+        self.assertEqual(result.status, 200, result.body)
+        self.assertTrue(result.body["remapped"])
+        self.assertEqual(result.body["projectCount"], 67)
+        state = (await self.scheduler.status()).body
+        self.assertEqual(state["keyCount"], 67)
+        lease = await self.scheduler.lease()
+        self.assertEqual(lease.status, 200)
+
+    async def test_mapping_change_is_rejected_while_a_lease_is_active(self):
+        await self.configure()
+        lease = await self.scheduler.lease()
+        self.assertEqual(lease.status, 200)
+        groups = [f"project-{index + 1}" for index in range(67)]
         result = await self.scheduler.configure(groups, rpm_per_project=15, rpd_per_project=500)
         self.assertEqual(result.status, 409)
         self.assertEqual(result.body["error"], "project_mapping_changed")
+        self.assertEqual(result.body["activeLeases"], 1)
+        await self.scheduler.report(lease.body["leaseId"], 200)
 
     async def test_retrying_the_same_request_id_reuses_the_lease(self):
         await self.configure()

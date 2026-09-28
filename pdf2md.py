@@ -144,6 +144,19 @@ def parse_api_keys(raw: str | None) -> list[str]:
     return result
 
 
+def parse_model_list(raw: str | None) -> tuple[str, ...]:
+    """Parse a comma/semicolon separated fallback chain, keeping first position."""
+    if not raw:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in re.split(r"[,;\s]+", raw)
+            if item.strip()
+        )
+    )
+
+
 def is_google_drive_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return host == "drive.google.com" or host.endswith(".drive.google.com")
@@ -443,7 +456,17 @@ class PermanentGeminiError(RuntimeError):
     """A request rejected for a non-transient client or configuration error."""
 
 
-async def call_gemini(
+class ModelUnavailableError(RuntimeError):
+    """The model itself is not serving the request right now.
+
+    Google's free tier answers 503 ``UNAVAILABLE`` ("This model is currently
+    experiencing high demand") and sometimes 404 for a whole model while the
+    API key and the Cloud project are perfectly healthy. Both must be retried
+    and must be able to fall through to another model instead of failing a page.
+    """
+
+
+async def call_gemini_once(
     client: httpx.AsyncClient,
     key_pool: ProjectQuotaPool,
     model: str,
@@ -516,9 +539,48 @@ async def call_gemini(
 
     await key_pool.mark_error(key_index, lease_id, http_status=response.status_code)
     error = f"Gemini HTTP {response.status_code}: {message}"
-    if response.status_code in {400, 401, 403, 404}:
+    if response.status_code in {400, 401, 403}:
         raise PermanentGeminiError(error)
+    if response.status_code == 404 or 500 <= response.status_code < 600:
+        raise ModelUnavailableError(error)
     raise RuntimeError(error)
+
+
+async def call_gemini(
+    client: httpx.AsyncClient,
+    key_pool: ProjectQuotaPool,
+    model: str,
+    parts: list[dict],
+    chunk_name: str,
+    thinking_level: str,
+    fallback_models: tuple[str, ...] = (),
+) -> str:
+    """Transcribe one chunk, walking the fallback chain when a model is saturated.
+
+    A single model can be unavailable for hours while its siblings keep serving,
+    and the quota pool is shared across all of them, so trying the next model is
+    the cheapest way to turn a hard page failure into a slower success.
+    """
+    candidates = [model, *(item for item in fallback_models if item and item != model)]
+    last_error: Exception | None = None
+    for position, candidate in enumerate(candidates):
+        try:
+            return await call_gemini_once(
+                client, key_pool, candidate, parts, chunk_name, thinking_level
+            )
+        except (QuotaPoolExhaustedError, PermanentGeminiError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - the chain is best effort
+            last_error = exc
+            if position + 1 < len(candidates):
+                print(
+                    f"[fallback] {chunk_name}: {candidate} -> "
+                    f"{type(exc).__name__}; trying {candidates[position + 1]}",
+                    flush=True,
+                )
+    if last_error is None:
+        raise RuntimeError("No Gemini model configured for this request")
+    raise last_error
 
 
 async def process_chunks(
@@ -533,6 +595,9 @@ async def process_chunks(
     media_resolution: str,
     rpm_per_key: float,
     rpd_per_key: int,
+    fallback_models: tuple[str, ...] = (),
+    retry_rounds: int = 5,
+    attempts_per_page: int = 2,
 ) -> list[dict]:
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
@@ -570,8 +635,9 @@ async def process_chunks(
         async def run_one(chunk: Chunk, round_number: int) -> dict:
             md_path = pages_dir / f"{chunk.stem}.md"
             error_path = errors_dir / f"{chunk.stem}.json"
+            attempts = max(1, attempts_per_page)
 
-            try:
+            async def transcribe() -> tuple[str, int]:
                 parts, estimated = make_request_parts(chunk, prompt, media_resolution)
                 text = await call_gemini(
                     client,
@@ -580,6 +646,7 @@ async def process_chunks(
                     parts,
                     chunk.stem,
                     thinking_level,
+                    fallback_models,
                 )
 
                 for verify_index in range(verification_passes):
@@ -593,7 +660,35 @@ async def process_chunks(
                         verify_parts,
                         f"{chunk.stem}-verify-{verify_index + 1}",
                         thinking_level,
+                        fallback_models,
                     )
+                return text, estimated
+
+            # A saturated free tier answers 503 in a couple of seconds, so an
+            # immediate retry is far cheaper than deferring the page to the next
+            # round, which waits 30-480 seconds.
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    text, estimated = await transcribe()
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if (
+                        isinstance(
+                            exc,
+                            (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
+                        )
+                        or attempt >= attempts
+                    ):
+                        break
+                    pause = random.uniform(3.0, 8.0) * attempt
+                    print(
+                        f"[retry] {chunk.stem}: attempt {attempt}/{attempts} failed "
+                        f"with {type(exc).__name__}; retrying in {pause:.1f}s",
+                        flush=True,
+                    )
+                    await asyncio.sleep(pause)
+                    continue
 
                 md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
                 if error_path.exists():
@@ -609,27 +704,31 @@ async def process_chunks(
                     "elapsed_seconds": elapsed,
                     "retryable": False,
                 }
-            except Exception as exc:
-                error = {
-                    "chunk": chunk.stem,
-                    "start_page": chunk.start_page,
-                    "end_page": chunk.end_page,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "round": round_number,
-                }
-                error_path.write_text(
-                    json.dumps(error, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                return {
-                    "chunk": chunk.stem,
-                    "status": "failed",
-                    "retryable": not isinstance(
-                        exc,
-                        (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
-                    ),
-                    **error,
-                }
+
+            exc = last_error if last_error is not None else RuntimeError(
+                "transcription failed without an exception"
+            )
+            error = {
+                "chunk": chunk.stem,
+                "start_page": chunk.start_page,
+                "end_page": chunk.end_page,
+                "error": f"{type(exc).__name__}: {exc}",
+                "round": round_number,
+                "attempts": attempts,
+            }
+            error_path.write_text(
+                json.dumps(error, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return {
+                "chunk": chunk.stem,
+                "status": "failed",
+                "retryable": not isinstance(
+                    exc,
+                    (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
+                ),
+                **error,
+            }
 
         async def run_round(round_chunks: list[Chunk], round_number: int) -> list[dict]:
             next_index = 0
@@ -698,14 +797,14 @@ async def process_chunks(
                 for result in first_round
                 if result["status"] == "failed" and result["retryable"]
             ]
-            for round_number in range(2, 4):
+            for round_number in range(2, retry_rounds + 1):
                 if not deferred:
                     break
-                delay_scale = 2 ** (round_number - 2)
-                delay = random.uniform(30.0 * delay_scale, 60.0 * delay_scale)
+                base_delay = min(480.0, 30.0 * (2 ** (round_number - 2)))
+                delay = random.uniform(base_delay, base_delay * 2.0)
                 print(
-                    f"[retry-round] round={round_number}/3 deferred_chunks={len(deferred)} "
-                    f"wait={delay:.0f}s",
+                    f"[retry-round] round={round_number}/{retry_rounds} "
+                    f"deferred_chunks={len(deferred)} wait={delay:.0f}s",
                     flush=True,
                 )
                 await asyncio.sleep(delay)
@@ -772,6 +871,33 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--model", default="gemini-3.5-flash-lite")
+    p.add_argument(
+        "--model-fallbacks",
+        default="",
+        help=(
+            "Comma-separated fallback model IDs tried in order when the primary "
+            "model answers 503/404. Empty disables the fallback chain."
+        ),
+    )
+    p.add_argument(
+        "--retry-rounds",
+        type=int,
+        default=5,
+        help=(
+            "Total passes over failed chunks. Each extra round waits roughly "
+            "twice as long as the previous one. Default: 5."
+        ),
+    )
+    p.add_argument(
+        "--attempts-per-page",
+        type=int,
+        default=2,
+        help=(
+            "Immediate attempts per page inside a round before the page is "
+            "deferred. A saturated model answers 503 within seconds, so a quick "
+            "retry is much cheaper than waiting for the next round. Default: 2."
+        ),
+    )
     p.add_argument(
         "--thinking-level",
         choices=["minimal", "low", "medium", "high"],
@@ -858,6 +984,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("rpm_per_key must be > 0")
     if args.rpd_per_key <= 0:
         raise ValueError("rpd_per_key must be > 0")
+    if not 1 <= args.retry_rounds <= 10:
+        raise ValueError("retry_rounds must be between 1 and 10")
+    if not 1 <= args.attempts_per_page <= 5:
+        raise ValueError("attempts_per_page must be between 1 and 5")
     if args.media_resolution not in {
         "unspecified",
         "low",
@@ -877,6 +1007,9 @@ async def async_main(args: argparse.Namespace) -> int:
         raise RuntimeError(
             "GEMINI_API_KEYS is empty. Add a repository Actions secret with one Gemini API key per line."
         )
+    fallback_models = parse_model_list(
+        args.model_fallbacks or os.getenv("GEMINI_MODEL_FALLBACKS")
+    )
 
     work_dir = Path(args.work_dir)
     output_dir = Path(args.output_dir)
@@ -895,6 +1028,9 @@ async def async_main(args: argparse.Namespace) -> int:
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
         f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key} "
+        f"model_fallbacks={','.join(fallback_models) or 'none'} "
+        f"retry_rounds={args.retry_rounds} "
+        f"attempts_per_page={args.attempts_per_page} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
@@ -934,6 +1070,9 @@ async def async_main(args: argparse.Namespace) -> int:
         args.media_resolution,
         args.rpm_per_key,
         args.rpd_per_key,
+        fallback_models=fallback_models,
+        retry_rounds=args.retry_rounds,
+        attempts_per_page=args.attempts_per_page,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 

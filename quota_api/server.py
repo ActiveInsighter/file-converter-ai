@@ -59,7 +59,7 @@ def create_app(
             socket_timeout=5,
             health_check_interval=30,
         )
-        scheduler = QuotaScheduler(client)
+        scheduler = QuotaScheduler.from_env(client)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

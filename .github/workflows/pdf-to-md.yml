@@ -44,6 +44,21 @@ on:
         required: true
         default: "gemini-3.5-flash-lite"
         type: string
+      model_fallbacks:
+        description: "Comma-separated fallback model IDs tried when the primary model answers 503/404. Use only models with a 500 RPD free quota (the -lite ones); plain Flash models allow just 20 requests/day/project."
+        required: false
+        default: "gemini-3.1-flash-lite,gemini-flash-lite-latest"
+        type: string
+      retry_rounds:
+        description: "Total passes over failed pages; each pass waits about twice as long as the previous one."
+        required: false
+        default: "5"
+        type: string
+      attempts_per_page:
+        description: "Immediate retries per page inside a round before the page is deferred to the next round."
+        required: false
+        default: "2"
+        type: string
       thinking_level:
         description: "Gemini thinking level"
         required: true
@@ -128,6 +143,9 @@ jobs:
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
+      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || 'gemini-3.1-flash-lite,gemini-flash-lite-latest' }}
+      RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
+      ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
@@ -180,6 +198,9 @@ jobs:
             echo "Repository secret GEMINI_QUOTA_API_TOKEN is required" >&2
             exit 1
           fi
+          if [[ -z "${GEMINI_KEY_GROUPS}" ]]; then
+            echo "::warning::Repository variable GEMINI_KEY_GROUPS is empty. The quota pool then labels keys project-1..N, so it cannot verify that each API key belongs to a distinct Google Cloud project; two keys from the same project would each be granted a full quota budget. Generate the list with deploy/print-key-groups.py and store it as a repository variable."
+          fi
 
       - name: Convert PDF to Markdown
         shell: bash
@@ -191,6 +212,9 @@ jobs:
             --images-per-request "${IMAGES_PER_REQUEST}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
+            --model-fallbacks "${MODEL_FALLBACKS}"
+            --retry-rounds "${RETRY_ROUNDS}"
+            --attempts-per-page "${ATTEMPTS_PER_PAGE}"
             --thinking-level "${THINKING_LEVEL}"
             --dpi "${DPI}"
             --image-format "${IMAGE_FORMAT}"
