@@ -332,24 +332,33 @@ nvapi-yyyyyyyy
 
 ### GitHub Actions 运行
 
-进入：
+这个功能目前在实验分支 `feat/nvidia-deepseek-v4.1-flash`。因为 GitHub 只允许默认分支中已经存在的 workflow 接收 `workflow_dispatch`，分支测试请复用现有的 `.github/workflows/pdf-to-md.yml`，并把运行 ref 指向这个实验分支。
 
-**Actions → PDF to Markdown with NVIDIA DeepSeek → Run workflow**
+使用 GitHub CLI 的示例：
 
-建议第一次只跑 1～4 页验证：
-
-```text
-images_per_request = 2
-concurrency = 4~8
-model = deepseek-ai/deepseek-v4.1-flash
-dpi = 240
-image_format = png
-max_tokens = 32768
-temperature = 0.1
-top_p = 0.95
+```bash
+gh workflow run pdf-to-md.yml \
+  --ref feat/nvidia-deepseek-v4.1-flash \
+  -f provider=nvidia \
+  -f source_url='https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
+  -f images_per_request=2 \
+  -f concurrency=8 \
+  -f nvidia_model=deepseek-ai/deepseek-v4.1-flash \
+  -f nvidia_max_tokens=32768 \
+  -f nvidia_temperature=0.1 \
+  -f nvidia_top_p=0.95
 ```
 
-确认没有 429 后再逐步提高 `concurrency`。NVIDIA workflow 和 Gemini workflow 使用不同的 concurrency group，不会互相排队。
+建议第一次只跑 1～4 页，并先使用：
+
+```text
+images_per_request = 1~2
+concurrency = 4~8
+dpi = 240
+image_format = png
+```
+
+确认没有 429 后再逐步提高 `concurrency`。分支合并到默认分支后，新增的独立 Action `PDF to Markdown with NVIDIA DeepSeek` 才会直接出现在 Actions 中供手动运行。
 
 ### 本地快速测试
 
