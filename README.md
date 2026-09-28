@@ -154,7 +154,7 @@ media_resolution = ultra_high
 verification_passes = 0
 ```
 
-其中 `concurrency = 50` 是客户端同时在途请求的上限；实际发起速率仍由 Project 级 RPM/RPD 调度器约束，因此不会为了凑满 50 并发而绕过配额。
+其中 `concurrency = 50` 是客户端同时处理的页面任务数；真正的 Gemini 请求由 Durable Object 统一限制为最多 24 个在途、持续 2 req/s。
 
 ## 本地运行
 
@@ -224,6 +224,8 @@ Actions 需要以下仓库设置：
 现有 `rpm_per_key` / `rpd_per_key` workflow 参数保留以兼容 n8n；它们实际配置每个 **Project** 的限额，默认分别为 15 RPM 和 500 RPD。所有并发 Action 使用同一个额度池和配置。
 
 除 Project 配额外，DO 还对所有 Action 统一整形：最多 24 个 Gemini 请求在途，持续启动速率 2 req/s，空闲时最多突发 8 个。发现最近 20 个结果中 503 占比达到 20%（至少 5 个结果）时，会分阶段把在途上限降至 12、再降至 8，并分别增加 5–15 秒、15–30 秒、30–60 秒的随机全局冷却；连续稳定成功后再逐步恢复。lease 超时为 180 秒，Gemini HTTP 超时为 120 秒。
+
+Cloudflare Workers Free 计划的 SQLite Durable Objects 每天有 500 万行读取额度，按 00:00 UTC 重置。调度器在全局等待时不会扫描 66 个 Project，并为活跃 lease 查询建立索引，以降低这一额度的消耗。若账号当天额度耗尽，Cloudflare 会拒绝 DO 存储读取，转换任务会在配置阶段失败；需要等额度重置或改用 Workers Paid 计划。
 
 每页每轮只请求一次：先完成所有页面的首轮，再把可重试失败页放入两轮 deferred retry；两轮分别随机等待 30–60 秒和 60–120 秒。400/401/403/404、超过请求体限制和全局 RPD 耗尽会直接记为最终失败。日志每 15 秒输出一次聚合请求数、429/503、p50/p95 延迟和 DO 状态，避免逐次重试刷屏。
 
