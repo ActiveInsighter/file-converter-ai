@@ -19,11 +19,19 @@ import gdown
 import httpx
 
 from quota_client import (
+    LocalKeyPool,
     ProjectQuotaPool,
     QuotaPoolExhaustedError,
-    classify_quota_error,
     parse_key_groups,
-    retry_after_seconds,
+)
+from providers import (
+    GEMINI,
+    Provider,
+    ProviderRefusal,
+    normalize_reasoning_effort,
+    provider_names,
+    resolve_model,
+    resolve_provider,
 )
 
 DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
@@ -59,7 +67,6 @@ def compose_prompt(system_prompt: str, user_prompt: str) -> str:
     return composed or DEFAULT_PROMPT
 
 
-GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
 
 # A page counts as an empty scan page when it has almost no ink *and* nothing
@@ -83,19 +90,6 @@ SPLIT_FALLBACK_OVERLAP = 0.01
 # halves of a refused half, so a stubborn page costs at most 1 + 2 + 2 requests
 # and never grows without bound.
 PAGE_SPLIT_DEPTH = 2
-# finishReason values that mean "the model refused to emit the page", as opposed
-# to "the model produced nothing".
-BLOCKED_FINISH_REASONS = frozenset(
-    {
-        "RECITATION",
-        "SAFETY",
-        "PROHIBITED_CONTENT",
-        "BLOCKLIST",
-        "SPII",
-        "IMAGE_SAFETY",
-        "LANGUAGE",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -105,87 +99,6 @@ class Chunk:
     image_paths: tuple[Path, ...]
     stem: str
     blank: bool = False
-
-
-class KeyPool:
-    """Quota-aware scheduler for independent Gemini API keys.
-
-    Each key is paced independently. With the default 15 RPM, a key is never
-    assigned more often than once every 4 seconds. 429 responses can temporarily
-    cool down or permanently exhaust one key for the current run.
-    """
-
-    def __init__(
-        self,
-        keys: list[str],
-        rpm_per_key: float,
-        rpd_per_key: int,
-    ) -> None:
-        if not keys:
-            raise ValueError("No Gemini API keys configured")
-        if rpm_per_key <= 0:
-            raise ValueError("rpm_per_key must be > 0")
-        if rpd_per_key <= 0:
-            raise ValueError("rpd_per_key must be > 0")
-
-        self.keys = keys
-        # Keep a small safety margin for provider sliding-window accounting.
-        self.interval = (60.0 / rpm_per_key) * 1.08
-        self.rpd_per_key = rpd_per_key
-        self.next_allowed = [0.0 for _ in keys]
-        self.cooldown_until = [0.0 for _ in keys]
-        self.used = [0 for _ in keys]
-        self.disabled = [False for _ in keys]
-        self.lock = asyncio.Lock()
-
-    async def acquire(self) -> tuple[int, str]:
-        while True:
-            wait_for = 0.0
-            async with self.lock:
-                now = time.monotonic()
-                candidates: list[tuple[float, int]] = []
-                for index in range(len(self.keys)):
-                    if self.disabled[index] or self.used[index] >= self.rpd_per_key:
-                        continue
-                    ready_at = max(
-                        self.next_allowed[index],
-                        self.cooldown_until[index],
-                    )
-                    candidates.append((ready_at, index))
-
-                if not candidates:
-                    raise RuntimeError(
-                        "All Gemini API keys reached their configured per-run "
-                        "daily limit or were disabled by quota errors."
-                    )
-
-                ready_at, index = min(candidates)
-                if ready_at <= now:
-                    self.used[index] += 1
-                    self.next_allowed[index] = now + self.interval
-                    return index, self.keys[index]
-
-                wait_for = max(0.05, ready_at - now)
-
-            await asyncio.sleep(wait_for)
-
-    async def rate_limited(
-        self,
-        index: int,
-        cooldown_seconds: float,
-        daily_exhausted: bool = False,
-    ) -> None:
-        async with self.lock:
-            if daily_exhausted:
-                self.disabled[index] = True
-                return
-            self.cooldown_until[index] = max(
-                self.cooldown_until[index],
-                time.monotonic() + cooldown_seconds,
-            )
-
-    def usage_summary(self) -> list[int]:
-        return list(self.used)
 
 
 def parse_api_keys(raw: str | None) -> list[str]:
@@ -526,35 +439,7 @@ def make_verification_parts(
     return parts, estimated
 
 
-def extract_response_text(payload: dict) -> str:
-    texts = []
-    for candidate in payload.get("candidates", []):
-        for part in (candidate.get("content") or {}).get("parts", []):
-            if part.get("thought"):
-                continue
-            if part.get("text"):
-                texts.append(part["text"])
-
-    result = "\n".join(texts).strip()
-    if not result:
-        finish_reasons = [
-            candidate.get("finishReason")
-            for candidate in payload.get("candidates", [])
-            if candidate.get("finishReason")
-        ]
-        feedback = payload.get("promptFeedback") or {}
-        blocked = [reason for reason in finish_reasons if reason in BLOCKED_FINISH_REASONS]
-        detail = (
-            f"finishReasons={finish_reasons}, promptFeedback={feedback}"
-        )
-        if feedback.get("blockReason"):
-            raise ContentBlockedError(
-                f"Gemini blocked this page image: blockReason={feedback['blockReason']}, {detail}"
-            )
-        if blocked:
-            raise ContentBlockedError(f"Gemini refused this page image. {detail}")
-        raise EmptyAnswerError(f"Gemini returned no answer text. {detail}")
-
+def _strip_markdown_fences(result: str) -> str:
     if result.startswith("~~~markdown") and result.endswith("~~~"):
         result = result[len("~~~markdown") : -3].strip()
     if result.startswith("```markdown") and result.endswith("```"):
@@ -562,6 +447,38 @@ def extract_response_text(payload: dict) -> str:
     elif result.startswith("```md") and result.endswith("```"):
         result = result[len("```md") : -3].strip()
     return result
+
+
+def _refusal_error(refusal: ProviderRefusal) -> Exception:
+    """Map a provider refusal onto the retry policy's error taxonomy.
+
+    A refusal is a property of the page image (or, for a truncated answer, of
+    our own output cap), so none of these may be retried as-is.
+    """
+    if refusal.kind == "blocked":
+        return ContentBlockedError(refusal.detail)
+    if refusal.kind == "truncated":
+        return PermanentProviderError(refusal.detail)
+    return EmptyAnswerError(refusal.detail)
+
+
+def answer_from_payload(provider: Provider, payload: dict) -> str:
+    """One provider answer -> Markdown, or a typed error the retry loop knows."""
+    try:
+        text = provider.extract_text(payload)
+    except ProviderRefusal as refusal:
+        raise _refusal_error(refusal) from refusal
+    return _strip_markdown_fences(text)
+
+
+def extract_response_text(payload: dict) -> str:
+    """Gemini-shaped response -> Markdown.
+
+    Kept under its original name because it is the Gemini entry point used by
+    the existing test-suite; multi-provider callers go through
+    :func:`answer_from_payload`.
+    """
+    return answer_from_payload(GEMINI, payload)
 
 
 def _single_dollar_positions(line: str) -> list[int]:
@@ -642,8 +559,18 @@ def validate_markdown_output(text: str) -> None:
             )
 
 
-class PermanentGeminiError(RuntimeError):
-    """A request rejected for a non-transient client or configuration error."""
+class PermanentProviderError(RuntimeError):
+    """A request rejected for a non-transient client or configuration error.
+
+    A bad key, a bad request, no permission, no credit, or an answer that ran
+    into the model's output limit: none of them is fixed by sending the very
+    same request again, so this must never enter the backoff rounds.
+    """
+
+
+# Kept as an alias because the error predates multi-provider support and both
+# the test-suite and older logs refer to it by this name.
+PermanentGeminiError = PermanentProviderError
 
 
 class ContentBlockedError(RuntimeError):
@@ -671,7 +598,7 @@ def is_retryable_error(exc: BaseException) -> bool:
     return not isinstance(
         exc,
         (
-            PermanentGeminiError,
+            PermanentProviderError,
             QuotaPoolExhaustedError,
             ValueError,
             ContentBlockedError,
@@ -689,43 +616,52 @@ class ModelUnavailableError(RuntimeError):
     """
 
 
-async def call_gemini_once(
+async def call_model_once(
     client: httpx.AsyncClient,
-    key_pool: ProjectQuotaPool,
+    key_pool,
+    provider: Provider,
     model: str,
     parts: list[dict],
     chunk_name: str,
     thinking_level: str,
+    reasoning_effort: str = "",
+    api_base: str = "",
+    max_output_tokens: int = 0,
 ) -> str:
-    url = f"{GOOGLE_API_BASE}/{model}:generateContent"
-    payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "thinkingConfig": {
-                "thinkingLevel": thinking_level,
-            }
-        },
-    }
+    """Send one request through one provider and return its Markdown.
+
+    Everything protocol-specific -- URL, auth header, request body, response
+    shape and error taxonomy -- is delegated to ``provider``. This function owns
+    only what the retry policy depends on: lease bookkeeping, metrics and the
+    exception type raised for each class of failure.
+    """
+    url = provider.endpoint(api_base or provider.default_base_url, model)
+    payload = provider.build_payload(
+        model,
+        parts,
+        thinking_level=thinking_level,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
+    )
     key_index, api_key, lease_id = await key_pool.acquire()
     started = time.monotonic()
     try:
         response = await client.post(
             url,
-            headers={
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            },
+            headers=provider.build_headers(api_key),
             json=payload,
         )
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         key_pool.record_http_result(0, time.monotonic() - started)
         await key_pool.mark_error(key_index, lease_id, http_status=0)
-        raise RuntimeError(f"Gemini transport failure: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(
+            f"{provider.label} transport failure: {type(exc).__name__}: {exc}"
+        ) from exc
 
     key_pool.record_http_result(response.status_code, time.monotonic() - started)
     if response.status_code == 200:
         try:
-            text = extract_response_text(response.json())
+            text = answer_from_payload(provider, response.json())
             text, math_warnings = repair_multiline_math_delimiters(text)
             if math_warnings:
                 print(
@@ -734,27 +670,32 @@ async def call_gemini_once(
                     flush=True,
                 )
             validate_markdown_output(text)
-        except ContentBlockedError:
-            # The request itself was fine: the model refused this page image.
-            # Release the lease cleanly and keep the error type, otherwise the
-            # wrapper below turns it into a retryable RuntimeError and the page
-            # burns every retry round on the same verdict.
+        except (ContentBlockedError, PermanentProviderError):
+            # The request itself was fine: the model refused this page image, or
+            # the answer was unusable for a reason a retry cannot fix. Release
+            # the lease cleanly and keep the error type, otherwise the wrapper
+            # below turns it into a retryable RuntimeError and the page burns
+            # every retry round on the same verdict.
             await key_pool.mark_success(key_index, lease_id)
             raise
         except Exception as exc:
             await key_pool.mark_error(key_index, lease_id, http_status=502)
-            raise RuntimeError(f"Gemini returned unusable Markdown: {exc}") from exc
+            raise RuntimeError(
+                f"{provider.label} returned unusable Markdown: {exc}"
+            ) from exc
         await key_pool.mark_success(key_index, lease_id)
         return text
 
     message = response.text[:800]
-    if response.status_code == 429:
-        try:
-            error_payload = response.json()
-        except ValueError:
-            error_payload = {"message": message}
-        quota_type = classify_quota_error(error_payload)
-        retry_after = retry_after_seconds(response.headers, error_payload)
+    try:
+        error_payload: object = response.json()
+    except ValueError:
+        error_payload = {"message": message}
+
+    kind = provider.status_error_kind(response.status_code, error_payload)
+    if kind == "rate_limited":
+        quota_type = provider.quota_kind(error_payload)
+        retry_after = provider.retry_after(response.headers, error_payload)
         cooldown_seconds = retry_after if retry_after is not None else 30.0
         await key_pool.rate_limited(
             key_index,
@@ -764,41 +705,55 @@ async def call_gemini_once(
             quota_type=quota_type,
         )
         raise RuntimeError(
-            f"Gemini HTTP 429 ({quota_type}; project cooldown={cooldown_seconds:.1f}s): {message}"
+            f"{provider.label} HTTP 429 ({quota_type}; "
+            f"project cooldown={cooldown_seconds:.1f}s): {message}"
         )
 
     await key_pool.mark_error(key_index, lease_id, http_status=response.status_code)
-    error = f"Gemini HTTP {response.status_code}: {message}"
-    if response.status_code in {400, 401, 403}:
-        raise PermanentGeminiError(error)
-    if response.status_code == 404 or 500 <= response.status_code < 600:
+    error = f"{provider.label} HTTP {response.status_code}: {message}"
+    if kind == "permanent":
+        raise PermanentProviderError(error)
+    if kind == "unavailable":
         raise ModelUnavailableError(error)
     raise RuntimeError(error)
 
 
-async def call_gemini(
+async def call_model(
     client: httpx.AsyncClient,
-    key_pool: ProjectQuotaPool,
+    key_pool,
+    provider: Provider,
     model: str,
     parts: list[dict],
     chunk_name: str,
     thinking_level: str,
     fallback_models: tuple[str, ...] = (),
+    reasoning_effort: str = "",
+    api_base: str = "",
+    max_output_tokens: int = 0,
 ) -> str:
     """Transcribe one chunk, walking the fallback chain when a model is saturated.
 
     A single model can be unavailable for hours while its siblings keep serving,
-    and the quota pool is shared across all of them, so trying the next model is
-    the cheapest way to turn a hard page failure into a slower success.
+    so trying the next model is the cheapest way to turn a hard page failure
+    into a slower success.
     """
     candidates = [model, *(item for item in fallback_models if item and item != model)]
     last_error: Exception | None = None
     for position, candidate in enumerate(candidates):
         try:
-            return await call_gemini_once(
-                client, key_pool, candidate, parts, chunk_name, thinking_level
+            return await call_model_once(
+                client,
+                key_pool,
+                provider,
+                candidate,
+                parts,
+                chunk_name,
+                thinking_level,
+                reasoning_effort,
+                api_base,
+                max_output_tokens,
             )
-        except (QuotaPoolExhaustedError, PermanentGeminiError):
+        except (QuotaPoolExhaustedError, PermanentProviderError):
             raise
         except Exception as exc:  # noqa: BLE001 - the chain is best effort
             last_error = exc
@@ -809,8 +764,44 @@ async def call_gemini(
                     flush=True,
                 )
     if last_error is None:
-        raise RuntimeError("No Gemini model configured for this request")
+        raise RuntimeError(f"No {provider.label} model configured for this request")
     raise last_error
+
+
+async def call_gemini_once(
+    client: httpx.AsyncClient,
+    key_pool,
+    model: str,
+    parts: list[dict],
+    chunk_name: str,
+    thinking_level: str,
+) -> str:
+    """Gemini entry point kept for callers that predate multi-provider support."""
+    return await call_model_once(
+        client, key_pool, GEMINI, model, parts, chunk_name, thinking_level
+    )
+
+
+async def call_gemini(
+    client: httpx.AsyncClient,
+    key_pool,
+    model: str,
+    parts: list[dict],
+    chunk_name: str,
+    thinking_level: str,
+    fallback_models: tuple[str, ...] = (),
+) -> str:
+    """Gemini entry point kept for callers that predate multi-provider support."""
+    return await call_model(
+        client,
+        key_pool,
+        GEMINI,
+        model,
+        parts,
+        chunk_name,
+        thinking_level,
+        fallback_models,
+    )
 
 
 async def process_chunks(
@@ -829,9 +820,15 @@ async def process_chunks(
     retry_rounds: int = 5,
     attempts_per_page: int = 2,
     blocked_page_split: str = "halves",
+    provider: Provider | None = None,
+    reasoning_effort: str = "",
+    api_base: str = "",
+    max_output_tokens: int = 0,
 ) -> list[dict]:
     if blocked_page_split not in {"none", "halves"}:
         raise ValueError("blocked_page_split must be none or halves")
+
+    provider = provider or resolve_provider(None)
 
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
@@ -839,26 +836,37 @@ async def process_chunks(
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
-    groups = parse_key_groups(
-        len(keys),
-        os.getenv("GEMINI_KEY_GROUPS"),
-    )
-    print(f"[quota] keys={len(keys)} projects={len(set(groups))}", flush=True)
+    if provider.uses_shared_quota_pool:
+        groups = parse_key_groups(
+            len(keys),
+            os.getenv("GEMINI_KEY_GROUPS"),
+        )
+        print(f"[quota] keys={len(keys)} projects={len(set(groups))}", flush=True)
+    else:
+        groups = []
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(120.0, connect=30.0),
+        timeout=httpx.Timeout(provider.request_timeout_seconds, connect=30.0),
         limits=httpx.Limits(
             max_connections=max(100, concurrency * 2),
             max_keepalive_connections=max(50, concurrency),
             keepalive_expiry=30.0,
         ),
     ) as client:
-        key_pool = await ProjectQuotaPool.create(
-            keys,
-            groups,
-            rpm_per_project=rpm_per_key,
-            rpd_per_project=rpd_per_key,
-            client=client,
-        )
+        if provider.uses_shared_quota_pool:
+            key_pool = await ProjectQuotaPool.create(
+                keys,
+                groups,
+                rpm_per_project=rpm_per_key,
+                rpd_per_project=rpd_per_key,
+                client=client,
+            )
+        else:
+            key_pool = await LocalKeyPool.create(
+                keys,
+                rpm_per_key=rpm_per_key,
+                rpd_per_key=rpd_per_key,
+                client=client,
+            )
 
         started_at = {chunk.stem: time.monotonic() for chunk in chunks}
         chunks_by_name = {chunk.stem: chunk for chunk in chunks}
@@ -918,28 +926,36 @@ async def process_chunks(
 
             async def transcribe(target: Chunk, name: str) -> tuple[str, int]:
                 parts, estimated = make_request_parts(target, prompt, media_resolution)
-                text = await call_gemini(
+                text = await call_model(
                     client,
                     key_pool,
+                    provider,
                     model,
                     parts,
                     name,
                     thinking_level,
                     fallback_models,
+                    reasoning_effort,
+                    api_base,
+                    max_output_tokens,
                 )
 
                 for verify_index in range(verification_passes):
                     verify_parts, _ = make_verification_parts(
                         target, prompt, text, media_resolution
                     )
-                    text = await call_gemini(
+                    text = await call_model(
                         client,
                         key_pool,
+                        provider,
                         model,
                         verify_parts,
                         f"{name}-verify-{verify_index + 1}",
                         thinking_level,
                         fallback_models,
+                        reasoning_effort,
+                        api_base,
+                        max_output_tokens,
                     )
                 return text, estimated
 
@@ -1131,22 +1147,31 @@ async def process_chunks(
                     failed = sum(item.get("status") == "failed" for item in latest_results.values())
                     blank = sum(item.get("status") == "blank" for item in latest_results.values())
                     pending = len(chunks) - len(completed_first_pass)
-                    try:
-                        remote = await key_pool.remote_status()
-                        global_state = remote.get("global", {})
-                        if not isinstance(global_state, dict):
-                            global_state = {}
+                    if not provider.uses_shared_quota_pool:
+                        # No shared quota service to report on: keys are paced
+                        # locally, so the useful signal is which provider ran and
+                        # how many requests came back as an error.
                         global_summary = (
-                            f"global_inflight={global_state.get('activeLeases', '?')}/"
-                            f"{global_state.get('maxInflight', '?')} "
-                            f"global_rps={global_state.get('requestsPerSecond', '?')} "
-                            f"active_projects={global_state.get('activeProjects', '?')} "
-                            f"global_cooldown_ms={global_state.get('cooldownRemainingMs', '?')} "
-                            f"recent_503_ratio={global_state.get('recent503Ratio', '?')} "
-                            f"adaptive_stage={global_state.get('adaptiveStage', '?')}"
+                            f"provider={provider.name} keys={len(keys)} "
+                            f"http_other={performance['other_error']}"
                         )
-                    except Exception as exc:
-                        global_summary = f"global_status=unavailable({type(exc).__name__})"
+                    else:
+                        try:
+                            remote = await key_pool.remote_status()
+                            global_state = remote.get("global", {})
+                            if not isinstance(global_state, dict):
+                                global_state = {}
+                            global_summary = (
+                                f"global_inflight={global_state.get('activeLeases', '?')}/"
+                                f"{global_state.get('maxInflight', '?')} "
+                                f"global_rps={global_state.get('requestsPerSecond', '?')} "
+                                f"active_projects={global_state.get('activeProjects', '?')} "
+                                f"global_cooldown_ms={global_state.get('cooldownRemainingMs', '?')} "
+                                f"recent_503_ratio={global_state.get('recent503Ratio', '?')} "
+                                f"adaptive_stage={global_state.get('adaptiveStage', '?')}"
+                            )
+                        except Exception as exc:
+                            global_summary = f"global_status=unavailable({type(exc).__name__})"
                     print(
                         f"[metrics] pending_chunks={pending} active_chunks={progress['active_chunks']} "
                         f"success={successful} failed={failed} blank={blank} "
@@ -1264,7 +1289,55 @@ def parser() -> argparse.ArgumentParser:
             "never replaces it."
         ),
     )
-    p.add_argument("--model", default="gemini-3.5-flash-lite")
+    p.add_argument(
+        "--provider",
+        default="",
+        help=(
+            "Model gateway to call. One of: "
+            + ", ".join(provider_names())
+            + ". Empty means FILE_CONVERTER_PROVIDER, then gemini. Each gateway "
+            "reads its own key list and needs its own model ids."
+        ),
+    )
+    p.add_argument(
+        "--api-base",
+        default="",
+        help=(
+            "Override the provider base URL. Empty uses the provider default "
+            "(Gemini: generativelanguage.googleapis.com; Modelflare: "
+            "https://modelflare.dev/v1), so pointing at a different "
+            "OpenAI-compatible gateway needs no code change."
+        ),
+    )
+    p.add_argument(
+        "--model",
+        default="",
+        help=(
+            "Model id. Empty uses the provider default, so switching provider "
+            "never silently keeps another gateway's model id."
+        ),
+    )
+    p.add_argument(
+        "--reasoning-effort",
+        default="",
+        help=(
+            "Reasoning effort for OpenAI-compatible gateways "
+            "(minimal/low/medium/high/xhigh). Empty omits the field, because "
+            "models without explicit reasoning reject it. --thinking-level is "
+            "the Gemini equivalent and is ignored by other providers."
+        ),
+    )
+    p.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Cap on the answer length; 0 omits the field and lets the gateway "
+            "decide. A gateway default can be far below what a dense page needs, "
+            "so a truncated answer is reported as a failure instead of being "
+            "silently accepted as a complete page."
+        ),
+    )
     p.add_argument(
         "--model-fallbacks",
         default="",
@@ -1412,21 +1485,44 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.blocked_page_split not in {"none", "halves"}:
         raise ValueError("blocked_page_split must be none or halves")
+    if args.provider:
+        resolve_provider(args.provider)
+    if args.api_base:
+        parsed = urlparse(args.api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("api_base must be an absolute http(s) URL")
+    if args.reasoning_effort:
+        normalize_reasoning_effort(args.reasoning_effort)
+    if not 0 <= args.max_output_tokens <= 200000:
+        raise ValueError("max_output_tokens must be between 0 and 200000")
 
 
 async def async_main(args: argparse.Namespace) -> int:
     validate_args(args)
+    provider = resolve_provider(args.provider or os.getenv("FILE_CONVERTER_PROVIDER"))
+    model = resolve_model(provider, args.model)
+    api_base = (args.api_base or provider.default_base_url).rstrip("/")
+    reasoning_effort = normalize_reasoning_effort(args.reasoning_effort)
+
     system_prompt = args.system_prompt.strip()
     user_prompt = args.prompt.strip()
     prompt = compose_prompt(system_prompt, user_prompt)
-    keys = parse_api_keys(os.getenv("GEMINI_API_KEYS"))
+    keys = parse_api_keys(os.getenv(provider.api_key_env))
     if not keys:
-        raise RuntimeError(
-            "GEMINI_API_KEYS is empty. Add a repository Actions secret with one Gemini API key per line."
-        )
-    fallback_models = parse_model_list(
-        args.model_fallbacks or os.getenv("GEMINI_MODEL_FALLBACKS")
+        raise RuntimeError(f"{provider.api_key_env} is empty. {provider.api_key_hint}")
+    fallbacks_source = args.model_fallbacks
+    if not fallbacks_source and provider.fallbacks_env:
+        fallbacks_source = os.getenv(provider.fallbacks_env)
+    fallback_models = (
+        parse_model_list(fallbacks_source) or provider.default_model_fallbacks
     )
+    if provider.name != GEMINI.name and model.lower().startswith("gemini-"):
+        print(
+            f"[warn] model {model!r} looks like a Gemini id but provider is "
+            f"{provider.name}. Switch --model to a {provider.label} id "
+            f"(e.g. {provider.model_example}) or the request will 404.",
+            flush=True,
+        )
 
     work_dir = Path(args.work_dir)
     output_dir = Path(args.output_dir)
@@ -1437,7 +1533,8 @@ async def async_main(args: argparse.Namespace) -> int:
     images_dir = work_dir / "images"
 
     print(
-        f"[config] conversion_type={args.conversion_type} model={args.model} keys={len(keys)} "
+        f"[config] conversion_type={args.conversion_type} provider={provider.name} "
+        f"model={model} keys={len(keys)} "
         f"concurrency={args.concurrency} "
         f"images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
@@ -1450,6 +1547,13 @@ async def async_main(args: argparse.Namespace) -> int:
         f"attempts_per_page={args.attempts_per_page} "
         f"blocked_page_split={args.blocked_page_split} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
+        flush=True,
+    )
+    print(
+        f"[provider] {provider.name} endpoint={provider.endpoint(api_base, model)} "
+        f"reasoning_effort={reasoning_effort or 'default'} "
+        f"max_output_tokens={args.max_output_tokens or 'default'} "
+        f"keys_env={provider.api_key_env} keys={len(keys)}",
         flush=True,
     )
     print(
@@ -1493,7 +1597,7 @@ async def async_main(args: argparse.Namespace) -> int:
         chunks,
         output_dir,
         prompt,
-        args.model,
+        model,
         args.concurrency,
         keys,
         args.thinking_level,
@@ -1505,6 +1609,10 @@ async def async_main(args: argparse.Namespace) -> int:
         retry_rounds=args.retry_rounds,
         attempts_per_page=args.attempts_per_page,
         blocked_page_split=args.blocked_page_split,
+        provider=provider,
+        reasoning_effort=reasoning_effort,
+        api_base=api_base,
+        max_output_tokens=args.max_output_tokens,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -1514,7 +1622,12 @@ async def async_main(args: argparse.Namespace) -> int:
     manifest = {
         "conversion_type": args.conversion_type,
         "source_url": args.source_url,
-        "model": args.model,
+        "provider": provider.name,
+        "model": model,
+        "api_base": api_base,
+        "model_fallbacks": list(fallback_models),
+        "reasoning_effort": reasoning_effort,
+        "max_output_tokens": args.max_output_tokens,
         "prompt": {
             "system_chars": len(system_prompt),
             "task_chars": len(user_prompt),

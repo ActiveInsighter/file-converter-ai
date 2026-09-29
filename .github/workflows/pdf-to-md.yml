@@ -24,13 +24,21 @@ on:
         description: "PDF download URL (Google Drive shared link is supported)"
         required: true
         type: string
+      provider:
+        description: "Model gateway; Modelflare needs its own API key and a compatible vision model"
+        required: true
+        default: "gemini"
+        type: choice
+        options:
+          - gemini
+          - modelflare
       images_per_request:
-        description: "How many consecutive PDF pages/images to send in one Gemini request"
+        description: "How many consecutive PDF pages/images to send in one model request"
         required: true
         default: "1"
         type: string
       concurrency:
-        description: "Local page workers; the quota API applies the shared Gemini request limit"
+        description: "Local page workers; Gemini additionally uses the shared quota API"
         required: true
         default: "50"
         type: string
@@ -45,14 +53,24 @@ on:
         default: ""
         type: string
       model:
-        description: "Gemini model ID"
-        required: true
-        default: "gemini-3.5-flash-lite"
+        description: "Exact model ID. Empty uses the Gemini default; Modelflare requires a vision-capable model ID"
+        required: false
+        default: ""
         type: string
       model_fallbacks:
-        description: "Comma-separated fallback model IDs tried when the primary model answers 503/404. Keep this same-tier: gemini-flash-lite-latest is the only lite model at least as strong as gemini-3.5-flash-lite. Do NOT add gemini-3.1-flash-lite - it is materially weaker (measured ~20% shorter output on the same page). Plain Flash models allow just 20 requests/day/project, so they are unusable here."
+        description: "Comma-separated same-provider fallback models. Empty uses the provider default (none for Modelflare)."
         required: false
-        default: "gemini-flash-lite-latest"
+        default: ""
+        type: string
+      reasoning_effort:
+        description: "Optional Modelflare reasoning effort; leave empty if the selected model does not support it"
+        required: false
+        default: ""
+        type: string
+      max_output_tokens:
+        description: "Optional answer token cap; 0 lets the gateway choose"
+        required: false
+        default: "0"
         type: string
       retry_rounds:
         description: "Total passes over failed pages; each pass waits about twice as long as the previous one."
@@ -98,7 +116,7 @@ on:
         default: "0"
         type: string
       media_resolution:
-        description: "Gemini per-image media resolution"
+        description: "Image resolution hint (mapped to low/high for Modelflare)"
         required: true
         default: "ultra_high"
         type: choice
@@ -142,14 +160,17 @@ jobs:
 
     env:
       CONVERSION_TYPE: ${{ github.event.inputs.conversion_type || github.event.client_payload.conversion_type || 'pdf_to_md' }}
+      PROVIDER: ${{ github.event.inputs.provider || github.event.client_payload.provider || 'gemini' }}
       OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
       IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || github.event.client_payload.system_prompt || '' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
-      MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
-      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || 'gemini-flash-lite-latest' }}
+      MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || '' }}
+      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || '' }}
+      REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || github.event.client_payload.reasoning_effort || '' }}
+      MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || github.event.client_payload.max_output_tokens || '0' }}
       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
       ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
@@ -163,6 +184,7 @@ jobs:
       START_PAGE: ${{ github.event.inputs.start_page || github.event.client_payload.start_page || '' }}
       END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      MODELFLARE_API_KEYS: ${{ secrets.MODELFLARE_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
       GEMINI_QUOTA_API_URL: ${{ vars.GEMINI_QUOTA_API_URL }}
       GEMINI_QUOTA_API_TOKEN: ${{ secrets.GEMINI_QUOTA_API_TOKEN }}
@@ -192,20 +214,26 @@ jobs:
             echo "source_url is required" >&2
             exit 1
           fi
-          if [[ -z "${GEMINI_API_KEYS}" ]]; then
-            echo "Repository secret GEMINI_API_KEYS is required" >&2
+          if [[ "${PROVIDER}" == "gemini" ]]; then
+            if [[ -z "${GEMINI_API_KEYS}" || -z "${GEMINI_QUOTA_API_URL}" || -z "${GEMINI_QUOTA_API_TOKEN}" ]]; then
+              echo "Gemini requires GEMINI_API_KEYS, GEMINI_QUOTA_API_URL, and GEMINI_QUOTA_API_TOKEN" >&2
+              exit 1
+            fi
+            if [[ -z "${GEMINI_KEY_GROUPS}" ]]; then
+              echo "::warning::Repository variable GEMINI_KEY_GROUPS is empty. Generate the list with deploy/print-key-groups.py so the quota pool can group keys by Google Cloud project."
+            fi
+          elif [[ "${PROVIDER}" == "modelflare" ]]; then
+            if [[ -z "${MODELFLARE_API_KEYS}" ]]; then
+              echo "Repository secret MODELFLARE_API_KEYS is required" >&2
+              exit 1
+            fi
+            if [[ -z "${MODEL}" ]]; then
+              echo "A vision-capable Modelflare model ID is required" >&2
+              exit 1
+            fi
+          else
+            echo "Unsupported provider: ${PROVIDER}" >&2
             exit 1
-          fi
-          if [[ -z "${GEMINI_QUOTA_API_URL}" ]]; then
-            echo "Repository variable GEMINI_QUOTA_API_URL is required" >&2
-            exit 1
-          fi
-          if [[ -z "${GEMINI_QUOTA_API_TOKEN}" ]]; then
-            echo "Repository secret GEMINI_QUOTA_API_TOKEN is required" >&2
-            exit 1
-          fi
-          if [[ -z "${GEMINI_KEY_GROUPS}" ]]; then
-            echo "::warning::Repository variable GEMINI_KEY_GROUPS is empty. The quota pool then labels keys project-1..N, so it cannot verify that each API key belongs to a distinct Google Cloud project; two keys from the same project would each be granted a full quota budget. Generate the list with deploy/print-key-groups.py and store it as a repository variable."
           fi
 
       - name: Convert PDF to Markdown
@@ -214,11 +242,14 @@ jobs:
           set -euo pipefail
           args=(
             --conversion-type "${CONVERSION_TYPE}"
+            --provider "${PROVIDER}"
             --source-url "${SOURCE_URL}"
             --images-per-request "${IMAGES_PER_REQUEST}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
             --model-fallbacks "${MODEL_FALLBACKS}"
+            --reasoning-effort "${REASONING_EFFORT}"
+            --max-output-tokens "${MAX_OUTPUT_TOKENS}"
             --retry-rounds "${RETRY_ROUNDS}"
             --attempts-per-page "${ATTEMPTS_PER_PAGE}"
             --thinking-level "${THINKING_LEVEL}"

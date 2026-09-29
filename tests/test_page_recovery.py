@@ -82,7 +82,7 @@ def run_process_chunks(chunks, directory, fake_call, **overrides):
             patch.dict(os.environ, {"GEMINI_KEY_GROUPS": ""}),
             patch("pdf2md.ProjectQuotaPool.create", new=AsyncMock(return_value=FakePool())),
             patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-            patch("pdf2md.call_gemini", new=fake_call),
+            patch("pdf2md.call_model", new=fake_call),
             patch("pdf2md.random.uniform", return_value=0.0),
         ):
             return await process_chunks(
@@ -308,7 +308,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 if chunk_name == "1":
@@ -335,7 +335,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 raise ContentBlockedError("Gemini refused this page image.")
@@ -361,7 +361,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 raise ContentBlockedError("Gemini refused this page image.")
@@ -382,7 +382,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             render_page(page_path, lines=(80, 120, 700, 740))
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 raise EmptyAnswerError("Gemini returned no answer text. finishReasons=['STOP']")
 
@@ -402,7 +402,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 if chunk_name in {"1", "1-part2"}:
@@ -430,7 +430,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 raise ContentBlockedError("Gemini refused this page image.")
@@ -453,7 +453,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 if chunk_name == "1":
@@ -485,7 +485,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 raise ContentBlockedError("Gemini refused this page image.")
@@ -519,7 +519,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             half_failures = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 if chunk_name == "1":
@@ -549,7 +549,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             render_page(page_path, lines=(80, 120, 700, 740))
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 if chunk_name == "1":
                     raise ContentBlockedError("Gemini refused this page image.")
@@ -576,7 +576,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
             calls = []
 
             async def fake_call(
-                _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+                _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
             ):
                 calls.append(chunk_name)
                 raise ContentBlockedError("Gemini refused this page image.")

@@ -96,7 +96,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def fake_call(
-            _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+            _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
         ):
             calls.append(chunk_name)
             if chunk_name == "1" and calls.count("1") == 1:
@@ -109,7 +109,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.dict(os.environ, {"GEMINI_KEY_GROUPS": ""}),
             patch("pdf2md.ProjectQuotaPool.create", new=AsyncMock(return_value=pool)),
             patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-            patch("pdf2md.call_gemini", new=fake_call),
+            patch("pdf2md.call_model", new=fake_call),
             patch("pdf2md.random.uniform", return_value=0.0),
         ):
             output_dir = Path(directory)
@@ -145,7 +145,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def fake_call(
-            _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+            _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
         ):
             calls.append(chunk_name)
             if chunk_name == "1":
@@ -158,7 +158,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.dict(os.environ, {"GEMINI_KEY_GROUPS": ""}),
             patch("pdf2md.ProjectQuotaPool.create", new=AsyncMock(return_value=FakePool())),
             patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-            patch("pdf2md.call_gemini", new=fake_call),
+            patch("pdf2md.call_model", new=fake_call),
         ):
             results = await process_chunks(
                 chunks,
@@ -179,7 +179,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _StubPool:
-    """Minimal ProjectQuotaPool stand-in for call_gemini_once tests."""
+    """Minimal ProjectQuotaPool stand-in for call_model_once tests."""
 
     def record_http_result(self, _status, _elapsed):
         return None
@@ -239,13 +239,15 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_fallback_chain_is_used_when_the_primary_is_saturated(self):
         attempted: list[str] = []
 
-        async def fake_once(_client, _pool, model, _parts, _chunk, _thinking):
+        async def fake_once(
+            _client, _pool, _provider, model, _parts, _chunk, _thinking, *_rest
+        ):
             attempted.append(model)
             if model != "healthy-model":
                 raise ModelUnavailableError("HTTP 503 UNAVAILABLE")
             return "transcribed"
 
-        with patch("pdf2md.call_gemini_once", new=fake_once):
+        with patch("pdf2md.call_model_once", new=fake_once):
             text = await call_gemini(
                 None, None, "saturated-model", [], "1", "high", ("healthy-model",)
             )
@@ -257,7 +259,7 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
         async def fake_once(*_args, **_kwargs):
             raise PermanentGeminiError("HTTP 403")
 
-        with patch("pdf2md.call_gemini_once", new=fake_once):
+        with patch("pdf2md.call_model_once", new=fake_once):
             with self.assertRaises(PermanentGeminiError):
                 await call_gemini(None, None, "a", [], "1", "high", ("b",))
 
@@ -265,7 +267,7 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
         async def fake_once(*_args, **_kwargs):
             raise ModelUnavailableError("HTTP 503 UNAVAILABLE")
 
-        with patch("pdf2md.call_gemini_once", new=fake_once):
+        with patch("pdf2md.call_model_once", new=fake_once):
             with self.assertRaises(ModelUnavailableError):
                 await call_gemini(None, None, "a", [], "1", "high", ("b", "c"))
 
@@ -284,7 +286,7 @@ class ImmediateRetryTests(unittest.IsolatedAsyncioTestCase):
         calls: list[str] = []
 
         async def fake_call(
-            _client, _pool, _model, _parts, chunk_name, _thinking_level, _fallbacks=()
+            _client, _pool, _provider, _model, _parts, chunk_name, _thinking_level, _fallbacks=(), *_rest
         ):
             calls.append(chunk_name)
             if len(calls) == 1:
@@ -297,7 +299,7 @@ class ImmediateRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.dict(os.environ, {"GEMINI_KEY_GROUPS": ""}),
             patch("pdf2md.ProjectQuotaPool.create", new=AsyncMock(return_value=FakePool())),
             patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-            patch("pdf2md.call_gemini", new=fake_call),
+            patch("pdf2md.call_model", new=fake_call),
             patch("pdf2md.random.uniform", return_value=0.0),
         ):
             results = await process_chunks(
