@@ -61,6 +61,8 @@ python pdf2md.py \
 
 接口路径与密钥分组规则以 [Modelflare 官方接口文档](https://docs.modelflare.dev/guides/endpoints/) 和 [模型与分组文档](https://docs.modelflare.dev/guides/models-and-groups/) 为准。当前适配的是 Chat Completions；若模型只提供 Responses 接口，需先增加对应的请求与响应适配器。
 
+`gpt-6-sol` 的单页、4 并发和 8 并发实测数据见 [Modelflare 验证记录](docs/modelflare-validation-2026-09-29.md)。
+
 ## 手动运行
 
 进入：
