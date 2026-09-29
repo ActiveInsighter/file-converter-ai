@@ -236,6 +236,10 @@ jobs:
             exit 1
           fi
 
+      - name: Probe Gemini routes
+        if: ${{ github.event.inputs.output_name == 'gemini-route-probe' }}
+        run: python scripts/probe_gemini_routes.py
+
       - name: Convert PDF to Markdown
         shell: bash
         run: |
