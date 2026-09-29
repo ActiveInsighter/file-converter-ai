@@ -1,5 +1,6 @@
 """The effective prompt is the DB system prompt plus this conversion's prompt."""
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,22 @@ from pdf2md import (
     parser,
     validate_args,
 )
+
+
+class BuiltInPromptIsPinned(unittest.TestCase):
+    # PocketBase keeps the same text as DEFAULT_SYSTEM_PROMPT and pins the same
+    # digest in test/file-conversion-config.test.mjs. Editing one copy without
+    # the other fails one of the two CIs instead of silently changing what users
+    # ask the model to do.
+    DIGEST = "e6a5bdc0a3a58a810ab83a7768c37ec4b413a2d13febd763e764298dabe49d38"
+
+    def test_the_built_in_prompt_is_unchanged(self):
+        self.assertEqual(hashlib.sha256(DEFAULT_PROMPT.encode("utf-8")).hexdigest(), self.DIGEST)
+
+    def test_the_built_in_prompt_has_no_surrounding_whitespace(self):
+        # The PocketBase hook trims system prompts on write, so the constant must
+        # already be trim-stable or the two copies would differ by a trailing byte.
+        self.assertEqual(DEFAULT_PROMPT, DEFAULT_PROMPT.strip())
 
 
 class ComposePromptTests(unittest.TestCase):
