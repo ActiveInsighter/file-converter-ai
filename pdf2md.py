@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
@@ -38,6 +39,27 @@ DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页�
 8. 输出前自行复核一遍图片与 Markdown，尤其复核所有数学公式和数字。
 9. 直接输出 Markdown，不要使用 Markdown 代码围栏。
 """
+# The prompt that actually runs is the DB-backed system prompt plus this
+# conversion's own prompt, joined by a blank line. Both are optional and
+# independent, and each is capped so the pair stays well inside the inline
+# request budget (the same bound the PocketBase config enforces).
+MAX_PROMPT_CHARS = 12000
+
+
+def compose_prompt(system_prompt: str, user_prompt: str) -> str:
+    """Join the shared system prompt with this conversion's own prompt.
+
+    ``system_prompt`` is read from the saved file-conversion config and applies
+    to every conversion; ``user_prompt`` is the per-task instruction. Either may
+    be empty and neither overrides the other. When both are empty the built-in
+    faithful Markdown prompt is used, so a manual workflow dispatch still
+    produces a faithful transcription.
+    """
+    parts = [part.strip() for part in (system_prompt, user_prompt)]
+    composed = "\n\n".join(part for part in parts if part)
+    return composed or DEFAULT_PROMPT
+
+
 GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
 
@@ -1226,7 +1248,23 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--source-url", required=True)
     p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=50)
-    p.add_argument("--prompt", default=DEFAULT_PROMPT)
+    p.add_argument(
+        "--system-prompt",
+        default="",
+        help=(
+            "Shared system prompt read from the saved file-conversion config. "
+            "It is sent before --prompt; when both are empty the built-in "
+            f"prompt is used. At most {MAX_PROMPT_CHARS} characters."
+        ),
+    )
+    p.add_argument(
+        "--prompt",
+        default="",
+        help=(
+            "Per-conversion prompt. It is appended after --system-prompt and "
+            "never replaces it."
+        ),
+    )
     p.add_argument("--model", default="gemini-3.5-flash-lite")
     p.add_argument(
         "--model-fallbacks",
@@ -1325,6 +1363,12 @@ def parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if args.conversion_type != "pdf_to_md":
         raise ValueError("conversion_type must be pdf_to_md")
+    if len(args.system_prompt) > MAX_PROMPT_CHARS:
+        raise ValueError(
+            f"system_prompt must be at most {MAX_PROMPT_CHARS} characters"
+        )
+    if len(args.prompt) > MAX_PROMPT_CHARS:
+        raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
     if not 1 <= args.images_per_request <= 20:
         raise ValueError("images_per_request must be between 1 and 20")
     if not 1 <= args.concurrency <= 100:
@@ -1373,6 +1417,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 async def async_main(args: argparse.Namespace) -> int:
     validate_args(args)
+    system_prompt = args.system_prompt.strip()
+    user_prompt = args.prompt.strip()
+    prompt = compose_prompt(system_prompt, user_prompt)
     keys = parse_api_keys(os.getenv("GEMINI_API_KEYS"))
     if not keys:
         raise RuntimeError(
@@ -1406,6 +1453,18 @@ async def async_main(args: argparse.Namespace) -> int:
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
+    print(
+        f"[prompt] system_chars={len(system_prompt)} task_chars={len(user_prompt)} "
+        f"effective_chars={len(prompt)} "
+        f"sha256={hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:12]}",
+        flush=True,
+    )
+    if not system_prompt and not user_prompt:
+        print(
+            "[prompt] no system or task prompt supplied; using the built-in "
+            "faithful transcription prompt",
+            flush=True,
+        )
     print(f"[download] {args.source_url}", flush=True)
     await asyncio.to_thread(download_pdf, args.source_url, source_pdf)
     with source_pdf.open("rb") as handle:
@@ -1434,7 +1493,7 @@ async def async_main(args: argparse.Namespace) -> int:
     results = await process_chunks(
         chunks,
         output_dir,
-        args.prompt,
+        prompt,
         args.model,
         args.concurrency,
         keys,
@@ -1457,6 +1516,14 @@ async def async_main(args: argparse.Namespace) -> int:
         "conversion_type": args.conversion_type,
         "source_url": args.source_url,
         "model": args.model,
+        "prompt": {
+            "system_chars": len(system_prompt),
+            "task_chars": len(user_prompt),
+            "effective_chars": len(prompt),
+            "effective_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "system": system_prompt,
+            "task": user_prompt,
+        },
         "total_pages": pdf_total_pages,
         "processed_pages": len(image_paths),
         "start_page": args.start_page,
