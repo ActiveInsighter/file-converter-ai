@@ -45,9 +45,9 @@ on:
         default: "gemini-3.5-flash-lite"
         type: string
       model_fallbacks:
-        description: "Comma-separated fallback model IDs tried when the primary model answers 503/404. Use only models with a 500 RPD free quota (the -lite ones); plain Flash models allow just 20 requests/day/project."
+        description: "Comma-separated fallback model IDs tried when the primary model answers 503/404. Keep this same-tier: gemini-flash-lite-latest is the only lite model at least as strong as gemini-3.5-flash-lite. Do NOT add gemini-3.1-flash-lite - it is materially weaker (measured ~20% shorter output on the same page). Plain Flash models allow just 20 requests/day/project, so they are unusable here."
         required: false
-        default: "gemini-3.1-flash-lite,gemini-flash-lite-latest"
+        default: "gemini-flash-lite-latest"
         type: string
       retry_rounds:
         description: "Total passes over failed pages; each pass waits about twice as long as the previous one."
@@ -143,7 +143,7 @@ jobs:
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
-      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || 'gemini-3.1-flash-lite,gemini-flash-lite-latest' }}
+      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || 'gemini-flash-lite-latest' }}
       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
       ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
