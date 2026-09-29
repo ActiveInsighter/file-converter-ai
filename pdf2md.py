@@ -37,8 +37,7 @@ DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页�
 6. 忽略页眉、页脚、纯页码、扫描水印、装饰性字符和无意义的重复数字/编码；除非它们明显属于正文。
 7. 表格尽量转换为 Markdown 表格；无法可靠转换时按原有阅读顺序保留文本，不要虚构表格结构。
 8. 输出前自行复核一遍图片与 Markdown，尤其复核所有数学公式和数字。
-9. 直接输出 Markdown，不要使用 Markdown 代码围栏。
-"""
+9. 直接输出 Markdown，不要使用 Markdown 代码围栏。"""
 # The prompt that actually runs is the DB-backed system prompt plus this
 # conversion's own prompt, joined by a blank line. Both are optional and
 # independent, and each is capped so the pair stays well inside the inline
