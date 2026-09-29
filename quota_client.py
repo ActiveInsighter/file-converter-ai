@@ -97,6 +97,35 @@ def parse_key_groups(key_count: int, raw: str | None) -> list[str]:
     return groups
 
 
+def count_http_result(counts: dict[str, int], status: int) -> None:
+    """Bucket one HTTP status into the shared metrics counters."""
+    if status == 200:
+        counts["success"] += 1
+    elif status == 429:
+        counts["429"] += 1
+    elif status == 503:
+        counts["503"] += 1
+    else:
+        counts["other_error"] += 1
+
+
+def latency_summary(latencies: list[float]) -> dict[str, object]:
+    """p50/p95 over the recorded request latencies."""
+    ordered = sorted(latencies)
+
+    def percentile(value: float) -> float | None:
+        if not ordered:
+            return None
+        index = round((len(ordered) - 1) * value)
+        return round(ordered[index], 2)
+
+    return {
+        "requests": len(ordered),
+        "p50_seconds": percentile(0.5),
+        "p95_seconds": percentile(0.95),
+    }
+
+
 class ProjectQuotaPool:
     """Client for the globally coordinated Valkey quota API."""
 
@@ -338,14 +367,7 @@ class ProjectQuotaPool:
         )
 
     def record_http_result(self, status: int, elapsed_seconds: float) -> None:
-        if status == 200:
-            self.http_counts["success"] += 1
-        elif status == 429:
-            self.http_counts["429"] += 1
-        elif status == 503:
-            self.http_counts["503"] += 1
-        else:
-            self.http_counts["other_error"] += 1
+        count_http_result(self.http_counts, status)
         self.request_latencies.append(max(0.0, elapsed_seconds))
         if len(self.request_latencies) > 1000:
             del self.request_latencies[: len(self.request_latencies) - 1000]
@@ -354,20 +376,7 @@ class ProjectQuotaPool:
         return await self._post("/v1/status", {})
 
     def performance_summary(self) -> dict[str, object]:
-        ordered = sorted(self.request_latencies)
-
-        def percentile(value: float) -> float | None:
-            if not ordered:
-                return None
-            index = round((len(ordered) - 1) * value)
-            return round(ordered[index], 2)
-
-        return {
-            **self.http_counts,
-            "requests": len(ordered),
-            "p50_seconds": percentile(0.5),
-            "p95_seconds": percentile(0.95),
-        }
+        return {**self.http_counts, **latency_summary(self.request_latencies)}
 
     async def close(self) -> None:
         return None
@@ -385,13 +394,161 @@ class ProjectQuotaPool:
                 }
                 for index, group in enumerate(self.groups)
             },
+        "keys": {
+            str(index + 1): {
+                "project": self.groups[index],
+                "requests": self.used[index],
+                "success": self.successes[index],
+                "http_429": self.rate_limited_counts[index],
+                "errors": self.errors[index],
+            }
+            for index in range(len(self.keys))
+        },
+    }
+
+
+class LocalKeyPool:
+    """In-memory key pacing for providers that need no shared quota service.
+
+    The Gemini free tier is metered per Google Cloud project, so its keys must be
+    paced by one globally coordinated pool (``ProjectQuotaPool``): two CI runs
+    that each stayed under their own limit would still overrun the project's
+    daily budget together. A paid gateway has no such constraint -- one run just
+    has to keep its own request rate under the account's limit -- so this pool
+    paces keys locally, exposing the same interface so ``process_chunks`` does
+    not care which implementation it received.
+    """
+
+    def __init__(
+        self,
+        keys: list[str],
+        rpm_per_key: float,
+        rpd_per_key: int,
+    ) -> None:
+        if not keys:
+            raise ValueError("No API keys configured")
+        if rpm_per_key <= 0 or rpd_per_key <= 0:
+            raise ValueError("RPM and RPD limits must be > 0")
+
+        self.keys = keys
+        # Keep a small safety margin for provider sliding-window accounting.
+        self.interval = (60.0 / rpm_per_key) * 1.08
+        self.rpd_per_key = rpd_per_key
+        self.next_allowed = [0.0 for _ in keys]
+        self.cooldown_until = [0.0 for _ in keys]
+        self.used = [0 for _ in keys]
+        self.successes = [0 for _ in keys]
+        self.errors = [0 for _ in keys]
+        self.rate_limited_counts = [0 for _ in keys]
+        self.disabled = [False for _ in keys]
+        self.http_counts = {"success": 0, "429": 0, "503": 0, "other_error": 0}
+        self.request_latencies: list[float] = []
+        self.lock = asyncio.Lock()
+
+    @classmethod
+    async def create(
+        cls,
+        keys: list[str],
+        rpm_per_key: float,
+        rpd_per_key: int,
+        client: httpx.AsyncClient | None = None,
+    ) -> "LocalKeyPool":
+        del client  # accepted so both pools share one construction call site
+        pool = cls(keys, rpm_per_key, rpd_per_key)
+        print(
+            f"[quota] local pacing keys={len(keys)} "
+            f"rpm_per_key={rpm_per_key:g} rpd_per_key={rpd_per_key}",
+            flush=True,
+        )
+        return pool
+
+    async def acquire(self) -> tuple[int, str, str]:
+        while True:
+            wait_for = 0.0
+            async with self.lock:
+                now = time.monotonic()
+                candidates: list[tuple[float, int]] = []
+                for index in range(len(self.keys)):
+                    if self.disabled[index] or self.used[index] >= self.rpd_per_key:
+                        continue
+                    candidates.append(
+                        (
+                            max(self.next_allowed[index], self.cooldown_until[index]),
+                            index,
+                        )
+                    )
+
+                if not candidates:
+                    raise QuotaPoolExhaustedError(
+                        "All API keys reached their configured per-run daily "
+                        "limit or were disabled by quota errors."
+                    )
+
+                ready_at, index = min(candidates)
+                if ready_at <= now:
+                    self.used[index] += 1
+                    self.next_allowed[index] = now + self.interval
+                    return index, self.keys[index], f"local-{index + 1}-{self.used[index]}"
+
+                wait_for = max(0.05, ready_at - now)
+
+            await asyncio.sleep(wait_for)
+
+    async def mark_success(self, key_index: int, lease_id: str) -> None:
+        self.successes[key_index] += 1
+
+    async def mark_error(
+        self,
+        key_index: int,
+        lease_id: str,
+        http_status: int = 0,
+    ) -> None:
+        self.errors[key_index] += 1
+
+    async def rate_limited(
+        self,
+        key_index: int,
+        lease_id: str,
+        cooldown_seconds: float,
+        daily_exhausted: bool = False,
+        quota_type: str = "unknown",
+    ) -> None:
+        self.rate_limited_counts[key_index] += 1
+        async with self.lock:
+            if daily_exhausted:
+                self.disabled[key_index] = True
+                return
+            self.cooldown_until[key_index] = max(
+                self.cooldown_until[key_index],
+                time.monotonic() + max(0.0, cooldown_seconds),
+            )
+
+    def record_http_result(self, status: int, elapsed_seconds: float) -> None:
+        count_http_result(self.http_counts, status)
+        self.request_latencies.append(max(0.0, elapsed_seconds))
+        if len(self.request_latencies) > 1000:
+            del self.request_latencies[: len(self.request_latencies) - 1000]
+
+    async def remote_status(self) -> dict:
+        return {}
+
+    def performance_summary(self) -> dict[str, object]:
+        return {**self.http_counts, **latency_summary(self.request_latencies)}
+
+    async def close(self) -> None:
+        return None
+
+    def usage_summary(self) -> dict[str, object]:
+        return {
+            "scope": "current_action",
+            "performance": self.performance_summary(),
             "keys": {
                 str(index + 1): {
-                    "project": self.groups[index],
                     "requests": self.used[index],
                     "success": self.successes[index],
                     "http_429": self.rate_limited_counts[index],
                     "errors": self.errors[index],
+                    "disabled": self.disabled[index],
                 }
                 for index in range(len(self.keys))
             },

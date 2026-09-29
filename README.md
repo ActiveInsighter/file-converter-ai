@@ -1,6 +1,6 @@
 # AnyWorkflow File Converter
 
-这是 AnyWorkflow 的文件转换执行仓库。当前首个转换器是 PDF → Markdown：用 GitHub Actions 临时 Runner 将 PDF 按页渲染为图片，并并发调用 Google AI Studio / Gemini API，把连续页面转换成 Markdown，最后按原页序合并。后续转换类型通过 `conversion_type` 扩展。
+这是 AnyWorkflow 的文件转换执行仓库。当前首个转换器是 PDF → Markdown：用 GitHub Actions 临时 Runner 将 PDF 按页渲染为图片，并并发调用所选模型接口，把连续页面转换成 Markdown，最后按原页序合并。后续转换类型通过 `conversion_type` 扩展。
 
 ## 功能
 
@@ -9,9 +9,10 @@
   `https://drive.google.com/file/d/FILE_ID/view?usp=drivesdk`
 - PDF 按页渲染为 PNG（默认无损）；也可显式选择 JPEG。
 - `images_per_request` 控制一次请求发送多少张连续页面图片。
-- `concurrency` 控制同时进行的 Gemini 请求数。
+- `concurrency` 控制同时进行的模型请求数。
 - 支持自定义提示词、模型、DPI 和 JPEG 质量。
 - 支持多个 Gemini API Key 轮询，重试时自动换下一个 Key。
+- 支持 `gemini` 和 `modelflare` 提供方；Modelflare 使用 OpenAI 兼容的 Chat Completions 图像输入。
 - 通过稳定的 `conversion_type` 输入选择转换器；当前值为 `pdf_to_md`。
 - 输出按原页码命名：`001.md` 或 `001-003.md`。
 - 全部成功生成 `merged.md`；有失败时生成 `merged.partial.md` 和错误详情。
@@ -41,6 +42,25 @@ AIza...key10
 
 使用一个多行 Secret 比维护 `GEMINI_API_KEY_1` 到 `GEMINI_API_KEY_10` 更方便；增删 Key 不需要修改 Workflow。
 
+## 配置 Modelflare
+
+后续要使用时，在同一个 GitHub Actions Secrets 页面创建 `MODELFLARE_API_KEYS`，填入一个或多个 Modelflare API Key，每行一个。密钥不写入仓库、任务参数或前端。创建密钥时选择能访问目标模型的路由分组；模型 ID 与分组必须匹配。可先用该密钥调用 `GET https://modelflare.dev/v1/models` 查看可用模型，再确认所选模型支持**图像输入**和 **Chat Completions**。图片中的 `gpt-6-sol` 等名称仅供识别接口，项目不会预选它们。
+
+运行时选择 `provider=modelflare`，并填写确切的视觉模型 ID。默认接口为 `https://modelflare.dev/v1/chat/completions`，页面图片作为 Base64 `image_url` 发送。`thinking_level` 只用于 Gemini；如目标模型支持，可另外填写 `reasoning_effort`。`max_output_tokens=0` 表示由接口决定输出上限。Modelflare 使用本次任务内的请求节流，不要求 Gemini 的共享配额服务。
+
+本地示例（将密钥放入环境变量，不要写入命令行参数）：
+
+```bash
+export MODELFLARE_API_KEYS='你的密钥'
+python pdf2md.py \
+  --source-url 'https://example.com/document.pdf' \
+  --provider modelflare \
+  --model '你选定的视觉模型ID' \
+  --concurrency 5
+```
+
+接口路径与密钥分组规则以 [Modelflare 官方接口文档](https://docs.modelflare.dev/guides/endpoints/) 和 [模型与分组文档](https://docs.modelflare.dev/guides/models-and-groups/) 为准。当前适配的是 Chat Completions；若模型只提供 Responses 接口，需先增加对应的请求与响应适配器。
+
 ## 手动运行
 
 进入：
@@ -52,12 +72,15 @@ AIza...key10
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `conversion_type` | 文件转换处理器 | `pdf_to_md` |
+| `provider` | 模型提供方：`gemini` / `modelflare` | `gemini` |
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
-| `concurrency` | 最大 Gemini 并发请求数 | `50` |
+| `concurrency` | 最大模型并发请求数 | `50` |
 | `system_prompt` | 系统提示词（来自已保存的转换配置，所有任务共用） | 空 |
 | `prompt` | 本次转换的专有提示词，追加在 `system_prompt` 之后 | 空 |
-| `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
+| `model` | 模型 ID；Modelflare 必填 | Gemini 默认 `gemini-3.5-flash-lite` |
+| `reasoning_effort` | Modelflare 推理强度，目标模型支持时填写 | 空 |
+| `max_output_tokens` | 输出 token 上限，0 表示接口默认 | `0` |
 | `thinking_level` | Gemini 思考深度 | `high` |
 | `dpi` | PDF 渲染 DPI | `240` |
 | `image_format` | 页面图像格式，PNG 为无损 | `png` |
@@ -118,6 +141,7 @@ Content-Type: application/json
   "event_type": "pdf_to_md",
   "client_payload": {
     "conversion_type": "pdf_to_md",
+    "provider": "gemini",
     "source_url": "https://drive.google.com/file/d/12DMkT6QkZSad5_SsxvcsHgFKsQrxf9JN/view?usp=drivesdk",
     "images_per_request": 1,
     "concurrency": 50,
@@ -132,6 +156,8 @@ Content-Type: application/json
   }
 }
 ```
+
+通过 `repository_dispatch` 使用 Modelflare 时，把 `provider` 改为 `modelflare`，并将 `model` 改为你选定的视觉模型 ID；不要沿用 Gemini 的模型 ID 或 `model_fallbacks`。仓库中即使仍有 Gemini 配额变量，Modelflare 任务也不会使用它们。
 
 因为仓库是私有仓库，调用方需要一个有权限访问该仓库的 GitHub Token。n8n 的 HTTP Request 节点可以直接调用这个地址。
 
