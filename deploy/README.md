@@ -120,7 +120,7 @@ Measured per Project in September 2026; Google no longer publishes these:
 | Model | RPM | RPD | Usable for page images |
 | --- | --- | --- | --- |
 | `gemini-3.5-flash-lite` | 15 | 500 | yes |
-| `gemini-3.1-flash-lite` | 15 | 500 | yes |
+| `gemini-3.1-flash-lite` | 15 | 500 | yes, but weaker output - not used as a fallback |
 | `gemini-3.6-flash` / `3.7` / `3.8` | 5 | 20 | no (503 on every image request) |
 | `gemini-3.5-flash` | 5 | 20 | no |
 

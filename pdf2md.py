@@ -876,7 +876,9 @@ def parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated fallback model IDs tried in order when the primary "
-            "model answers 503/404. Empty disables the fallback chain."
+            "model answers 503/404. Empty disables the fallback chain. "
+            "Keep fallbacks same-tier (gemini-flash-lite-latest); a weaker "
+            "model silently degrades page quality."
         ),
     )
     p.add_argument(
