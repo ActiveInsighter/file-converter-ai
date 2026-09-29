@@ -58,7 +58,7 @@ on:
         default: ""
         type: string
       model_fallbacks:
-        description: "Comma-separated same-provider fallback models. Empty uses the provider default (none for Modelflare)."
+        description: "Comma-separated fallback models. Empty only falls back for the default model; custom models stay exact. Use none to disable."
         required: false
         default: ""
         type: string

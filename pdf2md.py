@@ -127,6 +127,16 @@ def parse_model_list(raw: str | None) -> tuple[str, ...]:
     )
 
 
+def resolve_fallback_models(provider: Provider, model: str, raw: str | None) -> tuple[str, ...]:
+    """Never replace an explicitly chosen model with a weaker default fallback."""
+    if raw and raw.strip().lower() in {"none", "off"}:
+        return ()
+    explicit = parse_model_list(raw)
+    if explicit:
+        return explicit
+    return provider.default_model_fallbacks if model == provider.default_model else ()
+
+
 def is_google_drive_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return host == "drive.google.com" or host.endswith(".drive.google.com")
@@ -753,9 +763,7 @@ async def call_model(
                 api_base,
                 max_output_tokens,
             )
-        except (QuotaPoolExhaustedError, PermanentProviderError):
-            raise
-        except Exception as exc:  # noqa: BLE001 - the chain is best effort
+        except ModelUnavailableError as exc:
             last_error = exc
             if position + 1 < len(candidates):
                 print(
@@ -1343,9 +1351,9 @@ def parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated fallback model IDs tried in order when the primary "
-            "model answers 503/404. Empty disables the fallback chain. "
-            "Keep fallbacks same-tier (gemini-flash-lite-latest); a weaker "
-            "model silently degrades page quality."
+            "model answers 503/404. Empty keeps the default model's same-tier "
+            "fallback only; custom models have no automatic fallback. Use "
+            "'none' to disable the default fallback."
         ),
     )
     p.add_argument(
@@ -1513,9 +1521,7 @@ async def async_main(args: argparse.Namespace) -> int:
     fallbacks_source = args.model_fallbacks
     if not fallbacks_source and provider.fallbacks_env:
         fallbacks_source = os.getenv(provider.fallbacks_env)
-    fallback_models = (
-        parse_model_list(fallbacks_source) or provider.default_model_fallbacks
-    )
+    fallback_models = resolve_fallback_models(provider, model, fallbacks_source)
     if provider.name != GEMINI.name and model.lower().startswith("gemini-"):
         print(
             f"[warn] model {model!r} looks like a Gemini id but provider is "

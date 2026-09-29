@@ -14,10 +14,13 @@ from unittest.mock import AsyncMock, patch
 from pdf2md import (
     Chunk,
     ContentBlockedError,
+    ModelUnavailableError,
     PermanentProviderError,
     answer_from_payload,
+    call_model,
     is_retryable_error,
     process_chunks,
+    resolve_fallback_models,
 )
 from providers import (
     GEMINI,
@@ -31,6 +34,48 @@ from providers import (
 from quota_client import LocalKeyPool, QuotaPoolExhaustedError
 
 GEMINI_LITE = "gemini-3.5-flash-lite"
+
+
+class FallbackSelectionTests(unittest.TestCase):
+    def test_custom_gemini_model_does_not_silently_downgrade_to_lite(self):
+        self.assertEqual(resolve_fallback_models(GEMINI, "gemini-3.8-flash", ""), ())
+        self.assertEqual(resolve_fallback_models(GEMINI, "gemini-3.7-flash", ""), ())
+
+    def test_default_model_keeps_its_same_tier_fallback(self):
+        self.assertEqual(
+            resolve_fallback_models(GEMINI, GEMINI.default_model, ""),
+            GEMINI.default_model_fallbacks,
+        )
+
+    def test_explicit_fallbacks_and_disable_are_honored(self):
+        self.assertEqual(
+            resolve_fallback_models(GEMINI, "gemini-3.8-flash", "gemini-3.7-flash"),
+            ("gemini-3.7-flash",),
+        )
+        self.assertEqual(resolve_fallback_models(GEMINI, GEMINI.default_model, "none"), ())
+
+
+class FallbackExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_model_unavailability_uses_an_explicit_fallback(self):
+        with patch(
+            "pdf2md.call_model_once",
+            new=AsyncMock(side_effect=[ModelUnavailableError("503"), "# recovered"]),
+        ) as send:
+            result = await call_model(
+                None, None, GEMINI, "gemini-3.8-flash", [{"text": "page"}],
+                "001", "low", ("gemini-3.7-flash",),
+            )
+        self.assertEqual(result, "# recovered")
+        self.assertEqual([call.args[3] for call in send.call_args_list], ["gemini-3.8-flash", "gemini-3.7-flash"])
+
+    async def test_transport_failure_does_not_change_the_requested_model(self):
+        with patch("pdf2md.call_model_once", new=AsyncMock(side_effect=RuntimeError("network"))) as send:
+            with self.assertRaisesRegex(RuntimeError, "network"):
+                await call_model(
+                    None, None, GEMINI, "gemini-3.8-flash", [{"text": "page"}],
+                    "001", "low", ("gemini-3.7-flash",),
+                )
+        self.assertEqual(send.call_count, 1)
 
 
 def image_part(data: bytes = b"png-bytes", mime: str = "image/png", level: str | None = None):
