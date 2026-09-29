@@ -148,6 +148,9 @@ class Provider(abc.ABC):
     model_example: ClassVar[str] = ""
     #: Extra CLI flags this provider understands, for the help text.
     notes: ClassVar[str] = ""
+    #: Per-request read timeout. Gateway reasoning models can take longer than
+    #: Gemini to return a dense page even when the request is healthy.
+    request_timeout_seconds: ClassVar[float] = 120.0
     permanent_statuses: ClassVar[frozenset[int]] = PERMANENT_HTTP_STATUSES
 
     @abc.abstractmethod
@@ -314,6 +317,7 @@ class OpenAICompatibleProvider(Provider):
     default_model = ""
     model_example = "gpt-5.6-sol"
     notes = "--reasoning-effort, --max-output-tokens, --api-base"
+    request_timeout_seconds = 300.0
 
     def endpoint(self, base_url: str, model: str) -> str:
         return f"{base_url.rstrip('/')}/chat/completions"

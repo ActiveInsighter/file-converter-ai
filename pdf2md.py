@@ -845,7 +845,7 @@ async def process_chunks(
     else:
         groups = []
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(120.0, connect=30.0),
+        timeout=httpx.Timeout(provider.request_timeout_seconds, connect=30.0),
         limits=httpx.Limits(
             max_connections=max(100, concurrency * 2),
             max_keepalive_connections=max(50, concurrency),
