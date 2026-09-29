@@ -85,6 +85,43 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["maxInflight"], 8)
         self.assertEqual(state["adaptiveStage"], 2)
 
+    async def test_floor_stage_does_not_rearm_the_global_cooldown(self):
+        """At the floor the controller must stop touching the cooldown clock.
+
+        Re-entering the step-down branch while already at stage 3 re-armed
+        controller_changed_at + cooldown_until every 30 s. That parked the whole
+        pool (global_inflight=0) in 30-60 s bursts and starved every worker
+        waiting on a lease: a real 82-page run stalled for four minutes and took
+        16m13s, against 3m13s for the same document earlier the same day.
+        """
+        await self.configure()
+        for _ in range(10):
+            self.now[0] += 1_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 503)
+        state = (await self.scheduler.status()).body["global"]
+        self.assertEqual(state["maxInflight"], 12)
+        for _ in range(2):
+            self.now[0] += 31_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 503)
+        state = (await self.scheduler.status()).body["global"]
+        self.assertEqual(state["maxInflight"], 8)
+        self.assertEqual(state["adaptiveStage"], 3)
+
+        # Let the parking cooldown lapse, then keep the upstream failing well
+        # past the 30 s controller window. A floor-stage pool must leave the
+        # clock alone, so the remaining in-flight budget stays usable.
+        self.now[0] += 120_000
+        for _ in range(3):
+            self.now[0] += 31_000
+            lease = (await self.scheduler.lease()).body
+            await self.scheduler.report(lease["leaseId"], 503)
+        state = (await self.scheduler.status()).body["global"]
+        self.assertEqual(state["adaptiveStage"], 3)
+        self.assertEqual(state["maxInflight"], 8)
+        self.assertEqual(state["cooldownRemainingMs"], 0)
+
     async def test_partial_success_recovery_lifts_capacity_off_the_floor(self):
         """A clean-enough success window must lift capacity off the floor.
 
