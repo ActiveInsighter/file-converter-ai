@@ -41,6 +41,41 @@ DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页�
 GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
 
+# A page counts as an empty scan page when it has almost no ink *and* nothing
+# dark on it. Both halves of the test matter: a page with one faint line is not
+# blank, while scanner speckle on an otherwise white page still is. Measured
+# corpus margin: blank pages <= 0.004% ink with no pixel darker than 249, real
+# pages >= 4.8% ink with a darkest pixel <= 128.
+BLANK_PAGE_INK_RATIO = 0.001
+BLANK_PAGE_DARK_LEVEL = 200
+# Any pixel darker than this counts as ink when measuring page coverage.
+INK_PIXEL_MAX = 250
+# Pages are measured on a cheap downscaled grayscale pixmap instead of the full
+# resolution render.
+SPLIT_ANALYSIS_SCALE = 0.25
+# Vertical bands (fractions of the page height) searched for a blank cut row,
+# most balanced first. A cut on a row with no ink never slices a text line.
+SPLIT_SEARCH_WINDOWS = ((0.35, 0.65), (0.25, 0.75), (0.15, 0.85))
+# Overlap given to both halves when the page has no blank row in any band.
+SPLIT_FALLBACK_OVERLAP = 0.01
+# How many times a refused image may be cut again: 2 means page -> halves ->
+# halves of a refused half, so a stubborn page costs at most 1 + 2 + 2 requests
+# and never grows without bound.
+PAGE_SPLIT_DEPTH = 2
+# finishReason values that mean "the model refused to emit the page", as opposed
+# to "the model produced nothing".
+BLOCKED_FINISH_REASONS = frozenset(
+    {
+        "RECITATION",
+        "SAFETY",
+        "PROHIBITED_CONTENT",
+        "BLOCKLIST",
+        "SPII",
+        "IMAGE_SAFETY",
+        "LANGUAGE",
+    }
+)
+
 
 @dataclass(frozen=True)
 class Chunk:
@@ -48,6 +83,7 @@ class Chunk:
     end_page: int
     image_paths: tuple[Path, ...]
     stem: str
+    blank: bool = False
 
 
 class KeyPool:
@@ -187,7 +223,7 @@ def render_pdf(
     image_format: str,
     start_page: int | None,
     end_page: int | None,
-) -> tuple[list[Path], int, int]:
+) -> tuple[list[Path], int, int, set[int]]:
     image_dir.mkdir(parents=True, exist_ok=True)
     document = fitz.open(pdf_path)
     total_pages = document.page_count
@@ -207,6 +243,7 @@ def render_pdf(
         )
 
     extension = "png" if image_format == "png" else "jpg"
+    blank_pages: set[int] = set()
     for page_number in range(first, last + 1):
         page = document[page_number - 1]
         pix = page.get_pixmap(matrix=matrix, alpha=False)
@@ -216,17 +253,141 @@ def render_pdf(
         else:
             path.write_bytes(pix.tobytes("jpeg", jpg_quality=jpeg_quality))
         paths.append(path)
+        blank, ink_ratio, darkest = is_blank_page(page)
+        if blank:
+            blank_pages.add(page_number)
+            print(
+                f"[render] {page_number}/{total_pages}: {path.name} "
+                f"blank ink_ratio={ink_ratio:.6f} darkest={darkest}",
+                flush=True,
+            )
+            continue
         print(
             f"[render] {page_number}/{total_pages}: {path.name}",
             flush=True,
         )
 
     document.close()
-    return paths, width, total_pages
+    return paths, width, total_pages, blank_pages
+
+
+def page_ink_stats(page: fitz.Page) -> tuple[float, int]:
+    """Ink coverage and darkest pixel of a cheap downscaled page preview."""
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(SPLIT_ANALYSIS_SCALE, SPLIT_ANALYSIS_SCALE),
+        colorspace=fitz.csGRAY,
+    )
+    samples = pix.samples
+    if not samples:
+        return 0.0, 255
+    ink = sum(1 for value in samples if value < INK_PIXEL_MAX) / len(samples)
+    return ink, min(samples)
+
+
+def is_blank_page(page: fitz.Page) -> tuple[bool, float, int]:
+    """Is this an empty scan page, and what did the measurement see?"""
+    ink, darkest = page_ink_stats(page)
+    blank = ink < BLANK_PAGE_INK_RATIO and darkest >= BLANK_PAGE_DARK_LEVEL
+    return blank, ink, darkest
+
+
+def _page_ink_rows(page: fitz.Page) -> tuple[list[int], int]:
+    """Per-row ink pixel counts of the preview pixmap."""
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(SPLIT_ANALYSIS_SCALE, SPLIT_ANALYSIS_SCALE),
+        colorspace=fitz.csGRAY,
+    )
+    width, height, samples = pix.width, pix.height, pix.samples
+    rows = [
+        sum(1 for value in samples[y * width : (y + 1) * width] if value < INK_PIXEL_MAX)
+        for y in range(height)
+    ]
+    return rows, height
+
+
+def choose_split_row(rows: list[int], height: int) -> tuple[int, bool]:
+    """Pick the cut row of a page as (row, clean).
+
+    ``row`` is in preview coordinates and is the blank row closest to the middle
+    of the page, so the two halves stay balanced. ``clean`` is True when that row
+    carries no ink at all, i.e. no line of text is sliced by the cut; otherwise
+    the caller has to overlap the halves a little.
+    """
+    center = height / 2
+    for low, high in SPLIT_SEARCH_WINDOWS:
+        start, stop = int(height * low), int(height * high)
+        if stop <= start:
+            continue
+        blank_rows = [y for y in range(start, stop) if rows[y] == 0]
+        if blank_rows:
+            return min(blank_rows, key=lambda y: abs(y - center)), True
+
+    start, stop = int(height * 0.35), int(height * 0.65)
+    if stop <= start:
+        return height // 2, False
+    return min(range(start, stop), key=lambda y: rows[y]), False
+
+
+def native_page_scale(page: fitz.Page) -> float:
+    """Page points to image pixels, so a clipped render keeps the source detail.
+
+    A rendered page image is an image document whose rect comes from its DPI
+    metadata instead of its pixel count: rendering a clip at the identity matrix
+    silently drops 25% of the resolution.
+    """
+    best = None
+    for entry in page.get_image_info():
+        width = entry.get("width") or 0
+        bbox = entry.get("bbox") or (0, 0, 0, 0)
+        placed_width = bbox[2] - bbox[0]
+        if width and placed_width > 0:
+            ratio = width / placed_width
+            if best is None or ratio > best:
+                best = ratio
+    return best or 1.0
+
+
+def split_page_image(image_path: Path, target_dir: Path) -> tuple[list[Path], bool]:
+    """Cut one rendered page into two horizontal halves on a blank row.
+
+    A content refusal is triggered by recognising a whole passage, so the same
+    page usually transcribes fine once it is cropped. Halves are written as PNG
+    at the source resolution, next to the page they come from.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    source = fitz.open(image_path)
+    try:
+        if source.page_count < 1:
+            raise ValueError(f"{image_path} has no image page")
+        page = source[0]
+        rows, preview_height = _page_ink_rows(page)
+        blank_row, clean = choose_split_row(rows, preview_height)
+        rect = page.rect
+        cut = rect.y0 + blank_row / SPLIT_ANALYSIS_SCALE
+        overlap = 0.0 if clean else rect.height * SPLIT_FALLBACK_OVERLAP
+
+        scale = native_page_scale(page)
+        matrix = fitz.Matrix(scale, scale)
+        clips = (
+            fitz.Rect(rect.x0, rect.y0, rect.x1, cut + overlap),
+            fitz.Rect(rect.x0, cut - overlap, rect.x1, rect.y1),
+        )
+        halves: list[Path] = []
+        for index, clip in enumerate(clips, start=1):
+            pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
+            path = target_dir / f"{image_path.stem}-part{index}.png"
+            path.write_bytes(pix.tobytes("png"))
+            halves.append(path)
+        return halves, clean
+    finally:
+        source.close()
 
 
 def build_chunks(
-    image_paths: list[Path], images_per_request: int, width: int
+    image_paths: list[Path],
+    images_per_request: int,
+    width: int,
+    blank_pages: frozenset[int] | set[int] = frozenset(),
 ) -> list[Chunk]:
     chunks = []
     for offset in range(0, len(image_paths), images_per_request):
@@ -238,7 +399,8 @@ def build_chunks(
             if start_page == end_page
             else f"{start_page:0{width}d}-{end_page:0{width}d}"
         )
-        chunks.append(Chunk(start_page, end_page, batch, stem))
+        blank = all(int(path.stem) in blank_pages for path in batch)
+        chunks.append(Chunk(start_page, end_page, batch, stem, blank))
     return chunks
 
 
@@ -359,11 +521,18 @@ def extract_response_text(payload: dict) -> str:
             for candidate in payload.get("candidates", [])
             if candidate.get("finishReason")
         ]
-        raise RuntimeError(
-            "Gemini returned no answer text. "
-            f"finishReasons={finish_reasons}, "
-            f"promptFeedback={payload.get('promptFeedback') or {}}"
+        feedback = payload.get("promptFeedback") or {}
+        blocked = [reason for reason in finish_reasons if reason in BLOCKED_FINISH_REASONS]
+        detail = (
+            f"finishReasons={finish_reasons}, promptFeedback={feedback}"
         )
+        if feedback.get("blockReason"):
+            raise ContentBlockedError(
+                f"Gemini blocked this page image: blockReason={feedback['blockReason']}, {detail}"
+            )
+        if blocked:
+            raise ContentBlockedError(f"Gemini refused this page image. {detail}")
+        raise EmptyAnswerError(f"Gemini returned no answer text. {detail}")
 
     if result.startswith("~~~markdown") and result.endswith("~~~"):
         result = result[len("~~~markdown") : -3].strip()
@@ -456,6 +625,39 @@ class PermanentGeminiError(RuntimeError):
     """A request rejected for a non-transient client or configuration error."""
 
 
+class ContentBlockedError(RuntimeError):
+    """Gemini answered a page without any usable text.
+
+    Either ``finishReason`` is a content-refusal value (``RECITATION`` and
+    friends) or the prompt itself was blocked. The verdict is a property of the
+    page image, not of the quota pool: re-sending the same image reproduces it
+    on every attempt, so this error must never enter the backoff rounds.
+    ``split_page_image`` recovers many of these pages instead.
+    """
+
+
+class EmptyAnswerError(ContentBlockedError):
+    """The model stopped without emitting any text for a page image.
+
+    Seen on blank scan pages (nothing to transcribe), on figure-only pages and
+    on responses whose whole output landed in thinking parts. Retrying the same
+    image does not change it; cutting the page in half usually does.
+    """
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """Only capacity, transport and formatting errors are worth another round."""
+    return not isinstance(
+        exc,
+        (
+            PermanentGeminiError,
+            QuotaPoolExhaustedError,
+            ValueError,
+            ContentBlockedError,
+        ),
+    )
+
+
 class ModelUnavailableError(RuntimeError):
     """The model itself is not serving the request right now.
 
@@ -511,6 +713,13 @@ async def call_gemini_once(
                     flush=True,
                 )
             validate_markdown_output(text)
+        except ContentBlockedError:
+            # The request itself was fine: the model refused this page image.
+            # Release the lease cleanly and keep the error type, otherwise the
+            # wrapper below turns it into a retryable RuntimeError and the page
+            # burns every retry round on the same verdict.
+            await key_pool.mark_success(key_index, lease_id)
+            raise
         except Exception as exc:
             await key_pool.mark_error(key_index, lease_id, http_status=502)
             raise RuntimeError(f"Gemini returned unusable Markdown: {exc}") from exc
@@ -598,9 +807,14 @@ async def process_chunks(
     fallback_models: tuple[str, ...] = (),
     retry_rounds: int = 5,
     attempts_per_page: int = 2,
+    blocked_page_split: str = "halves",
 ) -> list[dict]:
+    if blocked_page_split not in {"none", "halves"}:
+        raise ValueError("blocked_page_split must be none or halves")
+
     pages_dir = output_dir / "pages"
     errors_dir = output_dir / "errors"
+    split_dir = output_dir / "split"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
@@ -632,37 +846,159 @@ async def process_chunks(
         progress = {"active_chunks": 0}
         stop_metrics = asyncio.Event()
 
-        async def run_one(chunk: Chunk, round_number: int) -> dict:
+        def record_success(
+            chunk: Chunk, text: str, estimated: int, note: str = "", **extra
+        ) -> dict:
             md_path = pages_dir / f"{chunk.stem}.md"
+            error_path = errors_dir / f"{chunk.stem}.json"
+            md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
+            if error_path.exists():
+                error_path.unlink()
+            elapsed = round(time.monotonic() - started_at[chunk.stem], 2)
+            print(f"[done] {chunk.stem}.md ({elapsed}s){note}", flush=True)
+            return {
+                "chunk": chunk.stem,
+                "status": "ok",
+                "path": str(md_path),
+                "estimated_payload_bytes": estimated,
+                "elapsed_seconds": elapsed,
+                "retryable": False,
+                **extra,
+            }
+
+        def record_blank(chunk: Chunk, reason: str, detail: str) -> dict:
+            """An empty page contributes nothing to the Markdown: not a failure."""
+            md_path = pages_dir / f"{chunk.stem}.md"
+            error_path = errors_dir / f"{chunk.stem}.json"
+            md_path.write_text("", encoding="utf-8")
+            if error_path.exists():
+                error_path.unlink()
+            print(f"[blank] {chunk.stem}: {detail}; skipped", flush=True)
+            return {
+                "chunk": chunk.stem,
+                "status": "blank",
+                "path": str(md_path),
+                "reason": reason,
+                "retryable": False,
+            }
+
+        async def run_one(chunk: Chunk, round_number: int) -> dict:
+            if chunk.blank:
+                return record_blank(
+                    chunk,
+                    "blank_page",
+                    "no visible page content "
+                    f"(ink < {BLANK_PAGE_INK_RATIO} and no pixel darker than "
+                    f"{BLANK_PAGE_DARK_LEVEL})",
+                )
+
             error_path = errors_dir / f"{chunk.stem}.json"
             attempts = max(1, attempts_per_page)
 
-            async def transcribe() -> tuple[str, int]:
-                parts, estimated = make_request_parts(chunk, prompt, media_resolution)
+            async def transcribe(target: Chunk, name: str) -> tuple[str, int]:
+                parts, estimated = make_request_parts(target, prompt, media_resolution)
                 text = await call_gemini(
                     client,
                     key_pool,
                     model,
                     parts,
-                    chunk.stem,
+                    name,
                     thinking_level,
                     fallback_models,
                 )
 
                 for verify_index in range(verification_passes):
                     verify_parts, _ = make_verification_parts(
-                        chunk, prompt, text, media_resolution
+                        target, prompt, text, media_resolution
                     )
                     text = await call_gemini(
                         client,
                         key_pool,
                         model,
                         verify_parts,
-                        f"{chunk.stem}-verify-{verify_index + 1}",
+                        f"{name}-verify-{verify_index + 1}",
                         thinking_level,
                         fallback_models,
                     )
                 return text, estimated
+
+            async def transcribe_part(
+                path: Path, name: str, splits_left: int
+            ) -> tuple[str, bool]:
+                """Transcribe one page image, cutting it up while it is refused.
+
+                Returns the text plus whether this crop was refused (as opposed to
+                simply empty). ``splits_left`` bounds the recursion, so a page that
+                is refused all the way down fails in seconds instead of eating the
+                whole quota pool.
+                """
+                part_chunk = Chunk(chunk.start_page, chunk.end_page, (path,), name)
+                try:
+                    text, _ = await transcribe(part_chunk, name)
+                except EmptyAnswerError:
+                    # An empty STOP answer means this crop has nothing to
+                    # transcribe; a smaller crop would not invent text either.
+                    return "", False
+                except ContentBlockedError as blocked:
+                    if splits_left <= 0:
+                        return "", True
+                    text, missing = await split_and_transcribe(
+                        path, name, blocked, splits_left
+                    )
+                    return text, bool(missing)
+                return text, False
+
+            async def split_and_transcribe(
+                path: Path, name: str, blocked: Exception, splits_left: int
+            ) -> tuple[str, list[str]]:
+                """Cut a refused image on blank rows and transcribe every part.
+
+                Returns the recovered text plus the parts that stayed refused at
+                their smallest size (their text is missing from the output).
+                """
+                parts, clean = await asyncio.to_thread(split_page_image, path, split_dir)
+                print(
+                    f"[split] {name}: {type(blocked).__name__} ({blocked}); "
+                    f"cutting into {len(parts)} parts (clean_cut={clean})",
+                    flush=True,
+                )
+                texts: list[str] = []
+                missing: list[str] = []
+                for index, part in enumerate(parts, start=1):
+                    part_name = f"{name}-part{index}"
+                    text, refused = await transcribe_part(part, part_name, splits_left - 1)
+                    if text.strip():
+                        texts.append(text)
+                    elif refused:
+                        # A refusal is about that one region, so the sibling parts
+                        # are still worth keeping; record what got lost instead.
+                        missing.append(part_name)
+                return "\n\n".join(texts), missing
+
+            async def transcribe_with_page_split(
+                blocked: Exception,
+            ) -> tuple[str, list[str]]:
+                """Retry a refused page by cutting it on blank rows.
+
+                Returns the recovered text and the parts that stayed refused at
+                their smallest size, so the caller can report a partial recovery
+                instead of silently dropping content.
+                """
+                text, missing = await split_and_transcribe(
+                    chunk.image_paths[0], chunk.stem, blocked, PAGE_SPLIT_DEPTH
+                )
+                if not text.strip():
+                    raise ContentBlockedError(
+                        "Gemini refused this page image and every part of it "
+                        f"({', '.join(missing) or 'no part returned text'})"
+                    ) from blocked
+                if missing:
+                    print(
+                        f"[warn] {chunk.stem}: Gemini refused {', '.join(missing)} "
+                        "at every size; that text is missing from the Markdown",
+                        flush=True,
+                    )
+                return text, missing
 
             # A saturated free tier answers 503 in a couple of seconds, so an
             # immediate retry is far cheaper than deferring the page to the next
@@ -670,16 +1006,10 @@ async def process_chunks(
             last_error: Exception | None = None
             for attempt in range(1, attempts + 1):
                 try:
-                    text, estimated = await transcribe()
+                    text, estimated = await transcribe(chunk, chunk.stem)
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
-                    if (
-                        isinstance(
-                            exc,
-                            (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
-                        )
-                        or attempt >= attempts
-                    ):
+                    if not is_retryable_error(exc) or attempt >= attempts:
                         break
                     pause = random.uniform(3.0, 8.0) * attempt
                     print(
@@ -690,24 +1020,42 @@ async def process_chunks(
                     await asyncio.sleep(pause)
                     continue
 
-                md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
-                if error_path.exists():
-                    error_path.unlink()
-
-                elapsed = round(time.monotonic() - started_at[chunk.stem], 2)
-                print(f"[done] {chunk.stem}.md ({elapsed}s)", flush=True)
-                return {
-                    "chunk": chunk.stem,
-                    "status": "ok",
-                    "path": str(md_path),
-                    "estimated_payload_bytes": estimated,
-                    "elapsed_seconds": elapsed,
-                    "retryable": False,
-                }
+                return record_success(chunk, text, estimated)
 
             exc = last_error if last_error is not None else RuntimeError(
                 "transcription failed without an exception"
             )
+
+            if isinstance(exc, EmptyAnswerError):
+                # Gemini answered STOP with no text at all: there is nothing to
+                # transcribe here, so this page is blank, not failed.
+                return record_blank(chunk, "no_transcribable_text", str(exc))
+
+            if (
+                isinstance(exc, ContentBlockedError)
+                and blocked_page_split == "halves"
+                and chunk.start_page == chunk.end_page
+                and chunk.image_paths
+            ):
+                try:
+                    text, missing = await transcribe_with_page_split(exc)
+                except EmptyAnswerError as empty:
+                    return record_blank(chunk, "no_transcribable_text", str(empty))
+                except Exception as unrecovered:  # noqa: BLE001
+                    exc = unrecovered
+                else:
+                    note = " via page split"
+                    if missing:
+                        note = f" via page split ({len(missing)} part(s) missing)"
+                    return record_success(
+                        chunk,
+                        text,
+                        0,
+                        note=note,
+                        recovered_by="page_split",
+                        missing_parts=missing,
+                    )
+
             error = {
                 "chunk": chunk.stem,
                 "start_page": chunk.start_page,
@@ -723,10 +1071,7 @@ async def process_chunks(
             return {
                 "chunk": chunk.stem,
                 "status": "failed",
-                "retryable": not isinstance(
-                    exc,
-                    (PermanentGeminiError, QuotaPoolExhaustedError, ValueError),
-                ),
+                "retryable": is_retryable_error(exc),
                 **error,
             }
 
@@ -763,6 +1108,7 @@ async def process_chunks(
                     performance = key_pool.performance_summary()
                     successful = sum(item.get("status") == "ok" for item in latest_results.values())
                     failed = sum(item.get("status") == "failed" for item in latest_results.values())
+                    blank = sum(item.get("status") == "blank" for item in latest_results.values())
                     pending = len(chunks) - len(completed_first_pass)
                     try:
                         remote = await key_pool.remote_status()
@@ -782,7 +1128,7 @@ async def process_chunks(
                         global_summary = f"global_status=unavailable({type(exc).__name__})"
                     print(
                         f"[metrics] pending_chunks={pending} active_chunks={progress['active_chunks']} "
-                        f"success={successful} failed={failed} "
+                        f"success={successful} failed={failed} blank={blank} "
                         f"http_429={performance['429']} http_503={performance['503']} "
                         f"http_p50={performance['p50_seconds']}s "
                         f"http_p95={performance['p95_seconds']}s {global_summary}",
@@ -797,6 +1143,17 @@ async def process_chunks(
                 for result in first_round
                 if result["status"] == "failed" and result["retryable"]
             ]
+            trivially_done = sum(
+                1
+                for result in first_round
+                if result["status"] == "failed" and not result["retryable"]
+            )
+            if trivially_done:
+                print(
+                    f"[retry-round] {trivially_done} chunk(s) are final after round 1 "
+                    "(content errors, blank pages, permanent errors); no backoff for them",
+                    flush=True,
+                )
             for round_number in range(2, retry_rounds + 1):
                 if not deferred:
                     break
@@ -950,6 +1307,16 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="1-based last PDF page to process. Default: last page.",
     )
+    p.add_argument(
+        "--blocked-page-split",
+        choices=["none", "halves"],
+        default="halves",
+        help=(
+            "When Gemini refuses a single page (RECITATION, safety block), retry it "
+            "as two horizontal halves cut on a blank row, cutting a refused half "
+            "again (at most PAGE_SPLIT_DEPTH times). 'none' disables it."
+        ),
+    )
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output")
     return p
@@ -1000,6 +1367,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "media_resolution must be unspecified, low, medium, high, or ultra_high"
         )
+    if args.blocked_page_split not in {"none", "halves"}:
+        raise ValueError("blocked_page_split must be none or halves")
 
 
 async def async_main(args: argparse.Namespace) -> int:
@@ -1033,6 +1402,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"model_fallbacks={','.join(fallback_models) or 'none'} "
         f"retry_rounds={args.retry_rounds} "
         f"attempts_per_page={args.attempts_per_page} "
+        f"blocked_page_split={args.blocked_page_split} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
@@ -1044,7 +1414,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
             )
 
-    image_paths, width, pdf_total_pages = await asyncio.to_thread(
+    image_paths, width, pdf_total_pages, blank_pages = await asyncio.to_thread(
         render_pdf,
         source_pdf,
         images_dir,
@@ -1054,9 +1424,10 @@ async def async_main(args: argparse.Namespace) -> int:
         args.start_page,
         args.end_page,
     )
-    chunks = build_chunks(image_paths, args.images_per_request, width)
+    chunks = build_chunks(image_paths, args.images_per_request, width, blank_pages)
     print(
-        f"[plan] pages={len(image_paths)} chunks={len(chunks)}",
+        f"[plan] pages={len(image_paths)} chunks={len(chunks)} "
+        f"blank_pages={len(blank_pages)}",
         flush=True,
     )
 
@@ -1075,6 +1446,7 @@ async def async_main(args: argparse.Namespace) -> int:
         fallback_models=fallback_models,
         retry_rounds=args.retry_rounds,
         attempts_per_page=args.attempts_per_page,
+        blocked_page_split=args.blocked_page_split,
     )
     failures = [x for x in results if x.get("status") == "failed"]
 
@@ -1108,6 +1480,19 @@ async def async_main(args: argparse.Namespace) -> int:
         ],
         "results": sorted(results, key=lambda item: item["chunk"]),
         "failures": len(failures),
+        "blocked_page_split": args.blocked_page_split,
+        "blank_pages": sorted(blank_pages),
+        "blank_chunks": sorted(
+            item["chunk"] for item in results if item.get("status") == "blank"
+        ),
+        "split_recovered": sorted(
+            item["chunk"] for item in results if item.get("recovered_by") == "page_split"
+        ),
+        "partial_recovery": {
+            item["chunk"]: item["missing_parts"]
+            for item in results
+            if item.get("missing_parts")
+        },
         "merged_file": merged_name,
     }
     (output_dir / "manifest.json").write_text(
