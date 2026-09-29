@@ -252,9 +252,18 @@ if op == 'report' then
   -- the pool pinned itself at 8 in-flight plus a long global cooldown forever.
   local degrade_ratio = tonumber(ARGV[11]) or 0.35
   local recover_ratio = tonumber(ARGV[12]) or 0.60
+  local stage_now = number_field(global, 'adaptive_stage', 0)
+  -- Never re-enter the step-down branch once the floor is reached. Doing so
+  -- re-armed controller_changed_at and cooldown_until every 30 s while the
+  -- upstream kept answering 503, which parked the whole pool
+  -- (global_inflight=0) for 30-60 s at a time. Measured on a real 82-page
+  -- run: 4 minutes of total stall and 16m13s wall time, versus 3m13s for the
+  -- same document earlier in the day. At the floor the controller must leave
+  -- the clock alone so the pool keeps its full 8 in-flight budget and can
+  -- recover the moment the success ratio clears recover_ratio.
   if count >= 10 and unavailable / count >= degrade_ratio and
-    now - last_change >= 30000 then
-    local stage = math.min(3, number_field(global, 'adaptive_stage', 0) + 1)
+    now - last_change >= 30000 and stage_now < 3 then
+    local stage = stage_now + 1
     local next_max = math.min(configured_max, current_max > 12 and 12 or 8)
     local minimum = stage == 1 and 5000 or (stage == 2 and 15000 or 30000)
     local span = stage == 1 and 10001 or (stage == 2 and 15001 or 30001)
