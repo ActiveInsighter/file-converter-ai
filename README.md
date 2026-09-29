@@ -161,6 +161,8 @@ Content-Type: application/json
 
 通过 `repository_dispatch` 使用 Modelflare 时，把 `provider` 改为 `modelflare`，并将 `model` 改为你选定的视觉模型 ID；不要沿用 Gemini 的模型 ID 或 `model_fallbacks`。仓库中即使仍有 Gemini 配额变量，Modelflare 任务也不会使用它们。
 
+Gemini 自定义模型（例如 `gemini-3.8-flash`、`gemini-3.7-flash`）默认只用所选模型。Google 返回 503 时会按页面重试，不会自动改用 Flash-Lite。只有显式传入 `model_fallbacks` 才会切换模型；默认 `gemini-3.5-flash-lite` 仍保留其同档替补。传入 `model_fallbacks=none` 可禁用默认替补。关于 3.8/3.7 Flash 的 503 实测见 [诊断记录](docs/gemini-flash-503-2026-09-29.md)。
+
 因为仓库是私有仓库，调用方需要一个有权限访问该仓库的 GitHub Token。n8n 的 HTTP Request 节点可以直接调用这个地址。
 
 ## 输出和失败处理
