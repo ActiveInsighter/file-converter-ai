@@ -34,8 +34,13 @@ on:
         required: true
         default: "50"
         type: string
+      system_prompt:
+        description: "Shared system prompt read from the saved file-conversion config. It is sent before prompt and the two are appended, never merged. Leave empty to fall back to the built-in faithful Markdown conversion prompt."
+        required: false
+        default: ""
+        type: string
       prompt:
-        description: "Prompt. Leave empty to use the built-in faithful Markdown conversion prompt"
+        description: "Per-conversion prompt. Appended after system_prompt; leave empty to send only the system prompt."
         required: false
         default: ""
         type: string
@@ -141,6 +146,7 @@ jobs:
       SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
       IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
+      SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || github.event.client_payload.system_prompt || '' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'gemini-3.5-flash-lite' }}
       MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || 'gemini-flash-lite-latest' }}
@@ -226,6 +232,9 @@ jobs:
             --work-dir work
             --output-dir output
           )
+          if [[ -n "${SYSTEM_PROMPT}" ]]; then
+            args+=(--system-prompt "${SYSTEM_PROMPT}")
+          fi
           if [[ -n "${USER_PROMPT}" ]]; then
             args+=(--prompt "${USER_PROMPT}")
           fi

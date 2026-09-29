@@ -55,7 +55,8 @@ AIza...key10
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
 | `concurrency` | 最大 Gemini 并发请求数 | `50` |
-| `prompt` | 自定义提示词；留空使用内置 Markdown 转换提示词 | 空 |
+| `system_prompt` | 系统提示词（来自已保存的转换配置，所有任务共用） | 空 |
+| `prompt` | 本次转换的专有提示词，追加在 `system_prompt` 之后 | 空 |
 | `model` | Gemini 模型 ID | `gemini-3.5-flash-lite` |
 | `thinking_level` | Gemini 思考深度 | `high` |
 | `dpi` | PDF 渲染 DPI | `240` |
@@ -63,6 +64,20 @@ AIza...key10
 | `jpeg_quality` | JPEG 质量（PNG 时忽略） | `95` |
 | `verification_passes` | 初次转录后再对照图片审校的次数 | `0` |
 | `media_resolution` | Gemini 每张图片的视觉分辨率预算 | `ultra_high` |
+
+### 提示词如何拼接
+
+真正发给模型的提示词是**系统提示词**与**本次转换的专有提示词**按顺序拼接（中间空一行）：
+
+```text
+system_prompt（存在 PocketBase 转换配置里，前端可编辑）
++ "\n\n" +
+prompt（每次转换单独填写）
+```
+
+两者互不覆盖、各自可选，各限 12000 字符。只有**两者都为空**时才回退到内置的忠实转写提示词，
+所以从 GitHub 页面手动派发仍然可用。`manifest.json` 的 `prompt` 字段记录两段原文、长度与
+拼接结果的 sha256，便于事后核对这一次究竟用了什么提示词。
 
 例如 10 页 PDF 且：
 
@@ -106,7 +121,8 @@ Content-Type: application/json
     "source_url": "https://drive.google.com/file/d/12DMkT6QkZSad5_SsxvcsHgFKsQrxf9JN/view?usp=drivesdk",
     "images_per_request": 1,
     "concurrency": 50,
-    "prompt": "请准确识别页面内容并转换为 Markdown，公式使用 LaTeX。",
+    "system_prompt": "请按图片原始顺序忠实转写，公式使用 LaTeX。",
+    "prompt": "只处理第 3-7 页，保留题号与分数。",
     "model": "gemini-3.5-flash-lite",
     "thinking_level": "high",
     "dpi": 240,
