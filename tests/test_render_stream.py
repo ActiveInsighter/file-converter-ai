@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 import fitz
-from pdf2md import Chunk, merge_markdown, stream_pdf_chunks
+from pdf2md import Chunk, stream_pdf_chunks
 from render_stream import RenderPlan
 from test_page_recovery import run_process_chunks
 from pdf2md import PermanentProviderError
@@ -59,11 +59,3 @@ class RenderStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([c.stem for c in chunks], ['001-002', '003'])
             self.assertEqual([c.blank for c in chunks], [True, False])
             self.assertEqual(blanks, {1, 2})
-
-    async def test_merge_excludes_stale_pages_and_sorts_numerically(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name in ['2', '10', '999']:
-                (root / f'{name}.md').write_text(f'Page {name}')
-            merge_markdown([Chunk(10, 10, (), '10'), Chunk(2, 2, (), '2')], root, root / 'merged.md')
-            self.assertEqual((root / 'merged.md').read_text(), 'Page 2\n\nPage 10\n')

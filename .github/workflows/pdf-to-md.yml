@@ -1,5 +1,5 @@
 name: AnyWorkflow File Converter · PDF to Markdown
-run-name: file-converter-pdf-to-md-${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
+run-name: file-converter-pdf-to-md-${{ inputs.request_id || github.run_id }}
 
 on:
   workflow_dispatch:
@@ -127,12 +127,12 @@ on:
           - low
           - unspecified
       rpm_per_key:
-        description: "Requests/minute for each project quota pool (legacy input name)."
+        description: "Requests/minute per Gemini project or other provider key."
         required: true
         default: "15"
         type: string
       rpd_per_key:
-        description: "Requests/day for each project quota pool (legacy input name)."
+        description: "Requests/day per Gemini project or other provider key."
         required: true
         default: "500"
         type: string
@@ -147,9 +147,6 @@ on:
         default: ""
         type: string
 
-  repository_dispatch:
-    types: [pdf_to_md]
-
 permissions:
   contents: read
 
@@ -159,32 +156,32 @@ jobs:
     timeout-minutes: 350
 
     env:
-      CONVERSION_TYPE: ${{ github.event.inputs.conversion_type || github.event.client_payload.conversion_type || 'pdf_to_md' }}
-      PROVIDER: ${{ github.event.inputs.provider || github.event.client_payload.provider || 'gemini' }}
-      OUTPUT_NAME: ${{ github.event.inputs.output_name || github.event.client_payload.output_name || 'merged' }}
-      SOURCE_URL: ${{ github.event.inputs.source_url || github.event.client_payload.source_url }}
-      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || github.event.client_payload.images_per_request || '1' }}
-      CONCURRENCY: ${{ github.event.inputs.concurrency || github.event.client_payload.concurrency || '50' }}
-      SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || github.event.client_payload.system_prompt || '' }}
-      USER_PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt || '' }}
-      MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || '' }}
-      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || github.event.client_payload.model_fallbacks || '' }}
-      REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || github.event.client_payload.reasoning_effort || '' }}
-      MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || github.event.client_payload.max_output_tokens || '0' }}
-      RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
-      ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
-      HEDGE_AFTER: ${{ (github.event.client_payload.hedge_after != null && format('{0}', github.event.client_payload.hedge_after)) || vars.CONVERTER_HEDGE_AFTER || '60' }}
-      HEDGE_BUDGET: ${{ (github.event.client_payload.hedge_budget != null && format('{0}', github.event.client_payload.hedge_budget)) || vars.CONVERTER_HEDGE_BUDGET || '-1' }}
-      THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
-      DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
-      IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
-      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || github.event.client_payload.jpeg_quality || '95' }}
-      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || github.event.client_payload.verification_passes || '0' }}
-      MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || github.event.client_payload.media_resolution || 'ultra_high' }}
-      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || github.event.client_payload.rpm_per_key || '15' }}
-      RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || github.event.client_payload.rpd_per_key || '500' }}
-      START_PAGE: ${{ github.event.inputs.start_page || github.event.client_payload.start_page || '' }}
-      END_PAGE: ${{ github.event.inputs.end_page || github.event.client_payload.end_page || '' }}
+      CONVERSION_TYPE: ${{ github.event.inputs.conversion_type || 'pdf_to_md' }}
+      PROVIDER: ${{ github.event.inputs.provider || 'gemini' }}
+      OUTPUT_NAME: ${{ github.event.inputs.output_name || 'merged' }}
+      SOURCE_URL: ${{ github.event.inputs.source_url }}
+      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}
+      CONCURRENCY: ${{ github.event.inputs.concurrency || '50' }}
+      SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || '' }}
+      USER_PROMPT: ${{ github.event.inputs.prompt || '' }}
+      MODEL: ${{ github.event.inputs.model || '' }}
+      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}
+      REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || '' }}
+      MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || '0' }}
+      RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || '5' }}
+      ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || '2' }}
+      HEDGE_AFTER: ${{ vars.CONVERTER_HEDGE_AFTER || '60' }}
+      HEDGE_BUDGET: ${{ vars.CONVERTER_HEDGE_BUDGET || '-1' }}
+      THINKING_LEVEL: ${{ github.event.inputs.thinking_level || 'high' }}
+      DPI: ${{ github.event.inputs.dpi || '240' }}
+      IMAGE_FORMAT: ${{ github.event.inputs.image_format || 'png' }}
+      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || '95' }}
+      VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || '0' }}
+      MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
+      RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
+      RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
+      START_PAGE: ${{ github.event.inputs.start_page || '' }}
+      END_PAGE: ${{ github.event.inputs.end_page || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       MODELFLARE_API_KEYS: ${{ secrets.MODELFLARE_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
@@ -246,6 +243,7 @@ jobs:
             --conversion-type "${CONVERSION_TYPE}"
             --provider "${PROVIDER}"
             --source-url "${SOURCE_URL}"
+            --output-name "${OUTPUT_NAME}"
             --images-per-request "${IMAGES_PER_REQUEST}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
@@ -280,10 +278,6 @@ jobs:
             args+=(--end-page "${END_PAGE}")
           fi
           python -u pdf2md.py "${args[@]}"
-
-      - name: Name Markdown result
-        if: always()
-        run: python prepare_result.py
 
       - name: Conversion summary
         if: always()

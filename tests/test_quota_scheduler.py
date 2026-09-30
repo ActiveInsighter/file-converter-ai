@@ -9,12 +9,13 @@ import httpx
 from pdf2md import (
     Chunk,
     ModelUnavailableError,
-    PermanentGeminiError,
-    call_gemini,
-    call_gemini_once,
+    PermanentProviderError,
+    call_model,
+    call_model_once,
     process_chunks,
 )
 from quota_api.scheduler import QuotaScheduler
+from providers import GEMINI
 from quota_client import QuotaPoolExhaustedError, classify_quota_error, retry_after_seconds
 
 
@@ -149,7 +150,7 @@ class DeferredRetryTests(unittest.IsolatedAsyncioTestCase):
         ):
             calls.append(chunk_name)
             if chunk_name == "1":
-                raise PermanentGeminiError("HTTP 400")
+                raise PermanentProviderError("HTTP 400")
             raise QuotaPoolExhaustedError("daily pool exhausted")
 
         chunks = [Chunk(index, index, (), str(index)) for index in range(1, 3)]
@@ -222,16 +223,16 @@ class GeminiErrorClassificationTests(unittest.IsolatedAsyncioTestCase):
         for status in (404, 500, 503, 504):
             with self.subTest(status=status):
                 with self.assertRaises(ModelUnavailableError):
-                    await call_gemini_once(
-                        _StubClient(status), _StubPool(), "m", [], "1", "high"
+                    await call_model_once(
+                        _StubClient(status), _StubPool(), GEMINI, "m", [], "1", "high"
                     )
 
     async def test_client_statuses_are_permanent(self):
         for status in (400, 401, 403):
             with self.subTest(status=status):
-                with self.assertRaises(PermanentGeminiError):
-                    await call_gemini_once(
-                        _StubClient(status), _StubPool(), "m", [], "1", "high"
+                with self.assertRaises(PermanentProviderError):
+                    await call_model_once(
+                        _StubClient(status), _StubPool(), GEMINI, "m", [], "1", "high"
                     )
 
 
@@ -248,8 +249,8 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
             return "transcribed"
 
         with patch("pdf2md.call_model_once", new=fake_once):
-            text = await call_gemini(
-                None, None, "saturated-model", [], "1", "high", ("healthy-model",)
+            text = await call_model(
+                None, None, GEMINI, "saturated-model", [], "1", "high", ("healthy-model",)
             )
 
         self.assertEqual(text, "transcribed")
@@ -257,11 +258,11 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fallback_chain_does_not_swallow_permanent_errors(self):
         async def fake_once(*_args, **_kwargs):
-            raise PermanentGeminiError("HTTP 403")
+            raise PermanentProviderError("HTTP 403")
 
         with patch("pdf2md.call_model_once", new=fake_once):
-            with self.assertRaises(PermanentGeminiError):
-                await call_gemini(None, None, "a", [], "1", "high", ("b",))
+            with self.assertRaises(PermanentProviderError):
+                await call_model(None, None, GEMINI, "a", [], "1", "high", ("b",))
 
     async def test_last_error_is_raised_when_the_whole_chain_fails(self):
         async def fake_once(*_args, **_kwargs):
@@ -269,7 +270,7 @@ class ModelFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pdf2md.call_model_once", new=fake_once):
             with self.assertRaises(ModelUnavailableError):
-                await call_gemini(None, None, "a", [], "1", "high", ("b", "c"))
+                await call_model(None, None, GEMINI, "a", [], "1", "high", ("b", "c"))
 
 
 class ImmediateRetryTests(unittest.IsolatedAsyncioTestCase):

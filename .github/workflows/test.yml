@@ -24,4 +24,4 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.txt -r quota_api/requirements.txt
       - run: python -m unittest discover -s tests
-      - run: python -m py_compile pdf2md.py providers.py prepare_result.py quota_client.py pipeline.py request_policy.py render_stream.py write_summary.py quota_api/*.py
+      - run: python -m py_compile pdf2md.py providers.py artifacts.py quota_client.py pipeline.py request_policy.py render_stream.py write_summary.py quota_api/*.py

@@ -143,7 +143,12 @@ async def schedule_chunks(source, run_one, concurrency, retry_rounds, progress,
                 pass
         if producer_error is not None:
             raise producer_error
-        progress.state = 'failed' if any(r['status'] == 'failed' for r in progress.results.values()) else 'completed'
+        if any(r['status'] == 'failed' for r in progress.results.values()):
+            progress.state = 'failed'
+        elif any(r.get('missing_parts') for r in progress.results.values()):
+            progress.state = 'partial'
+        else:
+            progress.state = 'completed'
         return [progress.results[name] for name in names]
     except BaseException:
         progress.state = 'failed'

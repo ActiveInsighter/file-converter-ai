@@ -2,7 +2,7 @@
 
 The Gemini tests here are deliberately written as *golden* assertions on the
 exact URL, headers and body: the adapter is meant to be a pure extraction of the
-code that used to live inline in ``call_gemini_once``, so any drift is a bug.
+code that used to live inline in ``_call_model_attempt``, so any drift is a bug.
 """
 
 import base64

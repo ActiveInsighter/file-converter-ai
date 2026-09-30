@@ -8,6 +8,16 @@ from request_policy import RequestPolicy
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_recovered_regions_cannot_show_completed_state(self):
+        async def source():
+            yield '1'
+        async def run(chunk, round_number):
+            return {'chunk': chunk, 'status': 'ok', 'missing_parts': ['1-part2']}
+        with tempfile.TemporaryDirectory() as root:
+            progress = Progress(Path(root), total_chunks=1, total_pages=1)
+            await schedule_chunks(source(), run, 1, 1, progress)
+            self.assertEqual(progress.snapshot()['state'], 'partial')
+
     async def test_stream_starts_conversion_before_rendering_finishes(self):
         converted = asyncio.Event()
         async def source():

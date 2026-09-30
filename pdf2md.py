@@ -12,7 +12,8 @@ import random
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import AsyncIterable
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,7 @@ import fitz
 import gdown
 import httpx
 
+from artifacts import prepare_directories, validate_output_name, write_result
 from pipeline import Progress, schedule_chunks
 from request_policy import CURRENT_POLICY, RequestPolicy
 from render_stream import RenderPlan, render_pages
@@ -165,22 +167,6 @@ def download_pdf(source_url: str, destination: Path) -> None:
         with destination.open("wb") as handle:
             for data in response.iter_bytes(chunk_size=1024 * 1024):
                 handle.write(data)
-
-
-def render_pdf(
-    pdf_path: Path,
-    image_dir: Path,
-    dpi: int,
-    jpeg_quality: int,
-    image_format: str,
-    start_page: int | None,
-    end_page: int | None,
-) -> tuple[list[Path], int, int, set[int]]:
-    plan = RenderPlan.from_pdf(pdf_path, start_page, end_page)
-    pages = list(render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
-                             image_format, is_blank_page))
-    return ([path for path, _ in pages], plan.width, plan.total_pdf_pages,
-            {int(path.stem) for path, blank in pages if blank})
 
 
 async def stream_pdf_chunks(pdf_path, image_dir, plan, dpi, jpeg_quality,
@@ -480,16 +466,6 @@ def answer_from_payload(provider: Provider, payload: dict) -> str:
     return _strip_markdown_fences(text)
 
 
-def extract_response_text(payload: dict) -> str:
-    """Gemini-shaped response -> Markdown.
-
-    Kept under its original name because it is the Gemini entry point used by
-    the existing test-suite; multi-provider callers go through
-    :func:`answer_from_payload`.
-    """
-    return answer_from_payload(GEMINI, payload)
-
-
 def _single_dollar_positions(line: str) -> list[int]:
     positions = []
     i = 0
@@ -575,11 +551,6 @@ class PermanentProviderError(RuntimeError):
     into the model's output limit: none of them is fixed by sending the very
     same request again, so this must never enter the backoff rounds.
     """
-
-
-# Kept as an alias because the error predates multi-provider support and both
-# the test-suite and older logs refer to it by this name.
-PermanentGeminiError = PermanentProviderError
 
 
 class ContentBlockedError(RuntimeError):
@@ -816,45 +787,9 @@ async def call_model(
     raise last_error
 
 
-async def call_gemini_once(
-    client: httpx.AsyncClient,
-    key_pool,
-    model: str,
-    parts: list[dict],
-    chunk_name: str,
-    thinking_level: str,
-) -> str:
-    """Gemini entry point kept for callers that predate multi-provider support."""
-    return await call_model_once(
-        client, key_pool, GEMINI, model, parts, chunk_name, thinking_level
-    )
-
-
-async def call_gemini(
-    client: httpx.AsyncClient,
-    key_pool,
-    model: str,
-    parts: list[dict],
-    chunk_name: str,
-    thinking_level: str,
-    fallback_models: tuple[str, ...] = (),
-) -> str:
-    """Gemini entry point kept for callers that predate multi-provider support."""
-    return await call_model(
-        client,
-        key_pool,
-        GEMINI,
-        model,
-        parts,
-        chunk_name,
-        thinking_level,
-        fallback_models,
-    )
-
-
 async def process_chunks(
     chunks: list[Chunk] | AsyncIterable[Chunk],
-    output_dir: Path,
+    state_dir: Path,
     prompt: str,
     model: str,
     concurrency: int,
@@ -876,15 +811,16 @@ async def process_chunks(
     total_pages: int | None = None,
     hedge_after: float = 60.0,
     hedge_budget: int | None = None,
+    publish_progress=None,
 ) -> list[dict]:
     if blocked_page_split not in {"none", "halves"}:
         raise ValueError("blocked_page_split must be none or halves")
 
     provider = provider or resolve_provider(None)
 
-    pages_dir = output_dir / "pages"
-    errors_dir = output_dir / "errors"
-    split_dir = output_dir / "split"
+    pages_dir = state_dir / "pages"
+    errors_dir = state_dir / "errors"
+    split_dir = state_dir / "split"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
@@ -925,7 +861,7 @@ async def process_chunks(
             total_pages = sum(c.end_page - c.start_page + 1 for c in chunks)
         if total_chunks is None or total_pages is None:
             raise ValueError("Streaming input requires total_chunks and total_pages")
-        tracker = Progress(output_dir, total_chunks=total_chunks, total_pages=total_pages)
+        tracker = Progress(state_dir, total_chunks=total_chunks, total_pages=total_pages)
         started_at: dict[str, float] = {}
         stop_metrics = asyncio.Event()
 
@@ -1201,6 +1137,12 @@ async def process_chunks(
                     await asyncio.wait_for(stop_metrics.wait(), timeout=5)
                     return
                 except TimeoutError:
+                    if publish_progress is not None:
+                        try:
+                            publish_progress(list(tracker.results.values()))
+                        except Exception as exc:
+                            print(f"[warn] Cannot refresh partial Markdown: {type(exc).__name__}: {exc}",
+                                  file=sys.stderr, flush=True)
                     counts = performance()
                     snapshot = tracker.write(log=True)
                     remote = {}
@@ -1227,8 +1169,10 @@ async def process_chunks(
         finally:
             CURRENT_POLICY.reset(policy_token)
             stop_metrics.set()
-            await metrics_task
-            await key_pool.close()
+            try:
+                await metrics_task
+            finally:
+                await key_pool.close()
 
         for result in results:
             if result["status"] == "failed":
@@ -1239,7 +1183,7 @@ async def process_chunks(
                 )
         quota_summary = key_pool.usage_summary()
         quota_summary["speculation"] = policy.summary()
-        (output_dir / "quota-usage.json").write_text(
+        (state_dir / "quota-usage.json").write_text(
             json.dumps(quota_summary, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
@@ -1251,23 +1195,6 @@ async def process_chunks(
         return results
 
 
-def merge_markdown(
-    chunks: list[Chunk], pages_dir: Path, destination: Path
-) -> None:
-    # Merge only this conversion's planned chunks in numeric page order.
-    page_files = [pages_dir / f"{chunk.stem}.md"
-                  for chunk in sorted(chunks, key=lambda c: c.start_page)
-                  if (pages_dir / f"{chunk.stem}.md").exists()]
-    blocks = [
-        path.read_text(encoding="utf-8").strip()
-        for path in page_files
-        if path.stat().st_size > 0
-    ]
-    destination.write_text(
-        "\n\n".join(blocks).rstrip() + "\n", encoding="utf-8"
-    )
-
-
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -1277,6 +1204,8 @@ def parser() -> argparse.ArgumentParser:
         help="Conversion handler selected by the generic file-converter workflow.",
     )
     p.add_argument("--source-url", required=True)
+    p.add_argument("--output-name", default="merged",
+                   help="Final Markdown basename without extension; source is reserved.")
     p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument(
@@ -1404,13 +1333,13 @@ def parser() -> argparse.ArgumentParser:
         "--rpm-per-key",
         type=float,
         default=15.0,
-        help="Compatibility name: maximum requests/minute for each project quota pool.",
+        help="Maximum requests/minute per Gemini project or other provider key.",
     )
     p.add_argument(
         "--rpd-per-key",
         type=int,
         default=500,
-        help="Compatibility name: requests/day guard for each project quota pool.",
+        help="Maximum requests/day per Gemini project or other provider key.",
     )
     p.add_argument(
         "--start-page",
@@ -1439,11 +1368,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--hedge-budget", type=int, default=-1,
                    help="Max extra requests per conversion. -1 uses 10%% of chunks (minimum 2); 0 disables.")
     p.add_argument("--work-dir", default="work")
-    p.add_argument("--output-dir", default="output")
+    p.add_argument("--output-dir", default="output",
+                   help="Dedicated generated artifact directory; cleared on each run.")
     return p
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    validate_output_name(args.output_name)
+    source = urlparse(args.source_url)
+    if source.scheme not in {"http", "https"} or not source.hostname:
+        raise ValueError("source_url must be an absolute http(s) URL")
     if not math.isfinite(args.hedge_after) or not 0 <= args.hedge_after <= 600:
         raise ValueError("hedge_after must be between 0 and 600 seconds")
     if not -1 <= args.hedge_budget <= 10000:
@@ -1514,6 +1448,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 async def async_main(args: argparse.Namespace) -> int:
     validate_args(args)
+    work_dir = Path(args.work_dir)
+    output_dir = Path(args.output_dir)
+    state_dir = prepare_directories(work_dir, output_dir)
     provider = resolve_provider(args.provider or os.getenv("FILE_CONVERTER_PROVIDER"))
     model = resolve_model(provider, args.model)
     api_base = (args.api_base or provider.default_base_url).rstrip("/")
@@ -1536,15 +1473,6 @@ async def async_main(args: argparse.Namespace) -> int:
             f"(e.g. {provider.model_example}) or the request will 404.",
             flush=True,
         )
-
-    work_dir = Path(args.work_dir)
-    output_dir = Path(args.output_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # A rerun must not publish a previous document's results after setup failure.
-    for generated in ('results.json', 'progress.json', 'manifest.json',
-                      'quota-usage.json', 'merged.md', 'merged.partial.md'):
-        (output_dir / generated).unlink(missing_ok=True)
 
     source_pdf = work_dir / "source.pdf"
     images_dir = work_dir / "images"
@@ -1608,10 +1536,20 @@ async def async_main(args: argparse.Namespace) -> int:
     print(f"[plan] pages={plan.page_count} chunks={math.ceil(plan.page_count / args.images_per_request)} streaming=true", flush=True)
 
     pipeline_error = None
+    def publish(results):
+        return write_result(
+            output_dir=output_dir, state_dir=state_dir, name=args.output_name,
+            source_url=args.source_url, plan=plan, provider=provider.name, model=model,
+            converted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            chunks=chunks, results=results, pipeline_error=pipeline_error,
+        )
+    # Always keep a compact partial package, including during cancellation.
+    publish([])
+    cancelled = False
     try:
         results = await process_chunks(
             chunk_source(),
-            output_dir,
+            state_dir,
             prompt,
             model,
             args.concurrency,
@@ -1633,99 +1571,32 @@ async def async_main(args: argparse.Namespace) -> int:
             total_pages=plan.page_count,
             hedge_after=args.hedge_after,
             hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
+            publish_progress=publish,
         )
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
+        cancelled = isinstance(exc, asyncio.CancelledError)
         pipeline_error = f"{type(exc).__name__}: {exc}"
         print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
-        result_index = output_dir / "results.json"
+        result_index = state_dir / "results.json"
         results = json.loads(result_index.read_text()) if result_index.exists() else []
-        if not (output_dir / 'progress.json').exists():
-            failed_progress = Progress(output_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
+        if not (state_dir / 'progress.json').exists():
+            failed_progress = Progress(state_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
                                        total_pages=plan.page_count)
             failed_progress.state = 'failed'
             failed_progress.write(log=True)
-    failures = [x for x in results if x.get("status") == "failed"]
-
-    merged_name = "merged.md" if not failures and not pipeline_error else "merged.partial.md"
-    successful_names = {r['chunk'] for r in results if r['status'] in {'ok', 'blank'}}
-    merge_markdown([c for c in chunks if c.stem in successful_names],
-                   output_dir / "pages", output_dir / merged_name)
-
-    manifest = {
-        "conversion_type": args.conversion_type,
-        "source_url": args.source_url,
-        "provider": provider.name,
-        "model": model,
-        "api_base": api_base,
-        "model_fallbacks": list(fallback_models),
-        "reasoning_effort": reasoning_effort,
-        "max_output_tokens": args.max_output_tokens,
-        "prompt": {
-            "system_chars": len(system_prompt),
-            "task_chars": len(user_prompt),
-            "effective_chars": len(prompt),
-            "effective_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "system": system_prompt,
-            "task": user_prompt,
-        },
-        "total_pages": plan.total_pdf_pages,
-        "processed_pages": sum(c.end_page - c.start_page + 1 for c in chunks),
-        "start_page": args.start_page,
-        "end_page": args.end_page,
-        "images_per_request": args.images_per_request,
-        "concurrency": args.concurrency,
-        "streaming": True,
-        "hedge_after": args.hedge_after,
-        "hedge_budget": args.hedge_budget,
-        "thinking_level": args.thinking_level,
-        "dpi": args.dpi,
-        "image_format": args.image_format,
-        "jpeg_quality": args.jpeg_quality,
-        "verification_passes": args.verification_passes,
-        "media_resolution": args.media_resolution,
-        "rpm_per_key": args.rpm_per_key,
-        "rpd_per_key": args.rpd_per_key,
-        "chunks": [
-            {
-                **asdict(chunk),
-                "image_paths": [str(p) for p in chunk.image_paths],
-            }
-            for chunk in chunks
-        ],
-        "results": sorted(results, key=lambda item: item["chunk"]),
-        "failures": len(failures),
-        "pipeline_error": pipeline_error,
-        "completed_chunks": len(results),
-        "planned_chunks": math.ceil(plan.page_count / args.images_per_request),
-        "blocked_page_split": args.blocked_page_split,
-        "blank_pages": sorted(blank_pages),
-        "blank_chunks": sorted(
-            item["chunk"] for item in results if item.get("status") == "blank"
-        ),
-        "split_recovered": sorted(
-            item["chunk"] for item in results if item.get("recovered_by") == "page_split"
-        ),
-        "partial_recovery": {
-            item["chunk"]: item["missing_parts"]
-            for item in results
-            if item.get("missing_parts")
-        },
-        "merged_file": merged_name,
-    }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    if failures or pipeline_error:
-        print(
-            f"[result] {len(failures)} chunk(s) failed; "
-            f"partial output: {merged_name}",
-            file=sys.stderr,
-        )
+    try:
+        files = publish(results)
+    except Exception as exc:
+        if cancelled:
+            print(f"[warn] Cannot save cancelled result: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            raise asyncio.CancelledError from exc
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    if files.partial:
+        print(f"[result] partial: {files.markdown}; see source.md for missing pages", file=sys.stderr, flush=True)
         return 2
-
-    print(f"[result] success: {output_dir / 'merged.md'}", flush=True)
+    print(f"[result] success: {files.markdown}", flush=True)
     return 0
 
 

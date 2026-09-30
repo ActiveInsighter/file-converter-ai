@@ -17,6 +17,8 @@ venv/
 dist/
 build/
 coverage/
+work/
+output/
 *.pdf
 
 # Local configuration
