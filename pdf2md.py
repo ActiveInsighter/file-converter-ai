@@ -645,7 +645,7 @@ async def call_model_once(
         )
     if policy is None:
         return await attempt()
-    return await policy.run(attempt, chunk_name)
+    return await policy.run(attempt, chunk_name, max_duration=provider.request_timeout_seconds)
 
 
 async def finish_report(report) -> None:
@@ -730,6 +730,9 @@ async def _call_model_attempt(
             raise RuntimeError(
                 f"{provider.label} returned unusable Markdown: {exc}"
             ) from exc
+        policy = CURRENT_POLICY.get()
+        if policy is not None:
+            policy.mark_validated()
         await finish_report(key_pool.mark_success(key_index, lease_id))
         return text
 

@@ -22,6 +22,22 @@ Live progress is currently exposed through converter logs and progress.json; the
 
 ## Validation
 
-138 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
+140 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
 
-GitHub branch deployment and real-document measurements will be appended after completion.
+## Branch and service deployment
+
+- Branch: `codex/streaming-tail-recovery-20260930`.
+- GitHub CI at `7fbdab2`: [36667182248](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36667182248), success. The Actions environment runs the complete suite with a real Valkey service.
+- Original page 51 smoke: [36667208141](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36667208141), success; page processing 21.12 seconds, progress 100%, no failures. The converter step took 28 seconds including source download.
+- The shared quota service's Lua cancellation report update was deployed while `activeLeases=0`. The original file was backed up under `/opt/file-converter-quota-api/backups/scheduler.lua-20260930-tail`. `/healthz` passed and daily counters were identical before and after the restart. Other quota limits and service settings were unchanged.
+- Manual workflow inputs stay within GitHub's 25-input limit. Advanced hedge controls use CLI arguments, repository-dispatch payload, or repository Variables. Existing manual/API input names are preserved.
+
+## First complete comparison and follow-up correction
+
+The first full 196-page branch test [36667295224](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36667295224) succeeded with all 196 pages, no failures, no missing split regions, and a 100% progress snapshot. The converter step took 4m31s versus 6m59s in the original run (about 35% shorter). The entire job took 4m46s. 205 requests were charged versus 200 originally; two pages needed complete split recovery. HTTP p50 was 12.98s, p95 25.05s, and 429/503 counts were zero.
+
+The first HTTP request began at 04:05:38.832 UTC and the last page was rendered at 04:07:31.885, confirming overlap. Rendering took about 114 seconds in this run, versus 65 seconds originally; shared CPU and PNG/Base64 work also affect these measurements. This is one observed run, not a guaranteed speedup.
+
+The run exposed a further worst-case bug: page 63's original and two speculative copies all timed out. Since the copies started a minute later, the race waited roughly 180 seconds before its next retry. The page eventually succeeded in the same model with elapsed time 243.89 seconds. `RequestPolicy` now applies the primary request's total deadline to the entire race, cancels any still-pending copies at that deadline, and retries without waiting for another full timeout. A regression fixture checks all three blocked attempts are cancelled at the shared deadline. Cleanup remains separately bounded. A response validated before the group deadline is preserved even if its bounded quota-success report finishes afterwards; refusals and validation errors are not eligible for this grace.
+
+A second full real-document run will verify the final shared-deadline revision.

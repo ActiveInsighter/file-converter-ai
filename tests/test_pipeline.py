@@ -59,6 +59,41 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HedgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_response_is_kept_when_reporting_crosses_http_deadline(self):
+        calls = []
+        async def attempt(started):
+            index = len(calls)
+            calls.append(index)
+            started()
+            if index:
+                await asyncio.Event().wait()
+            await asyncio.sleep(0.03)
+            policy.mark_validated()
+            # The real converter separately bounds report cleanup to 8 seconds.
+            await asyncio.sleep(0.05)
+            return 'valid before deadline'
+        policy = RequestPolicy(concurrency=3, hedge_after=0.02, hedge_budget=2)
+        result = await asyncio.wait_for(policy.run(attempt, '051', max_duration=0.06), 0.3)
+        self.assertEqual(result, 'valid before deadline')
+
+    async def test_slow_duplicates_cannot_extend_primary_total_deadline(self):
+        calls = []
+        cancelled = []
+        async def attempt(started):
+            index = len(calls)
+            calls.append(index)
+            started()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(index)
+                raise
+        policy = RequestPolicy(concurrency=3, hedge_after=0.02, hedge_budget=2)
+        with self.assertRaisesRegex(RuntimeError, 'deadline'):
+            await asyncio.wait_for(policy.run(attempt, '051', max_duration=0.06), 0.3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sorted(cancelled), [0, 1, 2])
+
     async def test_slow_request_uses_first_valid_duplicate_and_cancels_losers(self):
         calls = []
         cancelled = []
