@@ -288,6 +288,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: file-converter-pdf-to-md-${{ github.run_id }}
-          path: output/
+          path: output/*.md
           if-no-files-found: warn
           retention-days: 3

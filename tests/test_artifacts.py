@@ -2,12 +2,25 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 from artifacts import prepare_directories, validate_output_name, write_result
 from pdf2md import Chunk
 from render_stream import RenderPlan
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_failed_write_does_not_leave_temporary_files_in_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepare_directories(root / 'work', root / 'output')
+            actual_write = Path.write_text
+            def disk_failure(path, text, **kwargs):
+                actual_write(path, text, **kwargs)
+                raise OSError('Disk failure after partial write')
+            with patch('artifacts.Path.write_text', disk_failure), self.assertRaises(OSError):
+                self.write(root, [], [])
+            self.assertEqual(list((root / 'output').iterdir()), [])
+
     def write(self, root, chunks, results, **overrides):
         options = dict(output_dir=root / 'output', state_dir=root / 'work/conversion',
                        name='数学笔记', source_url='https://example.test/book.pdf',

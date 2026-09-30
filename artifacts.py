@@ -113,8 +113,11 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
     for path, content in [(source_path, source),
                           (destination, source + '\n---\n\n' + '\n\n'.join(blocks).rstrip() + '\n')]:
         temporary = path.with_suffix(path.suffix + '.tmp')
-        temporary.write_text(content, encoding='utf-8')
-        temporary.replace(path)
+        try:
+            temporary.write_text(content, encoding='utf-8')
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
     other = output_dir / (name + ('.md' if partial else '.partial.md'))
     other.unlink(missing_ok=True)
     return ResultFiles(destination, partial)
