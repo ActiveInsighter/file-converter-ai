@@ -22,7 +22,7 @@ Live progress is currently exposed through converter logs and progress.json; the
 
 ## Validation
 
-140 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
+142 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
 
 ## Branch and service deployment
 
@@ -40,4 +40,4 @@ The first HTTP request began at 04:05:38.832 UTC and the last page was rendered 
 
 The run exposed a further worst-case bug: page 63's original and two speculative copies all timed out. Since the copies started a minute later, the race waited roughly 180 seconds before its next retry. The page eventually succeeded in the same model with elapsed time 243.89 seconds. `RequestPolicy` now applies the primary request's total deadline to the entire race, cancels any still-pending copies at that deadline, and retries without waiting for another full timeout. A regression fixture checks all three blocked attempts are cancelled at the shared deadline. Cleanup remains separately bounded. A response validated before the group deadline is preserved even if its bounded quota-success report finishes afterwards; refusals and validation errors are not eligible for this grace.
 
-A second full real-document run will verify the final shared-deadline revision.
+A second full real-document run [36668645372](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36668645372), at `2bdbe50`, verifies the shared-deadline revision. Subsequent regressions additionally check that unfinished HTTP is cancelled before waiting for a validated response's report, and a refusal/permanent error keeps its classification when other copies remain stalled.

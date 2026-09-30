@@ -59,6 +59,43 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HedgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deadline_cancels_pending_http_before_waiting_for_valid_report(self):
+        cancelled = asyncio.Event()
+        calls = []
+        async def attempt(started):
+            index = len(calls)
+            calls.append(index)
+            started()
+            if index:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            await asyncio.sleep(0.03)
+            policy.mark_validated()
+            await asyncio.wait_for(cancelled.wait(), 0.3)
+            return 'valid'
+        policy = RequestPolicy(concurrency=3, hedge_after=0.02, hedge_budget=2)
+        result = await asyncio.wait_for(policy.run(attempt, '051', max_duration=0.06), 0.5)
+        self.assertEqual(result, 'valid')
+
+    async def test_deadline_preserves_nonretryable_refusal_if_all_copies_stall(self):
+        from pdf2md import ContentBlockedError, is_retryable_error
+        calls = []
+        async def attempt(started):
+            index = len(calls)
+            calls.append(index)
+            started()
+            if index:
+                await asyncio.Event().wait()
+            await asyncio.sleep(0.03)
+            raise ContentBlockedError('RECITATION')
+        policy = RequestPolicy(concurrency=3, hedge_after=0.02, hedge_budget=2)
+        with self.assertRaises(ContentBlockedError) as caught:
+            await policy.run(attempt, '051', max_duration=0.06)
+        self.assertFalse(is_retryable_error(caught.exception))
+
     async def test_valid_response_is_kept_when_reporting_crosses_http_deadline(self):
         calls = []
         async def attempt(started):

@@ -60,6 +60,7 @@ class RequestPolicy:
         primary = asyncio.create_task(send(0))
         tasks.append(primary)
         start_waiter = asyncio.create_task(started.wait())
+        first_error = None
         def winner(task, result):
             if task is not primary:
                 self.hedge_wins += 1
@@ -70,9 +71,12 @@ class RequestPolicy:
             # The converter marks validity before reporting and separately
             # bounds that cleanup. Do not throw away text received in time.
             for task in tasks:
+                if task not in self.validated and not task.done():
+                    task.cancel()
+            for task in tasks:
                 if task in self.validated:
                     return winner(task, await task)
-            raise RuntimeError(f'{name}: request group deadline exceeded ({max_duration:g}s)')
+            raise first_error or RuntimeError(f'{name}: request group deadline exceeded ({max_duration:g}s)')
         try:
             await asyncio.wait([primary, start_waiter], return_when=asyncio.FIRST_COMPLETED)
             if primary.done():
@@ -94,7 +98,6 @@ class RequestPolicy:
             print(f'[hedge] {name} slow_after={delay:.1f}s copies={copies} budget={self.hedges}/{self.budget}', flush=True)
             tasks.extend(asyncio.create_task(send(i + 1)) for i in range(copies))
             pending = set(tasks)
-            first_error = None
             while pending:
                 remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
                 done, pending = await asyncio.wait(pending, timeout=remaining,
