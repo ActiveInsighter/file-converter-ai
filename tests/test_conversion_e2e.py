@@ -64,7 +64,7 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
                     with lock:
                         counts[page] = counts.get(page, 0) + 1
                         attempt = counts[page]
-                    time.sleep(0.3 if page == 2 and attempt == 1 else 0.015)
+                    time.sleep(1.5 if page == 2 and attempt == 1 else 0.015)
                     data = json.dumps({'choices': [{'finish_reason': 'stop',
                                        'message': {'content': f'# Page {page}\n\nSource text.'}}]}).encode()
                     self.send_response(200)
@@ -83,7 +83,7 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
                 '--provider', 'modelflare', '--model', 'test-vision', '--api-base', base + '/v1',
                 '--source-url', base + '/source.pdf', '--work-dir', str(root / 'work'),
                 '--output-dir', str(root / 'output'), '--dpi', '72', '--concurrency', '4',
-                '--rpm-per-key', '6000', '--hedge-after', '0.05', '--hedge-budget', '2'])
+                '--rpm-per-key', '6000', '--hedge-after', '0.3', '--hedge-budget', '2'])
             try:
                 with patch.dict(os.environ, {'MODELFLARE_API_KEYS': 'fake-1\nfake-2\nfake-3\nfake-4'}):
                     result = await asyncio.wait_for(async_main(args), 5)
