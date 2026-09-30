@@ -22,7 +22,7 @@ Live progress is currently exposed through converter logs and progress.json; the
 
 ## Validation
 
-142 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
+144 local tests passed, including all 14 Valkey integration tests against isolated test keys. Regression tests were observed failing before fixes for total HTTP deadlines, cancelled HTTP/report/lease cleanup, same-ID replay, stale same-name pages and stale output indexes after setup failure. A real PDF/local HTTP gateway end-to-end fixture verifies slow-page speculation, first-valid selection, cancellation, quota charging, blank-page skipping, manifest and ordered Markdown output.
 
 ## Branch and service deployment
 
@@ -41,3 +41,16 @@ The first HTTP request began at 04:05:38.832 UTC and the last page was rendered 
 The run exposed a further worst-case bug: page 63's original and two speculative copies all timed out. Since the copies started a minute later, the race waited roughly 180 seconds before its next retry. The page eventually succeeded in the same model with elapsed time 243.89 seconds. `RequestPolicy` now applies the primary request's total deadline to the entire race, cancels any still-pending copies at that deadline, and retries without waiting for another full timeout. A regression fixture checks all three blocked attempts are cancelled at the shared deadline. Cleanup remains separately bounded. A response validated before the group deadline is preserved even if its bounded quota-success report finishes afterwards; refusals and validation errors are not eligible for this grace.
 
 A second full real-document run [36668645372](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36668645372), at `2bdbe50`, verifies the shared-deadline revision. Subsequent regressions additionally check that unfinished HTTP is cancelled before waiting for a validated response's report, and a refusal/permanent error keeps its classification when other copies remain stalled.
+
+
+## Shared-deadline real-document result
+
+Run [36668645372](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36668645372), at `2bdbe50`, succeeded with 196/196 page blocks, zero failures, zero missing split regions, and 100% progress. The converter step took **3m21s** versus **6m59s** in the reported baseline (about **52% shorter**). The entire job took 3m29s versus 7m11s. The pipeline snapshot measured 191.75 seconds, excluding source download and setup.
+
+Six extra copies were launched within the 20-copy budget. One duplicate won (page 43); the remaining race outcomes used the original valid response. Six cancelled requests were reported and their charged quota was preserved. Total charged requests were **206 versus 200** originally, an increase of **3%**; 200 HTTP responses completed successfully, including complete split recovery of pages 10 and 20. No 429/503 or other HTTP errors occurred. HTTP p50 was 12.72s and p95 26.39s. Page 51 finished in 38.69s from render-ready time; page 63 finished in 41.02s.
+
+The first HTTP request started at 04:24:07.426 UTC, while the last page was rendered at 04:26:03.483. All individual page Markdown files and the merged file, manifest, progress and quota artifacts were downloaded and verified. These are observed runs with a nondeterministic upstream, not a guaranteed runtime or transcription-quality benchmark.
+
+Two subsequent cleanup/classification refinements were covered by regression tests: cancel unfinished HTTP immediately at the group deadline while retaining a valid response's bounded success report; preserve refusal classification; do not interrupt already-running lease cancellation cleanup with a second cancellation. The final commit's real-page smoke and CI are recorded below.
+
+A real request/quota-client fixture additionally demonstrates delayed, already-charged hedge lease responses across the group deadline: valid Markdown is preserved; all three charged requests are counted; two cancellations are reported; no server leases remain outstanding. The pre-fix policy left two charged leases orphaned. Cancellation is now requested once per task so existing cleanup can drain safely.

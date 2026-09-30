@@ -59,6 +59,29 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HedgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_losing_copy_lease_cleanup_is_not_cancelled_twice(self):
+        calls = []
+        cleaned = []
+        async def attempt(started):
+            index = len(calls)
+            calls.append(index)
+            started()
+            if index:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # Model draining a granted lease's delayed response.
+                    await asyncio.sleep(0.06)
+                    cleaned.append(index)
+                    raise
+            await asyncio.sleep(0.03)
+            policy.mark_validated()
+            await asyncio.sleep(0.05)
+            return 'valid'
+        policy = RequestPolicy(concurrency=3, hedge_after=0.02, hedge_budget=2)
+        self.assertEqual(await policy.run(attempt, '051', max_duration=0.06), 'valid')
+        self.assertEqual(sorted(cleaned), [1, 2])
+
     async def test_deadline_cancels_pending_http_before_waiting_for_valid_report(self):
         cancelled = asyncio.Event()
         calls = []

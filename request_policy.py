@@ -71,7 +71,7 @@ class RequestPolicy:
             # The converter marks validity before reporting and separately
             # bounds that cleanup. Do not throw away text received in time.
             for task in tasks:
-                if task not in self.validated and not task.done():
+                if task not in self.validated and not task.done() and not task.cancelling():
                     task.cancel()
             for task in tasks:
                 if task in self.validated:
@@ -116,7 +116,7 @@ class RequestPolicy:
         finally:
             start_waiter.cancel()
             for task in tasks:
-                if not task.done():
+                if not task.done() and not task.cancelling():
                     task.cancel()
             await asyncio.gather(start_waiter, *tasks, return_exceptions=True)
             self.validated.difference_update(tasks)

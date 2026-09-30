@@ -294,6 +294,8 @@ Actions 需要以下仓库设置：
 
 失败页面独立调度重试，不再等待全部页面首轮结束。`attempts_per_page` 保留即时尝试次数，`retry_rounds` 保留每页最大轮数；轮间退避由 5 秒起步、最多 90 秒（含随机抖动），等待重试不占页面 worker。新页面优先取得空闲 worker。429 按 error details 分类，尊重服务端 `Retry-After` / `RetryInfo`；每日额度错误才停用该 Project 至 Pacific Time 次日。`/v1/lease` 的同一 `requestId` 在响应超时后可重放，`/v1/report` 重复提交不会重复计数。
 
+[196 页重构前后实测与部署记录](docs/streaming-tail-recovery-2026-09-30.md)（包括真实补发、请求消耗和时间对比）。
+
 ### 慢请求补发、超时与进度
 
 本地 CLI 的 `--hedge-after` / `--hedge-budget`，以及 `repository_dispatch.client_payload` 中的 `hedge_after` / `hedge_budget` 可按任务调整补发。手动 Actions 保留原有 25 个输入（GitHub 上限）；其高级默认值可用仓库 Variables `CONVERTER_HEDGE_AFTER` / `CONVERTER_HEDGE_BUDGET` 调整。分别默认 `60` / `-1`，任一设为 `0` 即禁用补发。
