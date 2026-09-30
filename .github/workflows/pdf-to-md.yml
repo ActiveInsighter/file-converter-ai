@@ -73,7 +73,7 @@ on:
         default: "0"
         type: string
       retry_rounds:
-        description: "Total passes over failed pages; each pass waits about twice as long as the previous one."
+        description: "Maximum passes per failed page; retries are scheduled independently."
         required: false
         default: "5"
         type: string
@@ -81,6 +81,16 @@ on:
         description: "Immediate retries per page inside a round before the page is deferred to the next round."
         required: false
         default: "2"
+        type: string
+      hedge_after:
+        description: "Minimum HTTP seconds before two speculative copies; 0 disables"
+        required: false
+        default: "60"
+        type: string
+      hedge_budget:
+        description: "Maximum extra requests per run; -1 uses 10% of chunks (minimum 2), 0 disables"
+        required: false
+        default: "-1"
         type: string
       thinking_level:
         description: "Gemini thinking level"
@@ -173,6 +183,8 @@ jobs:
       MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || github.event.client_payload.max_output_tokens || '0' }}
       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
       ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
+      HEDGE_AFTER: ${{ github.event.inputs.hedge_after || (github.event.client_payload.hedge_after != null && format('{0}', github.event.client_payload.hedge_after)) || '60' }}
+      HEDGE_BUDGET: ${{ github.event.inputs.hedge_budget || (github.event.client_payload.hedge_budget != null && format('{0}', github.event.client_payload.hedge_budget)) || '-1' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}
@@ -252,6 +264,8 @@ jobs:
             --max-output-tokens "${MAX_OUTPUT_TOKENS}"
             --retry-rounds "${RETRY_ROUNDS}"
             --attempts-per-page "${ATTEMPTS_PER_PAGE}"
+            --hedge-after "${HEDGE_AFTER}"
+            --hedge-budget "${HEDGE_BUDGET}"
             --thinking-level "${THINKING_LEVEL}"
             --dpi "${DPI}"
             --image-format "${IMAGE_FORMAT}"
@@ -275,11 +289,15 @@ jobs:
           if [[ -n "${END_PAGE}" ]]; then
             args+=(--end-page "${END_PAGE}")
           fi
-          python pdf2md.py "${args[@]}"
+          python -u pdf2md.py "${args[@]}"
 
       - name: Name Markdown result
         if: always()
         run: python prepare_result.py
+
+      - name: Conversion summary
+        if: always()
+        run: python write_summary.py
 
       - name: Upload Markdown result
         if: always()

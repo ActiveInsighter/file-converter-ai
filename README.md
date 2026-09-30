@@ -7,7 +7,7 @@
 - 支持普通 HTTP(S) PDF 下载地址。
 - 支持 Google Drive 公开分享链接，例如：
   `https://drive.google.com/file/d/FILE_ID/view?usp=drivesdk`
-- PDF 按页渲染为 PNG（默认无损）；也可显式选择 JPEG。
+- PDF 按页渲染为 PNG（默认无损）；也可显式选择 JPEG。每个页面块渲染后立即入队发送，解析与 AI 请求重叠执行。
 - `images_per_request` 控制一次请求发送多少张连续页面图片。
 - `concurrency` 控制同时进行的模型请求数。
 - 支持自定义提示词、模型、DPI 和 JPEG 质量。
@@ -77,7 +77,9 @@ python pdf2md.py \
 | `provider` | 模型提供方：`gemini` / `modelflare` | `gemini` |
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
-| `concurrency` | 最大模型并发请求数 | `50` |
+| `concurrency` | 本任务最大模型并发请求数（含补发副本） | `50` |
+| `hedge_after` | 慢 HTTP 请求补发的最短等待秒数，0 禁用 | `60` |
+| `hedge_budget` | 本任务额外补发请求预算，0 禁用；-1 自动取页块数 10%，至少 2 个 | `-1` |
 | `system_prompt` | 系统提示词（来自已保存的转换配置，所有任务共用） | 空 |
 | `prompt` | 本次转换的专有提示词，追加在 `system_prompt` 之后 | 空 |
 | `model` | 模型 ID；Modelflare 必填 | Gemini 默认 `gemini-3.5-flash-lite` |
@@ -292,7 +294,24 @@ Actions 需要以下仓库设置：
 
 全局调度最多允许 24 个 Gemini 请求在途，持续启动速率 2 req/s，空闲时突发上限 8 个。近 20 个结果中 503 占比达到 20%（至少 5 个结果）时，自动将上限降至 12、再降至 8，并加入随机全局冷却；持续成功后恢复。lease 超时 180 秒，Gemini HTTP 超时 120 秒。Valkey Sorted Set 维护每个 Project 的下次可用时间，正常发放 lease 时无需扫描 66 个 Project。
 
-每页每轮只请求一次：先完成全部页面首轮，再分两轮重试可恢复的失败页。429 按 error details 分类，尊重 `Retry-After` / `RetryInfo`；只有明确的每日请求额度错误才停用该 Project 至 Pacific Time 次日。API 的 `/v1/lease` 支持 `requestId`，请求超时后以相同 ID 重试会返回原 lease；`/v1/report` 重复提交不会重复计数。`/v1/status` 提供 Project 与全局状态；日志每 15 秒汇总进度、429/503 和 p50/p95 延迟。
+失败页面独立调度重试，不再等待全部页面首轮结束。`attempts_per_page` 保留即时尝试次数，`retry_rounds` 保留每页最大轮数；轮间退避由 5 秒起步、最多 90 秒（含随机抖动），等待重试不占页面 worker。新页面优先取得空闲 worker。429 按 error details 分类，尊重服务端 `Retry-After` / `RetryInfo`；每日额度错误才停用该 Project 至 Pacific Time 次日。`/v1/lease` 的同一 `requestId` 在响应超时后可重放，`/v1/report` 重复提交不会重复计数。
+
+### 慢请求补发、超时与进度
+
+当请求真正取得配额并开始 HTTP 后，等待超过 `max(hedge_after, 2 × 近期成功请求 P95)`，且近期 429/503 占比低于 20%，会尝试增加最多两个相同请求。原请求继续执行；第一个通过响应解析及 Markdown 校验的结果胜出，其余请求取消并释放租约。配置的并发上限包含所有副本，副本仍通过全局配额 API，并且会消耗真实 RPM/RPD；取消不会返还额度。并发已满时，副本也需要等待空闲容量。全任务默认补发预算约为页块数的 10%（小任务至少 2 个）；可设置 `hedge_budget=0` 禁用，或设固定预算。
+
+HTTP 除原来的连接/读取超时外，新增总时间上限：Gemini 为 120 秒，Modelflare 为 300 秒。成功的文本不会因为配额上报临时失败而被丢弃；上报清理最多等待 8 秒，服务不可达时由租约到期兜底。取消的副本向服务上报 499，保留已消耗的额度，但不参与 503 降速或成功恢复统计。
+
+日志每 5 秒显示完成百分比、渲染进度、活动页块、待重试页块、最终失败数、预计剩余时间与补发命中数。`[request]` 标记真实 HTTP 开始；`[hedge]` / `[hedge-win]` 标记慢请求恢复；错误日志包含具体原因。
+
+- `output/progress.json`：原子更新的实时进度，包含当前处理的页码及耗时；ETA 是基于已完成吞吐的估计。
+- `output/results.json`：每页完成后更新的结果索引。
+- `output/quota-usage.json`：HTTP 延迟、真实请求消耗、取消数和补发预算/命中。
+- GitHub Actions 完成后在 Summary 显示结果概览并上传这些文件。
+
+进度展示当前覆盖转换器日志、进度文件及 Actions Summary；AnyWorkflow Remote 的网页仍使用原有任务状态接口，尚未消费逐页实时进度。
+
+渲染采用单独线程顺序访问同一个 PyMuPDF 文档，队列上限是页面 worker 数的两倍；仅在请求槽内构造 Base64，避免整个长文档载荷同时驻留内存。已成功页面立即保存；渲染失败时保留已完成页、部分合并结果和 `manifest.json` 中的 `pipeline_error`。合并只使用本次成功页面，避免复用输出目录时混入旧任务同名页。
 
 `deploy/valkey/docker-compose.yml` 使用官方 Valkey 9.1.2 镜像、AOF `everysec` 与 RDB 快照，6379 仅映射到 `127.0.0.1`。没有 Docker 的 Ubuntu 主机也可使用发行版 `valkey-server` 包，启用相同的持久化配置。`deploy/quota-api.service` 将 API 绑定到本机 `127.0.0.1:8788`；由现有 HTTPS 入口反向代理，不向公网开放 Valkey 或 Uvicorn 端口。具体部署步骤见 `deploy/README.md`。
 
