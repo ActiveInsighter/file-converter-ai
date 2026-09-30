@@ -1545,7 +1545,6 @@ async def async_main(args: argparse.Namespace) -> int:
         )
     # Always keep a compact partial package, including during cancellation.
     publish([])
-    cancelled = False
     try:
         results = await process_chunks(
             chunk_source(),
@@ -1574,25 +1573,27 @@ async def async_main(args: argparse.Namespace) -> int:
             publish_progress=publish,
         )
     except (Exception, asyncio.CancelledError) as exc:
-        cancelled = isinstance(exc, asyncio.CancelledError)
+        cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
         pipeline_error = f"{type(exc).__name__}: {exc}"
         print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
-        result_index = state_dir / "results.json"
-        results = json.loads(result_index.read_text()) if result_index.exists() else []
-        if not (state_dir / 'progress.json').exists():
-            failed_progress = Progress(state_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
-                                       total_pages=plan.page_count)
-            failed_progress.state = 'failed'
-            failed_progress.write(log=True)
-    try:
+        try:
+            result_index = state_dir / "results.json"
+            results = json.loads(result_index.read_text()) if result_index.exists() else []
+            if not (state_dir / 'progress.json').exists():
+                failed_progress = Progress(state_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
+                                           total_pages=plan.page_count)
+                failed_progress.state = 'failed'
+                failed_progress.write(log=True)
+            files = publish(results)
+        except Exception as save_error:
+            print(f"[warn] Cannot save partial result: {type(save_error).__name__}: {save_error}",
+                  file=sys.stderr, flush=True)
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+    else:
         files = publish(results)
-    except Exception as exc:
-        if cancelled:
-            print(f"[warn] Cannot save cancelled result: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-            raise asyncio.CancelledError from exc
-        raise
-    if cancelled:
-        raise asyncio.CancelledError
     if files.partial:
         print(f"[result] partial: {files.markdown}; see source.md for missing pages", file=sys.stderr, flush=True)
         return 2

@@ -17,6 +17,47 @@ from pdf2md import async_main, parser
 
 
 class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_survives_diagnostic_write_failure_during_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            setup_started = asyncio.Event()
+
+            def download(_url, destination):
+                with fitz.open() as document:
+                    document.new_page().insert_text((72, 72), 'Source page')
+                    document.save(destination)
+
+            async def blocked_setup(*args, **kwargs):
+                setup_started.set()
+                await asyncio.Future()
+
+            args = parser().parse_args([
+                '--source-url', 'https://example.test/source.pdf',
+                '--output-name', 'notes', '--output-dir', str(root / 'output'),
+                '--work-dir', str(root / 'work'),
+            ])
+            with patch.dict(os.environ, {'GEMINI_API_KEYS': 'fake'}), \
+                    patch('pdf2md.download_pdf', download), \
+                    patch('pdf2md.process_chunks', blocked_setup), \
+                    patch('pdf2md.Progress.write', side_effect=OSError('diagnostic disk full')):
+                task = asyncio.create_task(async_main(args))
+                try:
+                    await asyncio.wait_for(setup_started.wait(), 2)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            # The already published package remains available even when the
+            # cancelled setup cannot write its private progress diagnostics.
+            output = root / 'output'
+            self.assertEqual({p.name for p in output.iterdir()}, {'source.md', 'notes.partial.md'})
+            source = (output / 'source.md').read_text()
+            self.assertIn('未完成页码：1', source)
+            self.assertTrue((output / 'notes.partial.md').read_text().startswith(source + '\n---\n\n'))
+
     async def test_progress_publication_failure_cannot_override_cancellation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
