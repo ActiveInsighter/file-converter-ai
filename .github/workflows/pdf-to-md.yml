@@ -82,16 +82,6 @@ on:
         required: false
         default: "2"
         type: string
-      hedge_after:
-        description: "Minimum HTTP seconds before two speculative copies; 0 disables"
-        required: false
-        default: "60"
-        type: string
-      hedge_budget:
-        description: "Maximum extra requests per run; -1 uses 10% of chunks (minimum 2), 0 disables"
-        required: false
-        default: "-1"
-        type: string
       thinking_level:
         description: "Gemini thinking level"
         required: true
@@ -183,8 +173,8 @@ jobs:
       MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || github.event.client_payload.max_output_tokens || '0' }}
       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || github.event.client_payload.retry_rounds || '5' }}
       ATTEMPTS_PER_PAGE: ${{ github.event.inputs.attempts_per_page || github.event.client_payload.attempts_per_page || '2' }}
-      HEDGE_AFTER: ${{ github.event.inputs.hedge_after || (github.event.client_payload.hedge_after != null && format('{0}', github.event.client_payload.hedge_after)) || '60' }}
-      HEDGE_BUDGET: ${{ github.event.inputs.hedge_budget || (github.event.client_payload.hedge_budget != null && format('{0}', github.event.client_payload.hedge_budget)) || '-1' }}
+      HEDGE_AFTER: ${{ (github.event.client_payload.hedge_after != null && format('{0}', github.event.client_payload.hedge_after)) || vars.CONVERTER_HEDGE_AFTER || '60' }}
+      HEDGE_BUDGET: ${{ (github.event.client_payload.hedge_budget != null && format('{0}', github.event.client_payload.hedge_budget)) || vars.CONVERTER_HEDGE_BUDGET || '-1' }}
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || github.event.client_payload.thinking_level || 'high' }}
       DPI: ${{ github.event.inputs.dpi || github.event.client_payload.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || github.event.client_payload.image_format || 'png' }}

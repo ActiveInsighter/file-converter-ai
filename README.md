@@ -78,8 +78,6 @@ python pdf2md.py \
 | `source_url` | PDF 下载地址，支持 Google Drive 分享链接 | 必填 |
 | `images_per_request` | 每次请求发送几张连续页面图片 | `1` |
 | `concurrency` | 本任务最大模型并发请求数（含补发副本） | `50` |
-| `hedge_after` | 慢 HTTP 请求补发的最短等待秒数，0 禁用 | `60` |
-| `hedge_budget` | 本任务额外补发请求预算，0 禁用；-1 自动取页块数 10%，至少 2 个 | `-1` |
 | `system_prompt` | 系统提示词（来自已保存的转换配置，所有任务共用） | 空 |
 | `prompt` | 本次转换的专有提示词，追加在 `system_prompt` 之后 | 空 |
 | `model` | 模型 ID；Modelflare 必填 | Gemini 默认 `gemini-3.5-flash-lite` |
@@ -297,6 +295,8 @@ Actions 需要以下仓库设置：
 失败页面独立调度重试，不再等待全部页面首轮结束。`attempts_per_page` 保留即时尝试次数，`retry_rounds` 保留每页最大轮数；轮间退避由 5 秒起步、最多 90 秒（含随机抖动），等待重试不占页面 worker。新页面优先取得空闲 worker。429 按 error details 分类，尊重服务端 `Retry-After` / `RetryInfo`；每日额度错误才停用该 Project 至 Pacific Time 次日。`/v1/lease` 的同一 `requestId` 在响应超时后可重放，`/v1/report` 重复提交不会重复计数。
 
 ### 慢请求补发、超时与进度
+
+本地 CLI 的 `--hedge-after` / `--hedge-budget`，以及 `repository_dispatch.client_payload` 中的 `hedge_after` / `hedge_budget` 可按任务调整补发。手动 Actions 保留原有 25 个输入（GitHub 上限）；其高级默认值可用仓库 Variables `CONVERTER_HEDGE_AFTER` / `CONVERTER_HEDGE_BUDGET` 调整。分别默认 `60` / `-1`，任一设为 `0` 即禁用补发。
 
 当请求真正取得配额并开始 HTTP 后，等待超过 `max(hedge_after, 2 × 近期成功请求 P95)`，且近期 429/503 占比低于 20%，会尝试增加最多两个相同请求。原请求继续执行；第一个通过响应解析及 Markdown 校验的结果胜出，其余请求取消并释放租约。配置的并发上限包含所有副本，副本仍通过全局配额 API，并且会消耗真实 RPM/RPD；取消不会返还额度。并发已满时，副本也需要等待空闲容量。全任务默认补发预算约为页块数的 10%（小任务至少 2 个）；可设置 `hedge_budget=0` 禁用，或设固定预算。
 
