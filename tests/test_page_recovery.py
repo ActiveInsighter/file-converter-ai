@@ -15,18 +15,19 @@ from pdf2md import (
     ContentBlockedError,
     EmptyAnswerError,
     ModelUnavailableError,
-    PermanentGeminiError,
+    PermanentProviderError,
     _page_ink_rows,
     build_chunks,
-    call_gemini_once,
+    call_model_once,
     choose_split_row,
-    extract_response_text,
+    answer_from_payload,
     is_blank_page,
     is_retryable_error,
     page_ink_stats,
     process_chunks,
     split_page_image,
 )
+from providers import GEMINI
 from quota_client import QuotaPoolExhaustedError
 
 
@@ -182,7 +183,7 @@ class ContentErrorClassificationTests(unittest.TestCase):
         payload = {"candidates": [{"finishReason": "RECITATION"}]}
 
         with self.assertRaises(ContentBlockedError) as caught:
-            extract_response_text(payload)
+            answer_from_payload(GEMINI, payload)
 
         self.assertIn("RECITATION", str(caught.exception))
         self.assertIsInstance(caught.exception, RuntimeError)
@@ -191,13 +192,13 @@ class ContentErrorClassificationTests(unittest.TestCase):
         payload = {"candidates": [{"finishReason": "PROHIBITED_CONTENT"}]}
 
         with self.assertRaises(ContentBlockedError):
-            extract_response_text(payload)
+            answer_from_payload(GEMINI, payload)
 
     def test_blocked_prompt_is_a_content_block(self):
         payload = {"candidates": [], "promptFeedback": {"blockReason": "SAFETY"}}
 
         with self.assertRaises(ContentBlockedError) as caught:
-            extract_response_text(payload)
+            answer_from_payload(GEMINI, payload)
 
         self.assertIn("blockReason=SAFETY", str(caught.exception))
 
@@ -205,7 +206,7 @@ class ContentErrorClassificationTests(unittest.TestCase):
         payload = {"candidates": [{"finishReason": "STOP"}]}
 
         with self.assertRaises(EmptyAnswerError):
-            extract_response_text(payload)
+            answer_from_payload(GEMINI, payload)
 
         self.assertIsInstance(EmptyAnswerError("x"), ContentBlockedError)
 
@@ -217,12 +218,12 @@ class ContentErrorClassificationTests(unittest.TestCase):
         }
 
         with self.assertRaises(EmptyAnswerError):
-            extract_response_text(payload)
+            answer_from_payload(GEMINI, payload)
 
     def test_content_errors_never_enter_the_backoff_rounds(self):
         self.assertFalse(is_retryable_error(ContentBlockedError("RECITATION")))
         self.assertFalse(is_retryable_error(EmptyAnswerError("STOP")))
-        self.assertFalse(is_retryable_error(PermanentGeminiError("HTTP 400")))
+        self.assertFalse(is_retryable_error(PermanentProviderError("HTTP 400")))
         self.assertFalse(is_retryable_error(QuotaPoolExhaustedError("daily")))
         self.assertFalse(is_retryable_error(ValueError("bad chunk")))
         self.assertTrue(is_retryable_error(ModelUnavailableError("HTTP 503")))
@@ -593,7 +594,7 @@ class SplitRecoveryFlowTests(unittest.IsolatedAsyncioTestCase):
 class RefusalThroughTheHttpLayerTests(unittest.IsolatedAsyncioTestCase):
     """A refusal must keep its error type through the HTTP layer.
 
-    ``call_gemini_once`` wraps every Markdown problem in a plain
+    ``call_model_once`` wraps every Markdown problem in a plain
     ``RuntimeError("Gemini returned unusable Markdown: ...")``, which makes it
     retryable again; a content refusal has to escape that wrapper.
     """
@@ -616,9 +617,10 @@ class RefusalThroughTheHttpLayerTests(unittest.IsolatedAsyncioTestCase):
             return RefusalThroughTheHttpLayerTests.FakeResponse(self.payload)
 
     async def call(self, payload):
-        return await call_gemini_once(
+        return await call_model_once(
             self.FakeClient(payload),
             FakePool(),
+            GEMINI,
             "fake-model",
             [{"text": "page"}],
             "086",

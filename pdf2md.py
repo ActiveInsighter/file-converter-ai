@@ -3,20 +3,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import AsyncIterable
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import fitz
 import gdown
 import httpx
+
+from artifacts import prepare_directories, validate_output_name, write_result
+from pipeline import Progress, schedule_chunks
+from request_policy import CURRENT_POLICY, RequestPolicy
+from render_stream import RenderPlan, render_pages
 
 from quota_client import (
     LocalKeyPool,
@@ -159,60 +169,35 @@ def download_pdf(source_url: str, destination: Path) -> None:
                 handle.write(data)
 
 
-def render_pdf(
-    pdf_path: Path,
-    image_dir: Path,
-    dpi: int,
-    jpeg_quality: int,
-    image_format: str,
-    start_page: int | None,
-    end_page: int | None,
-) -> tuple[list[Path], int, int, set[int]]:
-    image_dir.mkdir(parents=True, exist_ok=True)
-    document = fitz.open(pdf_path)
-    total_pages = document.page_count
-    if total_pages < 1:
-        raise ValueError("PDF has no pages")
-
-    width = max(3, len(str(total_pages)))
-    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-    paths: list[Path] = []
-
-    first = 1 if start_page is None else start_page
-    last = total_pages if end_page is None else end_page
-    if first < 1 or last > total_pages or first > last:
-        document.close()
-        raise ValueError(
-            f"Invalid page range {first}-{last}; PDF has {total_pages} pages"
-        )
-
-    extension = "png" if image_format == "png" else "jpg"
-    blank_pages: set[int] = set()
-    for page_number in range(first, last + 1):
-        page = document[page_number - 1]
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        path = image_dir / f"{page_number:0{width}d}.{extension}"
-        if image_format == "png":
-            path.write_bytes(pix.tobytes("png"))
-        else:
-            path.write_bytes(pix.tobytes("jpeg", jpg_quality=jpeg_quality))
-        paths.append(path)
-        blank, ink_ratio, darkest = is_blank_page(page)
-        if blank:
-            blank_pages.add(page_number)
-            print(
-                f"[render] {page_number}/{total_pages}: {path.name} "
-                f"blank ink_ratio={ink_ratio:.6f} darkest={darkest}",
-                flush=True,
-            )
-            continue
-        print(
-            f"[render] {page_number}/{total_pages}: {path.name}",
-            flush=True,
-        )
-
-    document.close()
-    return paths, width, total_pages, blank_pages
+async def stream_pdf_chunks(pdf_path, image_dir, plan, dpi, jpeg_quality,
+                            image_format, images_per_request, blank_pages):
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
+    iterator = render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
+                            image_format, is_blank_page)
+    def next_batch():
+        paths = []
+        blanks = set()
+        for _ in range(images_per_request):
+            item = next(iterator, None)
+            if item is None:
+                break
+            path, blank = item
+            paths.append(path)
+            if blank:
+                blanks.add(int(path.stem))
+        return paths, blanks
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            paths, blanks = await loop.run_in_executor(executor, next_batch)
+            if not paths:
+                return
+            blank_pages.update(blanks)
+            yield build_chunks(paths, images_per_request, plan.width, blanks)[0]
+    finally:
+        # close is queued behind any in-progress render on the same thread.
+        await loop.run_in_executor(executor, iterator.close)
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def page_ink_stats(page: fitz.Page) -> tuple[float, int]:
@@ -481,16 +466,6 @@ def answer_from_payload(provider: Provider, payload: dict) -> str:
     return _strip_markdown_fences(text)
 
 
-def extract_response_text(payload: dict) -> str:
-    """Gemini-shaped response -> Markdown.
-
-    Kept under its original name because it is the Gemini entry point used by
-    the existing test-suite; multi-provider callers go through
-    :func:`answer_from_payload`.
-    """
-    return answer_from_payload(GEMINI, payload)
-
-
 def _single_dollar_positions(line: str) -> list[int]:
     positions = []
     i = 0
@@ -578,11 +553,6 @@ class PermanentProviderError(RuntimeError):
     """
 
 
-# Kept as an alias because the error predates multi-provider support and both
-# the test-suite and older logs refer to it by this name.
-PermanentGeminiError = PermanentProviderError
-
-
 class ContentBlockedError(RuntimeError):
     """Gemini answered a page without any usable text.
 
@@ -638,6 +608,37 @@ async def call_model_once(
     api_base: str = "",
     max_output_tokens: int = 0,
 ) -> str:
+    policy = CURRENT_POLICY.get()
+    async def attempt(on_started=lambda: None):
+        return await _call_model_attempt(
+            client, key_pool, provider, model, parts, chunk_name, thinking_level,
+            reasoning_effort, api_base, max_output_tokens, on_started,
+        )
+    if policy is None:
+        return await attempt()
+    return await policy.run(attempt, chunk_name, max_duration=provider.request_timeout_seconds)
+
+
+async def finish_report(report) -> None:
+    """Release a lease even during cancellation; reporting cannot discard text."""
+    async def bounded():
+        try:
+            async with asyncio.timeout(8):
+                await report
+        except Exception as exc:
+            print(f"[quota-warning] report failed: {type(exc).__name__}; lease expiry is the fallback", flush=True)
+    task = asyncio.create_task(bounded())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+async def _call_model_attempt(
+    client, key_pool, provider, model, parts, chunk_name, thinking_level,
+    reasoning_effort, api_base, max_output_tokens, on_started,
+) -> str:
     """Send one request through one provider and return its Markdown.
 
     Everything protocol-specific -- URL, auth header, request body, response
@@ -656,14 +657,21 @@ async def call_model_once(
     key_index, api_key, lease_id = await key_pool.acquire()
     started = time.monotonic()
     try:
-        response = await client.post(
-            url,
-            headers=provider.build_headers(api_key),
-            json=payload,
-        )
-    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        on_started()
+        print(f"[request] {chunk_name} key#{key_index + 1} deadline={provider.request_timeout_seconds:g}s", flush=True)
+        # HTTPX bounds inactivity between chunks, not total wall time.
+        async with asyncio.timeout(provider.request_timeout_seconds):
+            response = await client.post(
+                url,
+                headers=provider.build_headers(api_key),
+                json=payload,
+            )
+    except asyncio.CancelledError:
+        await finish_report(key_pool.mark_cancelled(key_index, lease_id))
+        raise
+    except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
         key_pool.record_http_result(0, time.monotonic() - started)
-        await key_pool.mark_error(key_index, lease_id, http_status=0)
+        await finish_report(key_pool.mark_error(key_index, lease_id, http_status=0))
         raise RuntimeError(
             f"{provider.label} transport failure: {type(exc).__name__}: {exc}"
         ) from exc
@@ -686,14 +694,17 @@ async def call_model_once(
             # the lease cleanly and keep the error type, otherwise the wrapper
             # below turns it into a retryable RuntimeError and the page burns
             # every retry round on the same verdict.
-            await key_pool.mark_success(key_index, lease_id)
+            await finish_report(key_pool.mark_success(key_index, lease_id))
             raise
         except Exception as exc:
-            await key_pool.mark_error(key_index, lease_id, http_status=502)
+            await finish_report(key_pool.mark_error(key_index, lease_id, http_status=502))
             raise RuntimeError(
                 f"{provider.label} returned unusable Markdown: {exc}"
             ) from exc
-        await key_pool.mark_success(key_index, lease_id)
+        policy = CURRENT_POLICY.get()
+        if policy is not None:
+            policy.mark_validated()
+        await finish_report(key_pool.mark_success(key_index, lease_id))
         return text
 
     message = response.text[:800]
@@ -707,19 +718,19 @@ async def call_model_once(
         quota_type = provider.quota_kind(error_payload)
         retry_after = provider.retry_after(response.headers, error_payload)
         cooldown_seconds = retry_after if retry_after is not None else 30.0
-        await key_pool.rate_limited(
+        await finish_report(key_pool.rate_limited(
             key_index,
             lease_id,
             cooldown_seconds,
             daily_exhausted=quota_type == "rpd",
             quota_type=quota_type,
-        )
+        ))
         raise RuntimeError(
             f"{provider.label} HTTP 429 ({quota_type}; "
             f"project cooldown={cooldown_seconds:.1f}s): {message}"
         )
 
-    await key_pool.mark_error(key_index, lease_id, http_status=response.status_code)
+    await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
     error = f"{provider.label} HTTP {response.status_code}: {message}"
     if kind == "permanent":
         raise PermanentProviderError(error)
@@ -776,45 +787,9 @@ async def call_model(
     raise last_error
 
 
-async def call_gemini_once(
-    client: httpx.AsyncClient,
-    key_pool,
-    model: str,
-    parts: list[dict],
-    chunk_name: str,
-    thinking_level: str,
-) -> str:
-    """Gemini entry point kept for callers that predate multi-provider support."""
-    return await call_model_once(
-        client, key_pool, GEMINI, model, parts, chunk_name, thinking_level
-    )
-
-
-async def call_gemini(
-    client: httpx.AsyncClient,
-    key_pool,
-    model: str,
-    parts: list[dict],
-    chunk_name: str,
-    thinking_level: str,
-    fallback_models: tuple[str, ...] = (),
-) -> str:
-    """Gemini entry point kept for callers that predate multi-provider support."""
-    return await call_model(
-        client,
-        key_pool,
-        GEMINI,
-        model,
-        parts,
-        chunk_name,
-        thinking_level,
-        fallback_models,
-    )
-
-
 async def process_chunks(
-    chunks: list[Chunk],
-    output_dir: Path,
+    chunks: list[Chunk] | AsyncIterable[Chunk],
+    state_dir: Path,
     prompt: str,
     model: str,
     concurrency: int,
@@ -832,15 +807,20 @@ async def process_chunks(
     reasoning_effort: str = "",
     api_base: str = "",
     max_output_tokens: int = 0,
+    total_chunks: int | None = None,
+    total_pages: int | None = None,
+    hedge_after: float = 60.0,
+    hedge_budget: int | None = None,
+    publish_progress=None,
 ) -> list[dict]:
     if blocked_page_split not in {"none", "halves"}:
         raise ValueError("blocked_page_split must be none or halves")
 
     provider = provider or resolve_provider(None)
 
-    pages_dir = output_dir / "pages"
-    errors_dir = output_dir / "errors"
-    split_dir = output_dir / "split"
+    pages_dir = state_dir / "pages"
+    errors_dir = state_dir / "errors"
+    split_dir = state_dir / "split"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
@@ -876,12 +856,41 @@ async def process_chunks(
                 client=client,
             )
 
-        started_at = {chunk.stem: time.monotonic() for chunk in chunks}
-        chunks_by_name = {chunk.stem: chunk for chunk in chunks}
-        latest_results: dict[str, dict] = {}
-        completed_first_pass: set[str] = set()
-        progress = {"active_chunks": 0}
+        if isinstance(chunks, list):
+            total_chunks = len(chunks)
+            total_pages = sum(c.end_page - c.start_page + 1 for c in chunks)
+        if total_chunks is None or total_pages is None:
+            raise ValueError("Streaming input requires total_chunks and total_pages")
+        tracker = Progress(state_dir, total_chunks=total_chunks, total_pages=total_pages)
+        started_at: dict[str, float] = {}
         stop_metrics = asyncio.Event()
+
+        def performance():
+            if hasattr(key_pool, "performance_summary"):
+                return key_pool.performance_summary()
+            return {"429": 0, "503": 0, "requests": 0, "p50_seconds": None, "p95_seconds": None}
+
+        def can_hedge():
+            recent_errors = getattr(key_pool, "recent_statuses", [])[-20:]
+            return not recent_errors or sum(s in (429, 503) for s in recent_errors) / len(recent_errors) < 0.2
+
+        policy = RequestPolicy(
+            concurrency=concurrency, hedge_after=hedge_after,
+            hedge_budget=hedge_budget if hedge_budget is not None else max(2, math.ceil(total_chunks * 0.1)),
+            can_hedge=can_hedge, latency_p95=lambda: performance().get("success_p95_seconds"),
+        )
+        tracker.request_summary = policy.summary
+        policy_token = CURRENT_POLICY.set(policy)
+
+        async def source():
+            if isinstance(chunks, list):
+                for chunk in chunks:
+                    started_at.setdefault(chunk.stem, time.monotonic())
+                    yield chunk
+            else:
+                async for chunk in chunks:
+                    started_at.setdefault(chunk.stem, time.monotonic())
+                    yield chunk
 
         def record_success(
             chunk: Chunk, text: str, estimated: int, note: str = "", **extra
@@ -920,6 +929,8 @@ async def process_chunks(
             }
 
         async def run_one(chunk: Chunk, round_number: int) -> dict:
+            if round_number == 1:
+                (pages_dir / f"{chunk.stem}.md").unlink(missing_ok=True)
             if chunk.blank:
                 return record_blank(
                     chunk,
@@ -1059,7 +1070,7 @@ async def process_chunks(
                     pause = random.uniform(3.0, 8.0) * attempt
                     print(
                         f"[retry] {chunk.stem}: attempt {attempt}/{attempts} failed "
-                        f"with {type(exc).__name__}; retrying in {pause:.1f}s",
+                        f"with {type(exc).__name__}: {exc}; retrying in {pause:.1f}s",
                         flush=True,
                     )
                     await asyncio.sleep(pause)
@@ -1120,117 +1131,49 @@ async def process_chunks(
                 **error,
             }
 
-        async def run_round(round_chunks: list[Chunk], round_number: int) -> list[dict]:
-            next_index = 0
-            cursor_lock = asyncio.Lock()
-
-            async def worker() -> None:
-                nonlocal next_index
-                while True:
-                    async with cursor_lock:
-                        if next_index >= len(round_chunks):
-                            return
-                        chunk = round_chunks[next_index]
-                        next_index += 1
-                    progress["active_chunks"] += 1
-                    try:
-                        outcome = await run_one(chunk, round_number)
-                    finally:
-                        progress["active_chunks"] -= 1
-                    latest_results[chunk.stem] = outcome
-                    completed_first_pass.add(chunk.stem)
-
-            worker_count = min(concurrency, len(round_chunks))
-            await asyncio.gather(*(worker() for _ in range(worker_count)))
-            return [latest_results[chunk.stem] for chunk in round_chunks]
-
         async def emit_metrics() -> None:
             while True:
                 try:
-                    await asyncio.wait_for(stop_metrics.wait(), timeout=15)
+                    await asyncio.wait_for(stop_metrics.wait(), timeout=5)
                     return
-                except asyncio.TimeoutError:
-                    performance = key_pool.performance_summary()
-                    successful = sum(item.get("status") == "ok" for item in latest_results.values())
-                    failed = sum(item.get("status") == "failed" for item in latest_results.values())
-                    blank = sum(item.get("status") == "blank" for item in latest_results.values())
-                    pending = len(chunks) - len(completed_first_pass)
-                    if not provider.uses_shared_quota_pool:
-                        # No shared quota service to report on: keys are paced
-                        # locally, so the useful signal is which provider ran and
-                        # how many requests came back as an error.
-                        global_summary = (
-                            f"provider={provider.name} keys={len(keys)} "
-                            f"http_other={performance['other_error']}"
-                        )
-                    else:
+                except TimeoutError:
+                    if publish_progress is not None:
                         try:
-                            remote = await key_pool.remote_status()
-                            global_state = remote.get("global", {})
-                            if not isinstance(global_state, dict):
-                                global_state = {}
-                            global_summary = (
-                                f"global_inflight={global_state.get('activeLeases', '?')}/"
-                                f"{global_state.get('maxInflight', '?')} "
-                                f"global_rps={global_state.get('requestsPerSecond', '?')} "
-                                f"active_projects={global_state.get('activeProjects', '?')} "
-                                f"global_cooldown_ms={global_state.get('cooldownRemainingMs', '?')} "
-                                f"recent_503_ratio={global_state.get('recent503Ratio', '?')} "
-                                f"adaptive_stage={global_state.get('adaptiveStage', '?')}"
-                            )
+                            publish_progress(list(tracker.results.values()))
                         except Exception as exc:
-                            global_summary = f"global_status=unavailable({type(exc).__name__})"
+                            print(f"[warn] Cannot refresh partial Markdown: {type(exc).__name__}: {exc}",
+                                  file=sys.stderr, flush=True)
+                    counts = performance()
+                    snapshot = tracker.write(log=True)
+                    remote = {}
+                    if provider.uses_shared_quota_pool and hasattr(key_pool, "remote_status"):
+                        try:
+                            async with asyncio.timeout(2):
+                                remote = (await key_pool.remote_status()).get("global", {})
+                        except Exception:
+                            pass
                     print(
-                        f"[metrics] pending_chunks={pending} active_chunks={progress['active_chunks']} "
-                        f"success={successful} failed={failed} blank={blank} "
-                        f"http_429={performance['429']} http_503={performance['503']} "
-                        f"http_p50={performance['p50_seconds']}s "
-                        f"http_p95={performance['p95_seconds']}s {global_summary}",
-                        flush=True,
+                        f"[metrics] pending_chunks={snapshot['pending_chunks']} "
+                        f"active_chunks={snapshot['active_chunks']} "
+                        f"success={snapshot['success_chunks']} failed={snapshot['failed_chunks']} "
+                        f"retrying={snapshot['retrying_chunks']} "
+                        f"http_429={counts['429']} http_503={counts['503']} "
+                        f"http_p50={counts['p50_seconds']}s http_p95={counts['p95_seconds']}s "
+                        f"global_inflight={remote.get('activeLeases', '?')}/{remote.get('maxInflight', '?')} "
+                        f"hedges={policy.hedges} hedge_wins={policy.hedge_wins}", flush=True,
                     )
 
         metrics_task = asyncio.create_task(emit_metrics())
         try:
-            first_round = await run_round(chunks, 1)
-            deferred = [
-                chunks_by_name[result["chunk"]]
-                for result in first_round
-                if result["status"] == "failed" and result["retryable"]
-            ]
-            trivially_done = sum(
-                1
-                for result in first_round
-                if result["status"] == "failed" and not result["retryable"]
-            )
-            if trivially_done:
-                print(
-                    f"[retry-round] {trivially_done} chunk(s) are final after round 1 "
-                    "(content errors, blank pages, permanent errors); no backoff for them",
-                    flush=True,
-                )
-            for round_number in range(2, retry_rounds + 1):
-                if not deferred:
-                    break
-                base_delay = min(480.0, 30.0 * (2 ** (round_number - 2)))
-                delay = random.uniform(base_delay, base_delay * 2.0)
-                print(
-                    f"[retry-round] round={round_number}/{retry_rounds} "
-                    f"deferred_chunks={len(deferred)} wait={delay:.0f}s",
-                    flush=True,
-                )
-                await asyncio.sleep(delay)
-                round_results = await run_round(deferred, round_number)
-                deferred = [
-                    chunks_by_name[result["chunk"]]
-                    for result in round_results
-                    if result["status"] == "failed" and result["retryable"]
-                ]
+            results = await schedule_chunks(source(), run_one, concurrency, retry_rounds, tracker)
         finally:
+            CURRENT_POLICY.reset(policy_token)
             stop_metrics.set()
-            await metrics_task
-            await key_pool.close()
+            try:
+                await metrics_task
+            finally:
+                await key_pool.close()
 
-        results = [latest_results[chunk.stem] for chunk in chunks]
         for result in results:
             if result["status"] == "failed":
                 print(
@@ -1239,7 +1182,8 @@ async def process_chunks(
                     flush=True,
                 )
         quota_summary = key_pool.usage_summary()
-        (output_dir / "quota-usage.json").write_text(
+        quota_summary["speculation"] = policy.summary()
+        (state_dir / "quota-usage.json").write_text(
             json.dumps(quota_summary, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
@@ -1251,24 +1195,6 @@ async def process_chunks(
         return results
 
 
-def merge_markdown(
-    chunks: list[Chunk], pages_dir: Path, destination: Path
-) -> None:
-    def sort_key(path: Path) -> tuple[int, str]:
-        match = re.match(r"(\\d+)", path.stem)
-        return (int(match.group(1)) if match else 10**9, path.name)
-
-    page_files = sorted(pages_dir.glob("*.md"), key=sort_key)
-    blocks = [
-        path.read_text(encoding="utf-8").strip()
-        for path in page_files
-        if path.stat().st_size > 0
-    ]
-    destination.write_text(
-        "\n\n".join(blocks).rstrip() + "\n", encoding="utf-8"
-    )
-
-
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -1278,6 +1204,8 @@ def parser() -> argparse.ArgumentParser:
         help="Conversion handler selected by the generic file-converter workflow.",
     )
     p.add_argument("--source-url", required=True)
+    p.add_argument("--output-name", default="merged",
+                   help="Final Markdown basename without extension; source is reserved.")
     p.add_argument("--images-per-request", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument(
@@ -1361,7 +1289,7 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help=(
-            "Total passes over failed chunks. Each extra round waits roughly "
+            "Maximum passes per failed chunk. Independent retries wait roughly "
             "twice as long as the previous one. Default: 5."
         ),
     )
@@ -1405,13 +1333,13 @@ def parser() -> argparse.ArgumentParser:
         "--rpm-per-key",
         type=float,
         default=15.0,
-        help="Compatibility name: maximum requests/minute for each project quota pool.",
+        help="Maximum requests/minute per Gemini project or other provider key.",
     )
     p.add_argument(
         "--rpd-per-key",
         type=int,
         default=500,
-        help="Compatibility name: requests/day guard for each project quota pool.",
+        help="Maximum requests/day per Gemini project or other provider key.",
     )
     p.add_argument(
         "--start-page",
@@ -1435,12 +1363,25 @@ def parser() -> argparse.ArgumentParser:
             "again (at most PAGE_SPLIT_DEPTH times). 'none' disables it."
         ),
     )
+    p.add_argument("--hedge-after", type=float, default=60.0,
+                   help="Minimum HTTP age for speculative copies; also >= twice successful p95. 0 disables.")
+    p.add_argument("--hedge-budget", type=int, default=-1,
+                   help="Max extra requests per conversion. -1 uses 10%% of chunks (minimum 2); 0 disables.")
     p.add_argument("--work-dir", default="work")
-    p.add_argument("--output-dir", default="output")
+    p.add_argument("--output-dir", default="output",
+                   help="Dedicated generated artifact directory; cleared on each run.")
     return p
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    validate_output_name(args.output_name)
+    source = urlparse(args.source_url)
+    if source.scheme not in {"http", "https"} or not source.hostname:
+        raise ValueError("source_url must be an absolute http(s) URL")
+    if not math.isfinite(args.hedge_after) or not 0 <= args.hedge_after <= 600:
+        raise ValueError("hedge_after must be between 0 and 600 seconds")
+    if not -1 <= args.hedge_budget <= 10000:
+        raise ValueError("hedge_budget must be between -1 and 10000")
     if args.conversion_type != "pdf_to_md":
         raise ValueError("conversion_type must be pdf_to_md")
     if len(args.system_prompt) > MAX_PROMPT_CHARS:
@@ -1507,6 +1448,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 async def async_main(args: argparse.Namespace) -> int:
     validate_args(args)
+    work_dir = Path(args.work_dir)
+    output_dir = Path(args.output_dir)
+    state_dir = prepare_directories(work_dir, output_dir)
     provider = resolve_provider(args.provider or os.getenv("FILE_CONVERTER_PROVIDER"))
     model = resolve_model(provider, args.model)
     api_base = (args.api_base or provider.default_base_url).rstrip("/")
@@ -1530,11 +1474,6 @@ async def async_main(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    work_dir = Path(args.work_dir)
-    output_dir = Path(args.output_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     source_pdf = work_dir / "source.pdf"
     images_dir = work_dir / "images"
 
@@ -1552,6 +1491,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"retry_rounds={args.retry_rounds} "
         f"attempts_per_page={args.attempts_per_page} "
         f"blocked_page_split={args.blocked_page_split} "
+        f"hedge_after={args.hedge_after:g}s hedge_budget={args.hedge_budget} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
     )
@@ -1582,118 +1522,82 @@ async def async_main(args: argparse.Namespace) -> int:
                 "Downloaded source is not a PDF. Use a direct/public PDF link; ZIP and other files are not accepted."
             )
 
-    image_paths, width, pdf_total_pages, blank_pages = await asyncio.to_thread(
-        render_pdf,
-        source_pdf,
-        images_dir,
-        args.dpi,
-        args.jpeg_quality,
-        args.image_format,
-        args.start_page,
-        args.end_page,
-    )
-    chunks = build_chunks(image_paths, args.images_per_request, width, blank_pages)
-    print(
-        f"[plan] pages={len(image_paths)} chunks={len(chunks)} "
-        f"blank_pages={len(blank_pages)}",
-        flush=True,
-    )
+    plan = await asyncio.to_thread(RenderPlan.from_pdf, source_pdf, args.start_page, args.end_page)
+    blank_pages: set[int] = set()
+    chunks: list[Chunk] = []
+    rendered = stream_pdf_chunks(source_pdf, images_dir, plan, args.dpi,
+                                args.jpeg_quality, args.image_format,
+                                args.images_per_request, blank_pages)
+    async def chunk_source():
+        async with contextlib.aclosing(rendered):
+            async for chunk in rendered:
+                chunks.append(chunk)
+                yield chunk
+    print(f"[plan] pages={plan.page_count} chunks={math.ceil(plan.page_count / args.images_per_request)} streaming=true", flush=True)
 
-    results = await process_chunks(
-        chunks,
-        output_dir,
-        prompt,
-        model,
-        args.concurrency,
-        keys,
-        args.thinking_level,
-        args.verification_passes,
-        args.media_resolution,
-        args.rpm_per_key,
-        args.rpd_per_key,
-        fallback_models=fallback_models,
-        retry_rounds=args.retry_rounds,
-        attempts_per_page=args.attempts_per_page,
-        blocked_page_split=args.blocked_page_split,
-        provider=provider,
-        reasoning_effort=reasoning_effort,
-        api_base=api_base,
-        max_output_tokens=args.max_output_tokens,
-    )
-    failures = [x for x in results if x.get("status") == "failed"]
-
-    merged_name = "merged.md" if not failures else "merged.partial.md"
-    merge_markdown(chunks, output_dir / "pages", output_dir / merged_name)
-
-    manifest = {
-        "conversion_type": args.conversion_type,
-        "source_url": args.source_url,
-        "provider": provider.name,
-        "model": model,
-        "api_base": api_base,
-        "model_fallbacks": list(fallback_models),
-        "reasoning_effort": reasoning_effort,
-        "max_output_tokens": args.max_output_tokens,
-        "prompt": {
-            "system_chars": len(system_prompt),
-            "task_chars": len(user_prompt),
-            "effective_chars": len(prompt),
-            "effective_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "system": system_prompt,
-            "task": user_prompt,
-        },
-        "total_pages": pdf_total_pages,
-        "processed_pages": len(image_paths),
-        "start_page": args.start_page,
-        "end_page": args.end_page,
-        "images_per_request": args.images_per_request,
-        "concurrency": args.concurrency,
-        "thinking_level": args.thinking_level,
-        "dpi": args.dpi,
-        "image_format": args.image_format,
-        "jpeg_quality": args.jpeg_quality,
-        "verification_passes": args.verification_passes,
-        "media_resolution": args.media_resolution,
-        "rpm_per_key": args.rpm_per_key,
-        "rpd_per_key": args.rpd_per_key,
-        "chunks": [
-            {
-                **asdict(chunk),
-                "image_paths": [str(p) for p in chunk.image_paths],
-            }
-            for chunk in chunks
-        ],
-        "results": sorted(results, key=lambda item: item["chunk"]),
-        "failures": len(failures),
-        "blocked_page_split": args.blocked_page_split,
-        "blank_pages": sorted(blank_pages),
-        "blank_chunks": sorted(
-            item["chunk"] for item in results if item.get("status") == "blank"
-        ),
-        "split_recovered": sorted(
-            item["chunk"] for item in results if item.get("recovered_by") == "page_split"
-        ),
-        "partial_recovery": {
-            item["chunk"]: item["missing_parts"]
-            for item in results
-            if item.get("missing_parts")
-        },
-        "merged_file": merged_name,
-    }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    if failures:
-        print(
-            f"[result] {len(failures)} chunk(s) failed; "
-            f"partial output: {merged_name}",
-            file=sys.stderr,
+    pipeline_error = None
+    def publish(results):
+        return write_result(
+            output_dir=output_dir, state_dir=state_dir, name=args.output_name,
+            source_url=args.source_url, plan=plan, provider=provider.name, model=model,
+            converted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            chunks=chunks, results=results, pipeline_error=pipeline_error,
         )
+    # Always keep a compact partial package, including during cancellation.
+    publish([])
+    try:
+        results = await process_chunks(
+            chunk_source(),
+            state_dir,
+            prompt,
+            model,
+            args.concurrency,
+            keys,
+            args.thinking_level,
+            args.verification_passes,
+            args.media_resolution,
+            args.rpm_per_key,
+            args.rpd_per_key,
+            fallback_models=fallback_models,
+            retry_rounds=args.retry_rounds,
+            attempts_per_page=args.attempts_per_page,
+            blocked_page_split=args.blocked_page_split,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
+            api_base=api_base,
+            max_output_tokens=args.max_output_tokens,
+            total_chunks=math.ceil(plan.page_count / args.images_per_request),
+            total_pages=plan.page_count,
+            hedge_after=args.hedge_after,
+            hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
+            publish_progress=publish,
+        )
+    except (Exception, asyncio.CancelledError) as exc:
+        cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
+        pipeline_error = f"{type(exc).__name__}: {exc}"
+        print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
+        try:
+            result_index = state_dir / "results.json"
+            results = json.loads(result_index.read_text()) if result_index.exists() else []
+            if not (state_dir / 'progress.json').exists():
+                failed_progress = Progress(state_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
+                                           total_pages=plan.page_count)
+                failed_progress.state = 'failed'
+                failed_progress.write(log=True)
+            files = publish(results)
+        except Exception as save_error:
+            print(f"[warn] Cannot save partial result: {type(save_error).__name__}: {save_error}",
+                  file=sys.stderr, flush=True)
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+    else:
+        files = publish(results)
+    if files.partial:
+        print(f"[result] partial: {files.markdown}; see source.md for missing pages", file=sys.stderr, flush=True)
         return 2
-
-    print(f"[result] success: {output_dir / 'merged.md'}", flush=True)
+    print(f"[result] success: {files.markdown}", flush=True)
     return 0
 
 
