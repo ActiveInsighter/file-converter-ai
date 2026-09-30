@@ -54,3 +54,15 @@ The first HTTP request started at 04:24:07.426 UTC, while the last page was rend
 Two subsequent cleanup/classification refinements were covered by regression tests: cancel unfinished HTTP immediately at the group deadline while retaining a valid response's bounded success report; preserve refusal classification; do not interrupt already-running lease cancellation cleanup with a second cancellation. The final commit's real-page smoke and CI are recorded below.
 
 A real request/quota-client fixture additionally demonstrates delayed, already-charged hedge lease responses across the group deadline: valid Markdown is preserved; all three charged requests are counted; two cancellations are reported; no server leases remain outstanding. The pre-fix policy left two charged leases orphaned. Cancellation is now requested once per task so existing cleanup can drain safely.
+
+
+## Final source revision verification
+
+Final executable source revision `14a6773`:
+
+- [CI 36669343338](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36669343338): **144 tests passed**, no skips; compilation passed. Independent review also ran all 144 tests, including real Valkey integration, and approved the final source.
+- [Real pages 51–63, run 36669362314](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/36669362314): **13/13 success**, no pipeline errors, 100% progress, 13 charged requests. Converter step 33s; page 51 took 19.83s, page 63 took 13.24s from render-ready time. This validates the exact final executable revision after the additional cancellation guards.
+- All artifacts were downloaded and checked. For the complete 196-page run, model, concurrency, DPI, image format/resolution, verification setting and effective prompt hash match the baseline. The merged file exactly matches the ordered successful page files.
+- Post-test quota-service status: healthy, **0 active leases**, max inflight 24, 2 requests/s, adaptive stage 0.
+
+[Draft PR #27](https://github.com/ActiveInsighter/file-converter-ai/pull/27) contains the branch implementation and this evidence. Converter execution is deployed for branch testing through Actions; normal main-branch dispatches continue using the original converter until this branch is merged. The shared quota service already has the backward-compatible cancellation-report update and its rollback backup.
