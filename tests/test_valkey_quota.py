@@ -63,6 +63,18 @@ class ValkeyQuotaTests(unittest.IsolatedAsyncioTestCase):
         state = (await self.scheduler.status()).body
         self.assertEqual(state["global"]["activeLeases"], 8)
 
+    async def test_cancelled_hedge_releases_slot_without_refunding_or_biasing_controller(self):
+        await self.configure()
+        lease = (await self.scheduler.lease()).body
+        await self.scheduler.report(lease['leaseId'], 499)
+        duplicate = await self.scheduler.report(lease['leaseId'], 499)
+        self.assertTrue(duplicate.body['duplicate'])
+        state = (await self.scheduler.status()).body
+        self.assertEqual(state['requestsToday'], 1)
+        self.assertEqual(state['global']['activeLeases'], 0)
+        self.assertEqual(state['global']['recentOutcomes'], 0)
+        self.assertEqual(state['projects'][0]['errorCount'], 0)
+
     async def test_reports_are_idempotent_and_503s_reduce_global_capacity(self):
         await self.configure()
         leases = []

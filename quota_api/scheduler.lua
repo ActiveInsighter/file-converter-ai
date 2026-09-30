@@ -208,6 +208,12 @@ if op == 'report' then
   local lease_day = redis.call('HGET', lease, 'pacific_day')
   redis.call('HSET', lease, 'reported_at', now, 'http_status', status)
   redis.call('ZREM', active, id)
+  -- A losing speculative copy is neutral. Keep its charged request, but do
+  -- not dilute 503/success ratios or trigger controller changes.
+  if status == 499 then
+    return result(200, {reported = true, duplicate = false,
+      staleLease = lease_day ~= today, cancelled = true})
+  end
   redis.call('LPUSH', outcomes, status)
   redis.call('LTRIM', outcomes, 0, 19)
   if lease_day == today then

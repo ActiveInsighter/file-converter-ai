@@ -160,9 +160,12 @@ class ProjectQuotaPool:
         self.used = [0 for _ in keys]
         self.successes = [0 for _ in keys]
         self.errors = [0 for _ in keys]
+        self.cancelled = [0 for _ in keys]
         self.rate_limited_counts = [0 for _ in keys]
         self.http_counts = {"success": 0, "429": 0, "503": 0, "other_error": 0}
         self.request_latencies: list[float] = []
+        self.success_latencies: list[float] = []
+        self.recent_statuses: list[int] = []
 
     @classmethod
     async def create(
@@ -254,16 +257,8 @@ class ProjectQuotaPool:
         transport_failures = 0
         while True:
             try:
-                response = await self.client.post(
-                    self.api_url + "/v1/lease",
-                    headers={
-                        "Authorization": f"Bearer {self.api_token}",
-                        "User-Agent": "file-converter-ai/1.0",
-                    },
-                    json={"requestId": request_id},
-                    timeout=15.0,
-                )
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                response = await self._lease_response(request_id)
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
                 transport_failures += 1
                 if transport_failures >= 5:
                     raise RuntimeError("Quota API lease request failed repeatedly") from exc
@@ -302,6 +297,34 @@ class ProjectQuotaPool:
             self.used[key_index] += 1
             return key_index, self.keys[key_index], lease_id
 
+    async def _lease_response(self, request_id: str) -> httpx.Response:
+        async def request():
+            async with asyncio.timeout(15):
+                return await self.client.post(
+                    self.api_url + "/v1/lease",
+                    headers={"Authorization": f"Bearer {self.api_token}",
+                             "User-Agent": "file-converter-ai/1.0"},
+                    json={"requestId": request_id}, timeout=15.0,
+                )
+        task = asyncio.create_task(request())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The server may already have charged a lease even if its response
+            # has not reached us. Drain that response before cancelling a hedge.
+            try:
+                response = await task
+                if response.status_code == 200:
+                    body = response.json()
+                    index = body.get("keyIndex")
+                    if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(self.keys):
+                        self.used[index] += 1
+                        async with asyncio.timeout(8):
+                            await self.mark_cancelled(index, body["leaseId"])
+            except Exception as exc:
+                print(f"[quota-warning] cancelled lease cleanup failed: {type(exc).__name__}", flush=True)
+            raise
+
     async def _report(
         self,
         key_index: int,
@@ -339,6 +362,11 @@ class ProjectQuotaPool:
         self.successes[key_index] += 1
         await self._report(key_index, lease_id, 200)
 
+    async def mark_cancelled(self, key_index: int, lease_id: str) -> None:
+        self.cancelled[key_index] += 1
+        # Requests remain charged: a cancelled HTTP call may have reached Google.
+        await self._report(key_index, lease_id, 499)
+
     async def mark_error(
         self,
         key_index: int,
@@ -368,6 +396,11 @@ class ProjectQuotaPool:
 
     def record_http_result(self, status: int, elapsed_seconds: float) -> None:
         count_http_result(self.http_counts, status)
+        self.recent_statuses.append(status)
+        del self.recent_statuses[:-20]
+        if status == 200:
+            self.success_latencies.append(max(0.0, elapsed_seconds))
+            del self.success_latencies[:-1000]
         self.request_latencies.append(max(0.0, elapsed_seconds))
         if len(self.request_latencies) > 1000:
             del self.request_latencies[: len(self.request_latencies) - 1000]
@@ -376,7 +409,8 @@ class ProjectQuotaPool:
         return await self._post("/v1/status", {})
 
     def performance_summary(self) -> dict[str, object]:
-        return {**self.http_counts, **latency_summary(self.request_latencies)}
+        return {**self.http_counts, **latency_summary(self.request_latencies),
+                "success_p95_seconds": latency_summary(self.success_latencies)["p95_seconds"]}
 
     async def close(self) -> None:
         return None
@@ -391,6 +425,7 @@ class ProjectQuotaPool:
                     "success": self.successes[index],
                     "http_429": self.rate_limited_counts[index],
                     "errors": self.errors[index],
+                    "cancelled": self.cancelled[index],
                 }
                 for index, group in enumerate(self.groups)
             },
@@ -401,6 +436,7 @@ class ProjectQuotaPool:
                 "success": self.successes[index],
                 "http_429": self.rate_limited_counts[index],
                 "errors": self.errors[index],
+                    "cancelled": self.cancelled[index],
             }
             for index in range(len(self.keys))
         },
@@ -439,10 +475,13 @@ class LocalKeyPool:
         self.used = [0 for _ in keys]
         self.successes = [0 for _ in keys]
         self.errors = [0 for _ in keys]
+        self.cancelled = [0 for _ in keys]
         self.rate_limited_counts = [0 for _ in keys]
         self.disabled = [False for _ in keys]
         self.http_counts = {"success": 0, "429": 0, "503": 0, "other_error": 0}
         self.request_latencies: list[float] = []
+        self.success_latencies: list[float] = []
+        self.recent_statuses: list[int] = []
         self.lock = asyncio.Lock()
 
     @classmethod
@@ -497,6 +536,9 @@ class LocalKeyPool:
     async def mark_success(self, key_index: int, lease_id: str) -> None:
         self.successes[key_index] += 1
 
+    async def mark_cancelled(self, key_index: int, lease_id: str) -> None:
+        self.cancelled[key_index] += 1
+
     async def mark_error(
         self,
         key_index: int,
@@ -525,6 +567,11 @@ class LocalKeyPool:
 
     def record_http_result(self, status: int, elapsed_seconds: float) -> None:
         count_http_result(self.http_counts, status)
+        self.recent_statuses.append(status)
+        del self.recent_statuses[:-20]
+        if status == 200:
+            self.success_latencies.append(max(0.0, elapsed_seconds))
+            del self.success_latencies[:-1000]
         self.request_latencies.append(max(0.0, elapsed_seconds))
         if len(self.request_latencies) > 1000:
             del self.request_latencies[: len(self.request_latencies) - 1000]
@@ -533,7 +580,8 @@ class LocalKeyPool:
         return {}
 
     def performance_summary(self) -> dict[str, object]:
-        return {**self.http_counts, **latency_summary(self.request_latencies)}
+        return {**self.http_counts, **latency_summary(self.request_latencies),
+                "success_p95_seconds": latency_summary(self.success_latencies)["p95_seconds"]}
 
     async def close(self) -> None:
         return None
@@ -548,6 +596,7 @@ class LocalKeyPool:
                     "success": self.successes[index],
                     "http_429": self.rate_limited_counts[index],
                     "errors": self.errors[index],
+                    "cancelled": self.cancelled[index],
                     "disabled": self.disabled[index],
                 }
                 for index in range(len(self.keys))
