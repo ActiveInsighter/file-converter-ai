@@ -1,61 +1,44 @@
-import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 import fitz
-from pdf2md import Chunk, stream_pdf_chunks
+from pdf2md import stream_pages
 from render_stream import RenderPlan
-from test_page_recovery import run_process_chunks
-from pdf2md import PermanentProviderError
 
 
 class RenderStreamingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_failed_rerun_cannot_retain_old_page_with_same_name(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / 'pages').mkdir()
-            stale = root / 'pages/001.md'
-            stale.write_text('Old unrelated document')
-            async def fail(*args, **kwargs):
-                raise PermanentProviderError('HTTP 400')
-            results = await run_process_chunks([Chunk(1, 1, (), '001')], directory, fail)
-            self.assertEqual(results[0]['status'], 'failed')
-            self.assertFalse(stale.exists())
+    def write_pdf(self, root, texts):
+        with fitz.open() as doc:
+            for text in texts:
+                page = doc.new_page()
+                if text:
+                    page.insert_text((72, 72), text)
+            doc.save(root / 'test.pdf')
+        return root / 'test.pdf'
 
-    async def test_chunk_available_before_later_pages_are_rendered(self):
+    async def test_page_available_before_later_pages_are_rendered(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with fitz.open() as doc:
-                for index in range(3):
-                    doc.new_page().insert_text((72, 72), f'Page {index + 1}')
-                doc.save(root / 'test.pdf')
-            plan = RenderPlan.from_pdf(root / 'test.pdf', 1, None)
-            chunks = []
-            blanks = set()
-            stream = stream_pdf_chunks(root / 'test.pdf', root / 'images', plan,
-                                       72, 95, 'png', 1, blanks)
+            pdf = self.write_pdf(root, ['Page 1', 'Page 2', 'Page 3'])
+            plan = RenderPlan.from_pdf(pdf, 1, None)
+            stream = stream_pages(pdf, root / 'images', plan, 72, 95, 'png')
             first = await anext(stream)
-            self.assertTrue(first.image_paths[0].exists())
+            self.assertTrue(first.image_path.exists())
             self.assertFalse((root / 'images' / '002.png').exists())
-            chunks.append(first)
-            async for chunk in stream:
-                chunks.append(chunk)
-            self.assertEqual([c.start_page for c in chunks], [1, 2, 3])
-            self.assertEqual(blanks, set())
+            pages = [first] + [page async for page in stream]
+            self.assertEqual([p.number for p in pages], [1, 2, 3])
+            self.assertEqual([p.stem for p in pages], ['001', '002', '003'])
 
-    async def test_blank_batch_and_last_short_batch_keep_page_order(self):
+    async def test_blank_pages_are_flagged_in_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with fitz.open() as doc:
-                doc.new_page()
-                doc.new_page()
-                doc.new_page().insert_text((72, 72), 'Page 3')
-                doc.save(root / 'test.pdf')
-            plan = RenderPlan.from_pdf(root / 'test.pdf', None, None)
-            blanks = set()
-            chunks = [chunk async for chunk in stream_pdf_chunks(
-                root / 'test.pdf', root / 'images', plan, 72, 95, 'png', 2, blanks)]
-            self.assertEqual([c.stem for c in chunks], ['001-002', '003'])
-            self.assertEqual([c.blank for c in chunks], [True, False])
-            self.assertEqual(blanks, {1, 2})
+            pdf = self.write_pdf(root, ['', '', 'Page 3'])
+            plan = RenderPlan.from_pdf(pdf, 2, None)
+            pages = [page async for page in stream_pages(pdf, root / 'images', plan, 72, 95, 'jpeg')]
+            self.assertEqual([(p.number, p.blank) for p in pages], [(2, True), (3, False)])
+            self.assertEqual(pages[0].image_path.suffix, '.jpg')
+
+
+if __name__ == '__main__':
+    unittest.main()
