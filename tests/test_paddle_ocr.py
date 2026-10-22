@@ -179,6 +179,48 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
         self.assertTrue(all(page is not None for page in results.values()))
 
+    async def test_a_link_submission_that_times_out_switches_to_uploads_at_once(self):
+        link = "https://slow.test/manual.pdf"
+        service = FakeService(accepted_links={link})
+        respond, hangs = service.handler, []
+
+        def handler(request):
+            if request.method == "POST" and request.headers["Content-Type"] == "application/json":
+                hangs.append(request)
+                raise httpx.ReadTimeout("origin download too slow", request=request)
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=6, segment=2, source_url=link)
+        self.assertEqual(len(hangs), 1, "one probe, no retries on the link")
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 3))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_full_queue_is_retried_on_the_same_link(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        respond, busy = service.handler, []
+
+        def handler(request):
+            if request.method == "POST" and not busy:
+                busy.append(request)
+                return httpx.Response(200, json={"code": 10010, "msg": "queue full"})
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 0))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_stalled_link_job_is_replaced_by_an_upload(self):
+        from unittest.mock import patch
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        with patch("paddle_ocr.REMOTE_JOB_TIMEOUT", 0):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
+        self.assertTrue(all(page is not None for page in results.values()))
+
     async def test_a_failed_link_job_switches_the_run_to_uploads(self):
         link = "https://files.test/book.pdf"
         service = FakeService({"Page 1": ["fail"]}, accepted_links={link})

@@ -46,6 +46,12 @@ TARGET_UPLOAD_BYTES = 1024 * 1024
 PARALLEL_JOBS = 3
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
+#: The service downloads a linked file while the submission is open; a slow
+#: origin (gnu.org took longer than 60 s every time) must not hold OCR back.
+REMOTE_SUBMIT_TIMEOUT = 30.0
+#: A link job that is not done by then is abandoned for an upload, which
+#: finishes within about three minutes even at 20-25 KB/s.
+REMOTE_JOB_TIMEOUT = 300.0
 #: Attempts per segment. A full submission queue (10010) clears within
 #: minutes, so retries back off exponentially up to a minute apart.
 SEGMENT_ATTEMPTS = 6
@@ -194,12 +200,13 @@ class PaddleOcr:
         self.turn = 0
         self.fatal: str | None = None
         self.pages: dict[int, asyncio.Future] = {}
-        #: The link the service fetches; empty means "upload". The service
-        #: rejects some links outright (``https://arxiv.org/pdf/<id>`` gets
-        #: 10004), so the first submission doubles as a probe.
-        self.remote_urls = [source_url] if source_url else []
-        #: Serialises remote submissions while the link is being probed, so a
-        #: rejected link is tried once, not once per segment.
+        #: The link the service fetches; ``None`` means "upload". The first
+        #: submission doubles as a probe: a rejected link
+        #: (``https://arxiv.org/pdf/<id>`` gets 10004), a submission that
+        #: times out, or a link job that fails switches the run to uploads.
+        self.remote_url = source_url or None
+        #: Serialises remote submissions so a bad link costs one probe, not
+        #: one per segment.
         self.remote_lock = asyncio.Lock()
         self.started = time.monotonic()
         self.stats = {"jobs": 0, "remote_jobs": 0, "uploaded_jobs": 0, "pages": 0,
@@ -291,17 +298,16 @@ class PaddleOcr:
                     job = await self._submit_upload(upload, name)
                 else:
                     remote = True
-                return await self._collect(job, name, last - first + 1)
+                timeout = min(self.job_timeout, REMOTE_JOB_TIMEOUT) if remote else self.job_timeout
+                return await self._collect(job, name, last - first + 1, timeout)
             except OcrFatalError as exc:
                 self.fatal = str(exc)
                 raise
             except (OcrRetryableError, httpx.TransportError, TimeoutError, ValueError) as exc:
-                if remote and self.remote_urls and isinstance(exc, (OcrJobFailed, ValueError)):
-                    # A link the service accepted but then could not fetch or
-                    # parse will not get better; upload from now on.
-                    print(f"[ocr] {name}: remote job failed ({exc}); "
-                          "uploading segments from now on", flush=True)
-                    self.remote_urls.clear()
+                if remote and isinstance(exc, (OcrJobFailed, ValueError, TimeoutError)):
+                    # A link job that failed, came back wrong or stalled will
+                    # not get better; upload this and every later segment.
+                    self._abandon_link(f"{name}: {type(exc).__name__}: {exc}")
                 if attempt == SEGMENT_ATTEMPTS:
                     raise
                 pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))
@@ -330,36 +336,40 @@ class PaddleOcr:
             raise RuntimeError(message)
         return body.get("data") or {}
 
+    def _abandon_link(self, reason: str) -> None:
+        if self.remote_url:
+            print(f"[ocr] not using the link any more ({reason}); "
+                  "uploading segments instead", flush=True)
+            self.remote_url = None
+
     async def _submit_remote(self, first: int, last: int,
                              name: str) -> tuple[str, dict[str, str]] | None:
         """Ask the service to fetch the pages itself; ``None`` means upload."""
-        if not self.remote_urls:
+        if not self.remote_url:
             return None
         async with self.remote_lock:
-            while self.remote_urls:
-                url = self.remote_urls[0]
-                headers = self._next_token_headers()
+            if not self.remote_url:
+                return None
+            headers = self._next_token_headers()
+            try:
                 response = await self.client.post(
                     self.job_url,
                     headers=headers,
-                    json={"fileUrl": url, "model": self.model, "pageRanges": f"{first}-{last}",
-                          "optionalPayload": OPTIONAL_PAYLOAD},
-                    timeout=60.0,
+                    json={"fileUrl": self.remote_url, "model": self.model,
+                          "pageRanges": f"{first}-{last}", "optionalPayload": OPTIONAL_PAYLOAD},
+                    timeout=REMOTE_SUBMIT_TIMEOUT,
                 )
-                try:
-                    job_id = self._check(response)["jobId"]
-                except OcrSourceRejected as exc:
-                    print(f"[ocr] link {url} rejected ({exc})", flush=True)
-                    self.remote_urls.pop(0)
-                    continue
-                # Later segments go straight to the accepted link.
-                del self.remote_urls[1:]
-                self.stats["jobs"] += 1
-                self.stats["remote_jobs"] += 1
-                print(f"[ocr] {name}: job {job_id} submitted by link", flush=True)
-                return job_id, headers
-        print("[ocr] the service will not fetch this link; uploading segments", flush=True)
-        return None
+                job_id = self._check(response)["jobId"]
+            except (OcrFatalError, OcrRetryableError):
+                # Bad token, used-up quota or a full queue: not the link's fault.
+                raise
+            except Exception as exc:  # noqa: BLE001 - rejected, timed out, odd answer
+                self._abandon_link(f"{type(exc).__name__}: {exc}")
+                return None
+        self.stats["jobs"] += 1
+        self.stats["remote_jobs"] += 1
+        print(f"[ocr] {name}: job {job_id} submitted by link", flush=True)
+        return job_id, headers
 
     async def _submit_upload(self, data: bytes, name: str) -> tuple[str, dict[str, str]]:
         started = time.monotonic()
@@ -383,10 +393,10 @@ class PaddleOcr:
         return job_id, headers
 
     async def _collect(self, job: tuple[str, dict[str, str]], name: str,
-                       expected: int) -> list[dict]:
+                       expected: int, timeout: float) -> list[dict]:
         job_id, headers = job
         started = time.monotonic()
-        async with asyncio.timeout(self.job_timeout):
+        async with asyncio.timeout(timeout):
             while True:
                 status = self._check(await self.client.get(
                     f"{self.job_url}/{job_id}", headers=headers, timeout=60.0))
