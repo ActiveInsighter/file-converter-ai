@@ -8,7 +8,7 @@ from pathlib import Path
 from pdf2md import (
     DEFAULT_PROMPT,
     MAX_PROMPT_CHARS,
-    Chunk,
+    Page,
     compose_prompt,
     make_request_parts,
     parser,
@@ -87,9 +87,8 @@ class RequestPartsCarryBothPrompts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             page = Path(directory) / "page.png"
             page.write_bytes(b"not-a-real-png-but-enough-for-base64")
-            chunk = Chunk(start_page=1, end_page=1, image_paths=(page,), stem="1")
             parts, _ = make_request_parts(
-                chunk,
+                Page(1, page, "001"),
                 compose_prompt("系统提示词：忠实转录。", "本次要求：只处理第 1 页。"),
                 "high",
             )

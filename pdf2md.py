@@ -1,3 +1,14 @@
+"""PDF -> Markdown: PaddleOCR drafts every page, a vision model finalises it.
+
+1. The PDF is downloaded and handed to PaddleOCR-VL in small segments.
+2. Pages are rendered to images in a background thread at the same time.
+3. Each page goes to the model as soon as both its image and its OCR draft are
+   ready. The model checks the draft against the image and writes the final
+   Markdown for that page.
+4. A page whose model request keeps failing or is refused falls back to its OCR
+   draft; a page without a draft is transcribed from the image alone.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -12,11 +23,11 @@ import random
 import re
 import sys
 import time
+from collections.abc import AsyncIterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import AsyncIterable
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import fitz
@@ -24,16 +35,10 @@ import gdown
 import httpx
 
 from artifacts import prepare_directories, validate_output_name, write_result
+from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
+from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
+from paddle_ocr import JOB_URL, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
 from pipeline import Progress, schedule_chunks
-from request_policy import CURRENT_POLICY, RequestPolicy
-from render_stream import RenderPlan, render_pages
-
-from quota_client import (
-    LocalKeyPool,
-    ProjectQuotaPool,
-    QuotaPoolExhaustedError,
-    parse_key_groups,
-)
 from providers import (
     GEMINI,
     Provider,
@@ -43,6 +48,8 @@ from providers import (
     resolve_model,
     resolve_provider,
 )
+from render_stream import RenderPlan, render_pages
+from request_policy import CURRENT_POLICY, RequestPolicy
 
 DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
 
@@ -61,6 +68,15 @@ DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页�
 # independent, and each is capped so the pair stays well inside the inline
 # request budget (the same bound the PocketBase config enforces).
 MAX_PROMPT_CHARS = 12000
+
+#: How the model is asked to use the OCR draft. The transcription rules
+#: (``DEFAULT_PROMPT`` or the configured prompts) follow it.
+REFINE_INSTRUCTIONS = """下方 <ocr_draft> 是 OCR 模型（PaddleOCR-VL）对这一页的识别草稿。请以图片为准、以草稿为底稿，输出这一页最终的 Markdown：
+1. 草稿的文字识别通常可靠：逐段对照图片，保留正确内容，只修正与图片不符之处（错字、漏字、多字、数字、公式符号、上下标）。
+2. 草稿漏掉的正文、公式、表格或题目，按图片补全；草稿里的页眉、页脚、页码和水印删除。
+3. 按图片整理结构：标题层级、段落拆分与合并、列表、阅读顺序（多栏页面按栏阅读）。
+4. 表格输出为 Markdown 表格；存在合并单元格等 Markdown 无法表达的结构时，保留 HTML <table>。
+5. 草稿中的图片引用 ![...](images/...) 原样保留在它在页面中的位置，不改路径，不新增图片引用。"""
 
 
 def compose_prompt(system_prompt: str, user_prompt: str) -> str:
@@ -88,27 +104,28 @@ BLANK_PAGE_INK_RATIO = 0.001
 BLANK_PAGE_DARK_LEVEL = 200
 # Any pixel darker than this counts as ink when measuring page coverage.
 INK_PIXEL_MAX = 250
-# Pages are measured on a cheap downscaled grayscale pixmap instead of the full
-# resolution render.
-SPLIT_ANALYSIS_SCALE = 0.25
-# Vertical bands (fractions of the page height) searched for a blank cut row,
-# most balanced first. A cut on a row with no ink never slices a text line.
-SPLIT_SEARCH_WINDOWS = ((0.35, 0.65), (0.25, 0.75), (0.15, 0.85))
-# Overlap given to both halves when the page has no blank row in any band.
-SPLIT_FALLBACK_OVERLAP = 0.01
-# How many times a refused image may be cut again: 2 means page -> halves ->
-# halves of a refused half, so a stubborn page costs at most 1 + 2 + 2 requests
-# and never grows without bound.
-PAGE_SPLIT_DEPTH = 2
+# Pages are measured on a cheap downscaled grayscale pixmap.
+BLANK_ANALYSIS_SCALE = 0.25
+
+_FIGURE_LINK = re.compile(r"!\[[^\]\n]*\]\((images/[^)\s]+)\)")
 
 
 @dataclass(frozen=True)
-class Chunk:
-    start_page: int
-    end_page: int
-    image_paths: tuple[Path, ...]
+class Page:
+    """One rendered PDF page; ``stem`` names its files and its progress entry."""
+
+    number: int
+    image_path: Path
     stem: str
     blank: bool = False
+
+    @property
+    def start_page(self) -> int:
+        return self.number
+
+    @property
+    def end_page(self) -> int:
+        return self.number
 
 
 def parse_api_keys(raw: str | None) -> list[str]:
@@ -169,31 +186,19 @@ def download_pdf(source_url: str, destination: Path) -> None:
                 handle.write(data)
 
 
-async def stream_pdf_chunks(pdf_path, image_dir, plan, dpi, jpeg_quality,
-                            image_format, images_per_request, blank_pages):
+async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format):
+    """Render pages one by one on a dedicated thread and yield them in order."""
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
     iterator = render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
                             image_format, is_blank_page)
-    def next_batch():
-        paths = []
-        blanks = set()
-        for _ in range(images_per_request):
-            item = next(iterator, None)
-            if item is None:
-                break
-            path, blank = item
-            paths.append(path)
-            if blank:
-                blanks.add(int(path.stem))
-        return paths, blanks
     loop = asyncio.get_running_loop()
     try:
         while True:
-            paths, blanks = await loop.run_in_executor(executor, next_batch)
-            if not paths:
+            item = await loop.run_in_executor(executor, next, iterator, None)
+            if item is None:
                 return
-            blank_pages.update(blanks)
-            yield build_chunks(paths, images_per_request, plan.width, blanks)[0]
+            path, blank = item
+            yield Page(int(path.stem), path, path.stem, blank)
     finally:
         # close is queued behind any in-progress render on the same thread.
         await loop.run_in_executor(executor, iterator.close)
@@ -203,7 +208,7 @@ async def stream_pdf_chunks(pdf_path, image_dir, plan, dpi, jpeg_quality,
 def page_ink_stats(page: fitz.Page) -> tuple[float, int]:
     """Ink coverage and darkest pixel of a cheap downscaled page preview."""
     pix = page.get_pixmap(
-        matrix=fitz.Matrix(SPLIT_ANALYSIS_SCALE, SPLIT_ANALYSIS_SCALE),
+        matrix=fitz.Matrix(BLANK_ANALYSIS_SCALE, BLANK_ANALYSIS_SCALE),
         colorspace=fitz.csGRAY,
     )
     samples = pix.samples
@@ -220,119 +225,6 @@ def is_blank_page(page: fitz.Page) -> tuple[bool, float, int]:
     return blank, ink, darkest
 
 
-def _page_ink_rows(page: fitz.Page) -> tuple[list[int], int]:
-    """Per-row ink pixel counts of the preview pixmap."""
-    pix = page.get_pixmap(
-        matrix=fitz.Matrix(SPLIT_ANALYSIS_SCALE, SPLIT_ANALYSIS_SCALE),
-        colorspace=fitz.csGRAY,
-    )
-    width, height, samples = pix.width, pix.height, pix.samples
-    rows = [
-        sum(1 for value in samples[y * width : (y + 1) * width] if value < INK_PIXEL_MAX)
-        for y in range(height)
-    ]
-    return rows, height
-
-
-def choose_split_row(rows: list[int], height: int) -> tuple[int, bool]:
-    """Pick the cut row of a page as (row, clean).
-
-    ``row`` is in preview coordinates and is the blank row closest to the middle
-    of the page, so the two halves stay balanced. ``clean`` is True when that row
-    carries no ink at all, i.e. no line of text is sliced by the cut; otherwise
-    the caller has to overlap the halves a little.
-    """
-    center = height / 2
-    for low, high in SPLIT_SEARCH_WINDOWS:
-        start, stop = int(height * low), int(height * high)
-        if stop <= start:
-            continue
-        blank_rows = [y for y in range(start, stop) if rows[y] == 0]
-        if blank_rows:
-            return min(blank_rows, key=lambda y: abs(y - center)), True
-
-    start, stop = int(height * 0.35), int(height * 0.65)
-    if stop <= start:
-        return height // 2, False
-    return min(range(start, stop), key=lambda y: rows[y]), False
-
-
-def native_page_scale(page: fitz.Page) -> float:
-    """Page points to image pixels, so a clipped render keeps the source detail.
-
-    A rendered page image is an image document whose rect comes from its DPI
-    metadata instead of its pixel count: rendering a clip at the identity matrix
-    silently drops 25% of the resolution.
-    """
-    best = None
-    for entry in page.get_image_info():
-        width = entry.get("width") or 0
-        bbox = entry.get("bbox") or (0, 0, 0, 0)
-        placed_width = bbox[2] - bbox[0]
-        if width and placed_width > 0:
-            ratio = width / placed_width
-            if best is None or ratio > best:
-                best = ratio
-    return best or 1.0
-
-
-def split_page_image(image_path: Path, target_dir: Path) -> tuple[list[Path], bool]:
-    """Cut one rendered page into two horizontal halves on a blank row.
-
-    A content refusal is triggered by recognising a whole passage, so the same
-    page usually transcribes fine once it is cropped. Halves are written as PNG
-    at the source resolution, next to the page they come from.
-    """
-    target_dir.mkdir(parents=True, exist_ok=True)
-    source = fitz.open(image_path)
-    try:
-        if source.page_count < 1:
-            raise ValueError(f"{image_path} has no image page")
-        page = source[0]
-        rows, preview_height = _page_ink_rows(page)
-        blank_row, clean = choose_split_row(rows, preview_height)
-        rect = page.rect
-        cut = rect.y0 + blank_row / SPLIT_ANALYSIS_SCALE
-        overlap = 0.0 if clean else rect.height * SPLIT_FALLBACK_OVERLAP
-
-        scale = native_page_scale(page)
-        matrix = fitz.Matrix(scale, scale)
-        clips = (
-            fitz.Rect(rect.x0, rect.y0, rect.x1, cut + overlap),
-            fitz.Rect(rect.x0, cut - overlap, rect.x1, rect.y1),
-        )
-        halves: list[Path] = []
-        for index, clip in enumerate(clips, start=1):
-            pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
-            path = target_dir / f"{image_path.stem}-part{index}.png"
-            path.write_bytes(pix.tobytes("png"))
-            halves.append(path)
-        return halves, clean
-    finally:
-        source.close()
-
-
-def build_chunks(
-    image_paths: list[Path],
-    images_per_request: int,
-    width: int,
-    blank_pages: frozenset[int] | set[int] = frozenset(),
-) -> list[Chunk]:
-    chunks = []
-    for offset in range(0, len(image_paths), images_per_request):
-        batch = tuple(image_paths[offset : offset + images_per_request])
-        start_page = int(batch[0].stem)
-        end_page = int(batch[-1].stem)
-        stem = (
-            f"{start_page:0{width}d}"
-            if start_page == end_page
-            else f"{start_page:0{width}d}-{end_page:0{width}d}"
-        )
-        blank = all(int(path.stem) in blank_pages for path in batch)
-        chunks.append(Chunk(start_page, end_page, batch, stem, blank))
-    return chunks
-
-
 def media_resolution_payload(level: str) -> dict | None:
     if level == "unspecified":
         return None
@@ -341,60 +233,59 @@ def media_resolution_payload(level: str) -> dict | None:
     }
 
 
-def make_request_parts(
-    chunk: Chunk, prompt: str, media_resolution: str
-) -> tuple[list[dict], int]:
-    page_label = (
-        f"第 {chunk.start_page} 页"
-        if chunk.start_page == chunk.end_page
-        else f"第 {chunk.start_page}-{chunk.end_page} 页"
-    )
-    parts = [
-        {
-            "text": (
-                f"以下图片按顺序对应 PDF {page_label}。\n"
-                f"请严格按图片顺序处理。\n\n{prompt.strip()}"
-            )
+def image_part(path: Path, media_resolution: str) -> tuple[dict, int]:
+    data = path.read_bytes()
+    mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    part = {
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": base64.b64encode(data).decode("ascii"),
         }
-    ]
-    raw_bytes = 0
+    }
+    resolution = media_resolution_payload(media_resolution)
+    if resolution is not None:
+        part["mediaResolution"] = resolution
+    return part, len(data)
 
-    for path in chunk.image_paths:
-        data = path.read_bytes()
-        raw_bytes += len(data)
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        image_part = {
-            "inlineData": {
-                "mimeType": mime_type,
-                "data": base64.b64encode(data).decode("ascii"),
-            }
-        }
-        resolution = media_resolution_payload(media_resolution)
-        if resolution is not None:
-            image_part["mediaResolution"] = resolution
-        parts.append(image_part)
 
-    estimated = int(raw_bytes * 4 / 3) + len(prompt.encode("utf-8")) + 64 * 1024
+def _check_request_size(name: str, raw_bytes: int, text: str) -> int:
+    estimated = int(raw_bytes * 4 / 3) + len(text.encode("utf-8")) + 64 * 1024
     if estimated > MAX_INLINE_REQUEST_BYTES:
         raise ValueError(
-            f"Chunk {chunk.stem} is about {estimated / 1024 / 1024:.1f} MiB after base64, "
-            "too large for inline image input. Lower images_per_request or dpi; for JPEG you can also lower jpeg_quality."
+            f"Page {name} is about {estimated / 1024 / 1024:.1f} MiB after base64, "
+            "too large for inline image input. Lower dpi; for JPEG you can also lower jpeg_quality."
         )
-    return parts, estimated
+    return estimated
+
+
+def make_request_parts(
+    page: Page, prompt: str, media_resolution: str, draft: str | None = None
+) -> tuple[list[dict], int]:
+    """The page image plus, when OCR produced one, the draft to refine."""
+    text = f"以下图片是 PDF 第 {page.number} 页。\n"
+    if draft is None:
+        text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
+    else:
+        text += (
+            f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}\n\n"
+            f"<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
+        )
+    image, raw_bytes = image_part(page.image_path, media_resolution)
+    return [{"text": text}, image], _check_request_size(page.stem, raw_bytes, text)
 
 
 def make_verification_parts(
-    chunk: Chunk, prompt: str, draft: str, media_resolution: str
+    page: Page, prompt: str, draft: str, media_resolution: str
 ) -> tuple[list[dict], int]:
-    verify_prompt = f"""请逐页对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
+    verify_prompt = f"""请对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
 
 审校重点：
 1. 逐字符核对所有数学公式：正负号、分数、根号、上下标、积分/求和上下限、矩阵、转置、希腊字母、括号和数字。
-2. 检查是否有漏行、错行、重复、跨页错位、把页眉页脚或扫描水印误当正文。
-3. 检查 Markdown/LaTeX 格式，行内公式使用成对 $...$，多行公式使用成对 $...$。
+2. 检查是否有漏行、错行、重复，或把页眉页脚、扫描水印误当正文。
+3. 检查 Markdown/LaTeX 格式，行内公式使用成对 $...$，多行公式使用成对 $$...$$。
 4. 只依据图片纠错，不要自行改写原文、推导新内容或加入解释。
 5. 若草稿与图片冲突，以图片为准。看不清时写 [无法辨认]，不要猜。
-6. 只输出最终修正后的 Markdown。
+6. 图片引用 ![...](images/...) 原样保留。只输出最终修正后的 Markdown。
 
 原始转录要求：
 {prompt.strip()}
@@ -404,34 +295,17 @@ def make_verification_parts(
 {draft}
 ---END DRAFT---
 """
-    parts = [{"text": verify_prompt}]
-    raw_bytes = 0
-    for path in chunk.image_paths:
-        data = path.read_bytes()
-        raw_bytes += len(data)
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        image_part = {
-            "inlineData": {
-                "mimeType": mime_type,
-                "data": base64.b64encode(data).decode("ascii"),
-            }
-        }
-        resolution = media_resolution_payload(media_resolution)
-        if resolution is not None:
-            image_part["mediaResolution"] = resolution
-        parts.append(image_part)
-    estimated = (
-        int(raw_bytes * 4 / 3)
-        + len(verify_prompt.encode("utf-8"))
-        + 64 * 1024
-    )
-    if estimated > MAX_INLINE_REQUEST_BYTES:
-        raise ValueError(
-            f"Verification chunk {chunk.stem} is about "
-            f"{estimated / 1024 / 1024:.1f} MiB after base64, too large. "
-            "Lower images_per_request or dpi."
-        )
-    return parts, estimated
+    image, raw_bytes = image_part(page.image_path, media_resolution)
+    return [{"text": verify_prompt}, image], _check_request_size(page.stem, raw_bytes, verify_prompt)
+
+
+def keep_known_figures(text: str, figures: dict[str, Path]) -> str:
+    """Drop figure links the model invented; only OCR crops exist on disk."""
+    return _FIGURE_LINK.sub(lambda m: m.group(0) if m.group(1) in figures else "", text)
+
+
+def figures_used(text: str) -> list[str]:
+    return list(dict.fromkeys(_FIGURE_LINK.findall(text)))
 
 
 def _strip_markdown_fences(result: str) -> str:
@@ -560,7 +434,7 @@ class ContentBlockedError(RuntimeError):
     friends) or the prompt itself was blocked. The verdict is a property of the
     page image, not of the quota pool: re-sending the same image reproduces it
     on every attempt, so this error must never enter the backoff rounds.
-    ``split_page_image`` recovers many of these pages instead.
+    The page falls back to its OCR draft instead.
     """
 
 
@@ -569,7 +443,7 @@ class EmptyAnswerError(ContentBlockedError):
 
     Seen on blank scan pages (nothing to transcribe), on figure-only pages and
     on responses whose whole output landed in thinking parts. Retrying the same
-    image does not change it; cutting the page in half usually does.
+    image does not change it.
     """
 
 
@@ -752,7 +626,7 @@ async def call_model(
     api_base: str = "",
     max_output_tokens: int = 0,
 ) -> str:
-    """Transcribe one chunk, walking the fallback chain when a model is saturated.
+    """Send one page request, walking the fallback chain when a model is saturated.
 
     A single model can be unavailable for hours while its siblings keep serving,
     so trying the next model is the cheapest way to turn a hard page failure
@@ -787,8 +661,8 @@ async def call_model(
     raise last_error
 
 
-async def process_chunks(
-    chunks: list[Chunk] | AsyncIterable[Chunk],
+async def process_pages(
+    pages: list[Page] | AsyncIterable[Page],
     state_dir: Path,
     prompt: str,
     model: str,
@@ -802,36 +676,28 @@ async def process_chunks(
     fallback_models: tuple[str, ...] = (),
     retry_rounds: int = 5,
     attempts_per_page: int = 2,
-    blocked_page_split: str = "halves",
     provider: Provider | None = None,
     reasoning_effort: str = "",
     api_base: str = "",
     max_output_tokens: int = 0,
-    total_chunks: int | None = None,
     total_pages: int | None = None,
     hedge_after: float = 60.0,
     hedge_budget: int | None = None,
     publish_progress=None,
+    ocr: PaddleOcr | None = None,
 ) -> list[dict]:
-    if blocked_page_split not in {"none", "halves"}:
-        raise ValueError("blocked_page_split must be none or halves")
-
+    """Finalise every page with the model, using its OCR draft when there is one."""
     provider = provider or resolve_provider(None)
 
     pages_dir = state_dir / "pages"
     errors_dir = state_dir / "errors"
-    split_dir = state_dir / "split"
     pages_dir.mkdir(parents=True, exist_ok=True)
     errors_dir.mkdir(parents=True, exist_ok=True)
 
-    if provider.uses_shared_quota_pool:
-        groups = parse_key_groups(
-            len(keys),
-            os.getenv("GEMINI_KEY_GROUPS"),
-        )
-        print(f"[quota] keys={len(keys)} projects={len(set(groups))}", flush=True)
-    else:
-        groups = []
+    groups = (
+        parse_key_groups(len(keys), os.getenv(provider.key_groups_env))
+        if provider.key_groups_env else None
+    )
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(provider.request_timeout_seconds, connect=30.0),
         limits=httpx.Limits(
@@ -840,292 +706,160 @@ async def process_chunks(
             keepalive_expiry=30.0,
         ),
     ) as client:
-        if provider.uses_shared_quota_pool:
-            key_pool = await ProjectQuotaPool.create(
-                keys,
-                groups,
-                rpm_per_project=rpm_per_key,
-                rpd_per_project=rpd_per_key,
-                client=client,
-            )
-        else:
-            key_pool = await LocalKeyPool.create(
-                keys,
-                rpm_per_key=rpm_per_key,
-                rpd_per_key=rpd_per_key,
-                client=client,
-            )
+        key_pool = await KeyPool.create(
+            keys, groups, rpm_per_key=rpm_per_key, rpd_per_key=rpd_per_key
+        )
 
-        if isinstance(chunks, list):
-            total_chunks = len(chunks)
-            total_pages = sum(c.end_page - c.start_page + 1 for c in chunks)
-        if total_chunks is None or total_pages is None:
-            raise ValueError("Streaming input requires total_chunks and total_pages")
-        tracker = Progress(state_dir, total_chunks=total_chunks, total_pages=total_pages)
+        if isinstance(pages, list):
+            total_pages = len(pages)
+        if total_pages is None:
+            raise ValueError("Streaming input requires total_pages")
+        tracker = Progress(state_dir, total_chunks=total_pages, total_pages=total_pages)
         started_at: dict[str, float] = {}
         stop_metrics = asyncio.Event()
 
-        def performance():
-            if hasattr(key_pool, "performance_summary"):
-                return key_pool.performance_summary()
-            return {"429": 0, "503": 0, "requests": 0, "p50_seconds": None, "p95_seconds": None}
-
         def can_hedge():
-            recent_errors = getattr(key_pool, "recent_statuses", [])[-20:]
-            return not recent_errors or sum(s in (429, 503) for s in recent_errors) / len(recent_errors) < 0.2
+            recent = key_pool.recent_statuses[-20:]
+            return not recent or sum(s in (429, 503) for s in recent) / len(recent) < 0.2
 
         policy = RequestPolicy(
             concurrency=concurrency, hedge_after=hedge_after,
-            hedge_budget=hedge_budget if hedge_budget is not None else max(2, math.ceil(total_chunks * 0.1)),
-            can_hedge=can_hedge, latency_p95=lambda: performance().get("success_p95_seconds"),
+            hedge_budget=hedge_budget if hedge_budget is not None else max(2, math.ceil(total_pages * 0.1)),
+            can_hedge=can_hedge,
+            latency_p95=lambda: key_pool.performance_summary().get("success_p95_seconds"),
         )
         tracker.request_summary = policy.summary
         policy_token = CURRENT_POLICY.set(policy)
 
         async def source():
-            if isinstance(chunks, list):
-                for chunk in chunks:
-                    started_at.setdefault(chunk.stem, time.monotonic())
-                    yield chunk
+            if isinstance(pages, list):
+                for page in pages:
+                    started_at.setdefault(page.stem, time.monotonic())
+                    yield page
             else:
-                async for chunk in chunks:
-                    started_at.setdefault(chunk.stem, time.monotonic())
-                    yield chunk
+                async for page in pages:
+                    started_at.setdefault(page.stem, time.monotonic())
+                    yield page
 
-        def record_success(
-            chunk: Chunk, text: str, estimated: int, note: str = "", **extra
-        ) -> dict:
-            md_path = pages_dir / f"{chunk.stem}.md"
-            error_path = errors_dir / f"{chunk.stem}.json"
-            md_path.write_text(text.rstrip() + "\n", encoding="utf-8")
-            if error_path.exists():
-                error_path.unlink()
-            elapsed = round(time.monotonic() - started_at[chunk.stem], 2)
-            print(f"[done] {chunk.stem}.md ({elapsed}s){note}", flush=True)
+        def record_success(page: Page, text: str, estimated: int, source: str, **extra) -> dict:
+            md_path = pages_dir / f"{page.stem}.md"
+            md_path.write_text(text.strip() + "\n", encoding="utf-8")
+            (errors_dir / f"{page.stem}.json").unlink(missing_ok=True)
+            elapsed = round(time.monotonic() - started_at[page.stem], 2)
+            print(f"[done] {page.stem}.md ({elapsed}s, {source})", flush=True)
             return {
-                "chunk": chunk.stem,
+                "chunk": page.stem,
+                "page": page.number,
                 "status": "ok",
+                "source": source,
                 "path": str(md_path),
+                "figures": figures_used(text),
                 "estimated_payload_bytes": estimated,
                 "elapsed_seconds": elapsed,
                 "retryable": False,
                 **extra,
             }
 
-        def record_blank(chunk: Chunk, reason: str, detail: str) -> dict:
+        def record_blank(page: Page, reason: str, detail: str) -> dict:
             """An empty page contributes nothing to the Markdown: not a failure."""
-            md_path = pages_dir / f"{chunk.stem}.md"
-            error_path = errors_dir / f"{chunk.stem}.json"
+            md_path = pages_dir / f"{page.stem}.md"
             md_path.write_text("", encoding="utf-8")
-            if error_path.exists():
-                error_path.unlink()
-            print(f"[blank] {chunk.stem}: {detail}; skipped", flush=True)
+            (errors_dir / f"{page.stem}.json").unlink(missing_ok=True)
+            print(f"[blank] {page.stem}: {detail}; skipped", flush=True)
             return {
-                "chunk": chunk.stem,
+                "chunk": page.stem,
+                "page": page.number,
                 "status": "blank",
                 "path": str(md_path),
                 "reason": reason,
                 "retryable": False,
             }
 
-        async def run_one(chunk: Chunk, round_number: int) -> dict:
+        async def run_one(page: Page, round_number: int) -> dict:
             if round_number == 1:
-                (pages_dir / f"{chunk.stem}.md").unlink(missing_ok=True)
-            if chunk.blank:
+                (pages_dir / f"{page.stem}.md").unlink(missing_ok=True)
+            if page.blank:
                 return record_blank(
-                    chunk,
+                    page,
                     "blank_page",
                     "no visible page content "
                     f"(ink < {BLANK_PAGE_INK_RATIO} and no pixel darker than "
                     f"{BLANK_PAGE_DARK_LEVEL})",
                 )
 
-            error_path = errors_dir / f"{chunk.stem}.json"
+            ocr_page: OcrPage | None = await ocr.page(page.number) if ocr else None
+            draft = ocr_page.markdown if ocr_page else None
+            figures = ocr_page.figures if ocr_page else {}
             attempts = max(1, attempts_per_page)
 
-            async def transcribe(target: Chunk, name: str) -> tuple[str, int]:
-                parts, estimated = make_request_parts(target, prompt, media_resolution)
+            async def transcribe() -> tuple[str, int]:
+                parts, estimated = make_request_parts(page, prompt, media_resolution, draft)
                 text = await call_model(
-                    client,
-                    key_pool,
-                    provider,
-                    model,
-                    parts,
-                    name,
-                    thinking_level,
-                    fallback_models,
-                    reasoning_effort,
-                    api_base,
-                    max_output_tokens,
+                    client, key_pool, provider, model, parts, page.stem, thinking_level,
+                    fallback_models, reasoning_effort, api_base, max_output_tokens,
                 )
-
                 for verify_index in range(verification_passes):
-                    verify_parts, _ = make_verification_parts(
-                        target, prompt, text, media_resolution
-                    )
+                    verify_parts, _ = make_verification_parts(page, prompt, text, media_resolution)
                     text = await call_model(
-                        client,
-                        key_pool,
-                        provider,
-                        model,
-                        verify_parts,
-                        f"{name}-verify-{verify_index + 1}",
-                        thinking_level,
-                        fallback_models,
-                        reasoning_effort,
-                        api_base,
-                        max_output_tokens,
+                        client, key_pool, provider, model, verify_parts,
+                        f"{page.stem}-verify-{verify_index + 1}", thinking_level,
+                        fallback_models, reasoning_effort, api_base, max_output_tokens,
                     )
                 return text, estimated
 
-            async def transcribe_part(
-                path: Path, name: str, splits_left: int
-            ) -> tuple[str, bool]:
-                """Transcribe one page image, cutting it up while it is refused.
-
-                Returns the text plus whether this crop was refused (as opposed to
-                simply empty). ``splits_left`` bounds the recursion, so a page that
-                is refused all the way down fails in seconds instead of eating the
-                whole quota pool.
-                """
-                part_chunk = Chunk(chunk.start_page, chunk.end_page, (path,), name)
-                try:
-                    text, _ = await transcribe(part_chunk, name)
-                except EmptyAnswerError:
-                    # An empty STOP answer means this crop has nothing to
-                    # transcribe; a smaller crop would not invent text either.
-                    return "", False
-                except ContentBlockedError as blocked:
-                    if splits_left <= 0:
-                        return "", True
-                    text, missing = await split_and_transcribe(
-                        path, name, blocked, splits_left
-                    )
-                    return text, bool(missing)
-                return text, False
-
-            async def split_and_transcribe(
-                path: Path, name: str, blocked: Exception, splits_left: int
-            ) -> tuple[str, list[str]]:
-                """Cut a refused image on blank rows and transcribe every part.
-
-                Returns the recovered text plus the parts that stayed refused at
-                their smallest size (their text is missing from the output).
-                """
-                parts, clean = await asyncio.to_thread(split_page_image, path, split_dir)
-                print(
-                    f"[split] {name}: {type(blocked).__name__} ({blocked}); "
-                    f"cutting into {len(parts)} parts (clean_cut={clean})",
-                    flush=True,
-                )
-                texts: list[str] = []
-                missing: list[str] = []
-                for index, part in enumerate(parts, start=1):
-                    part_name = f"{name}-part{index}"
-                    text, refused = await transcribe_part(part, part_name, splits_left - 1)
-                    if text.strip():
-                        texts.append(text)
-                    elif refused:
-                        # A refusal is about that one region, so the sibling parts
-                        # are still worth keeping; record what got lost instead.
-                        missing.append(part_name)
-                return "\n\n".join(texts), missing
-
-            async def transcribe_with_page_split(
-                blocked: Exception,
-            ) -> tuple[str, list[str]]:
-                """Retry a refused page by cutting it on blank rows.
-
-                Returns the recovered text and the parts that stayed refused at
-                their smallest size, so the caller can report a partial recovery
-                instead of silently dropping content.
-                """
-                text, missing = await split_and_transcribe(
-                    chunk.image_paths[0], chunk.stem, blocked, PAGE_SPLIT_DEPTH
-                )
-                if not text.strip():
-                    raise ContentBlockedError(
-                        "Gemini refused this page image and every part of it "
-                        f"({', '.join(missing) or 'no part returned text'})"
-                    ) from blocked
-                if missing:
-                    print(
-                        f"[warn] {chunk.stem}: Gemini refused {', '.join(missing)} "
-                        "at every size; that text is missing from the Markdown",
-                        flush=True,
-                    )
-                return text, missing
-
             # A saturated free tier answers 503 in a couple of seconds, so an
             # immediate retry is far cheaper than deferring the page to the next
-            # round, which waits 30-480 seconds.
+            # round, which waits 5-90 seconds.
             last_error: Exception | None = None
             for attempt in range(1, attempts + 1):
                 try:
-                    text, estimated = await transcribe(chunk, chunk.stem)
+                    text, estimated = await transcribe()
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     if not is_retryable_error(exc) or attempt >= attempts:
                         break
                     pause = random.uniform(3.0, 8.0) * attempt
                     print(
-                        f"[retry] {chunk.stem}: attempt {attempt}/{attempts} failed "
+                        f"[retry] {page.stem}: attempt {attempt}/{attempts} failed "
                         f"with {type(exc).__name__}: {exc}; retrying in {pause:.1f}s",
                         flush=True,
                     )
                     await asyncio.sleep(pause)
                     continue
+                text = keep_known_figures(text, figures)
+                return record_success(
+                    page, text, estimated, "ocr+model" if draft is not None else "model"
+                )
 
-                return record_success(chunk, text, estimated)
-
-            exc = last_error if last_error is not None else RuntimeError(
-                "transcription failed without an exception"
-            )
-
+            exc = last_error or RuntimeError("transcription failed without an exception")
+            has_draft = bool(draft and draft.strip())
+            last_round = round_number >= retry_rounds or not is_retryable_error(exc)
+            if has_draft and last_round:
+                print(
+                    f"[fallback] {page.stem}: model gave up with {type(exc).__name__}: "
+                    f"{exc}; using the OCR draft",
+                    flush=True,
+                )
+                return record_success(
+                    page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
+                )
             if isinstance(exc, EmptyAnswerError):
-                # Gemini answered STOP with no text at all: there is nothing to
-                # transcribe here, so this page is blank, not failed.
-                return record_blank(chunk, "no_transcribable_text", str(exc))
-
-            if (
-                isinstance(exc, ContentBlockedError)
-                and blocked_page_split == "halves"
-                and chunk.start_page == chunk.end_page
-                and chunk.image_paths
-            ):
-                try:
-                    text, missing = await transcribe_with_page_split(exc)
-                except EmptyAnswerError as empty:
-                    return record_blank(chunk, "no_transcribable_text", str(empty))
-                except Exception as unrecovered:  # noqa: BLE001
-                    exc = unrecovered
-                else:
-                    note = " via page split"
-                    if missing:
-                        note = f" via page split ({len(missing)} part(s) missing)"
-                    return record_success(
-                        chunk,
-                        text,
-                        0,
-                        note=note,
-                        recovered_by="page_split",
-                        missing_parts=missing,
-                    )
+                # No OCR text and no model text: nothing to transcribe here.
+                return record_blank(page, "no_transcribable_text", str(exc))
 
             error = {
-                "chunk": chunk.stem,
-                "start_page": chunk.start_page,
-                "end_page": chunk.end_page,
+                "chunk": page.stem,
+                "page": page.number,
+                "start_page": page.number,
+                "end_page": page.number,
                 "error": f"{type(exc).__name__}: {exc}",
                 "round": round_number,
                 "attempts": attempts,
             }
-            error_path.write_text(
-                json.dumps(error, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            (errors_dir / f"{page.stem}.json").write_text(
+                json.dumps(error, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             return {
-                "chunk": chunk.stem,
                 "status": "failed",
                 "retryable": is_retryable_error(exc),
                 **error,
@@ -1143,23 +877,16 @@ async def process_chunks(
                         except Exception as exc:
                             print(f"[warn] Cannot refresh partial Markdown: {type(exc).__name__}: {exc}",
                                   file=sys.stderr, flush=True)
-                    counts = performance()
+                    counts = key_pool.performance_summary()
                     snapshot = tracker.write(log=True)
-                    remote = {}
-                    if provider.uses_shared_quota_pool and hasattr(key_pool, "remote_status"):
-                        try:
-                            async with asyncio.timeout(2):
-                                remote = (await key_pool.remote_status()).get("global", {})
-                        except Exception:
-                            pass
+                    ocr_note = f"ocr_pages={ocr.stats['pages']} " if ocr and ocr.enabled else ""
                     print(
-                        f"[metrics] pending_chunks={snapshot['pending_chunks']} "
-                        f"active_chunks={snapshot['active_chunks']} "
+                        f"[metrics] pending={snapshot['pending_chunks']} "
+                        f"active={snapshot['active_chunks']} "
                         f"success={snapshot['success_chunks']} failed={snapshot['failed_chunks']} "
-                        f"retrying={snapshot['retrying_chunks']} "
+                        f"retrying={snapshot['retrying_chunks']} {ocr_note}"
                         f"http_429={counts['429']} http_503={counts['503']} "
                         f"http_p50={counts['p50_seconds']}s http_p95={counts['p95_seconds']}s "
-                        f"global_inflight={remote.get('activeLeases', '?')}/{remote.get('maxInflight', '?')} "
                         f"hedges={policy.hedges} hedge_wins={policy.hedge_wins}", flush=True,
                     )
 
@@ -1176,20 +903,22 @@ async def process_chunks(
 
         for result in results:
             if result["status"] == "failed":
-                print(
-                    f"[failed] {result['chunk']}: {result['error']}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        quota_summary = key_pool.usage_summary()
-        quota_summary["speculation"] = policy.summary()
+                print(f"[failed] {result['chunk']}: {result['error']}", file=sys.stderr, flush=True)
+        usage = key_pool.usage_summary()
+        usage["speculation"] = policy.summary()
+        usage["ocr"] = ocr.stats if ocr and ocr.enabled else None
+        usage["page_sources"] = {
+            source: sum(r.get("source") == source for r in results)
+            for source in ("ocr+model", "model", "ocr")
+        }
         (state_dir / "quota-usage.json").write_text(
-            json.dumps(quota_summary, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+            json.dumps(usage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        spread = usage["spread"]
         print(
-            f"[quota] action complete keys={len(keys)} "
-            f"requests={sum(key_pool.used)}",
+            f"[quota] action complete keys={len(keys)} requests={sum(key_pool.used)} "
+            f"per_bucket={spread['min_requests']}-{spread['max_requests']} "
+            f"sources={json.dumps(usage['page_sources'])}",
             flush=True,
         )
         return results
@@ -1205,8 +934,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--source-url", required=True)
     p.add_argument("--output-name", default="merged",
-                   help="Final Markdown basename without extension; source is reserved.")
-    p.add_argument("--images-per-request", type=int, default=1)
+                   help="Merged Markdown basename without extension.")
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument(
         "--system-prompt",
@@ -1225,6 +953,19 @@ def parser() -> argparse.ArgumentParser:
             "never replaces it."
         ),
     )
+    p.add_argument(
+        "--ocr",
+        choices=["paddle", "none"],
+        default="paddle",
+        help=(
+            "Draft every page with PaddleOCR-VL first (tokens in PADDLEOCR_TOKENS) "
+            "and let the model refine it. 'none' sends only the page image."
+        ),
+    )
+    p.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
+    p.add_argument("--ocr-url", default=JOB_URL, help="PaddleOCR async job endpoint.")
+    p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
+                   help="Pages per PaddleOCR job.")
     p.add_argument(
         "--provider",
         default="",
@@ -1269,9 +1010,8 @@ def parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Cap on the answer length; 0 omits the field and lets the gateway "
-            "decide. A gateway default can be far below what a dense page needs, "
-            "so a truncated answer is reported as a failure instead of being "
-            "silently accepted as a complete page."
+            "decide. A truncated answer is reported as a failure instead of "
+            "being silently accepted as a complete page."
         ),
     )
     p.add_argument(
@@ -1288,20 +1028,13 @@ def parser() -> argparse.ArgumentParser:
         "--retry-rounds",
         type=int,
         default=5,
-        help=(
-            "Maximum passes per failed chunk. Independent retries wait roughly "
-            "twice as long as the previous one. Default: 5."
-        ),
+        help="Maximum passes per failed page; the last one falls back to the OCR draft.",
     )
     p.add_argument(
         "--attempts-per-page",
         type=int,
         default=2,
-        help=(
-            "Immediate attempts per page inside a round before the page is "
-            "deferred. A saturated model answers 503 within seconds, so a quick "
-            "retry is much cheaper than waiting for the next round. Default: 2."
-        ),
+        help="Immediate attempts per page inside a round before the page is deferred.",
     )
     p.add_argument(
         "--thinking-level",
@@ -1321,7 +1054,7 @@ def parser() -> argparse.ArgumentParser:
         "--verification-passes",
         type=int,
         default=0,
-        help="Extra image-vs-Markdown verification passes after initial transcription.",
+        help="Extra image-vs-Markdown verification passes after the first answer.",
     )
     p.add_argument(
         "--media-resolution",
@@ -1333,40 +1066,22 @@ def parser() -> argparse.ArgumentParser:
         "--rpm-per-key",
         type=float,
         default=15.0,
-        help="Maximum requests/minute per Gemini project or other provider key.",
+        help="Requests/minute per Gemini project or other provider key.",
     )
     p.add_argument(
         "--rpd-per-key",
         type=int,
         default=500,
-        help="Maximum requests/day per Gemini project or other provider key.",
+        help="Requests per run per Gemini project or other provider key.",
     )
-    p.add_argument(
-        "--start-page",
-        type=int,
-        default=None,
-        help="1-based first PDF page to process. Default: first page.",
-    )
-    p.add_argument(
-        "--end-page",
-        type=int,
-        default=None,
-        help="1-based last PDF page to process. Default: last page.",
-    )
-    p.add_argument(
-        "--blocked-page-split",
-        choices=["none", "halves"],
-        default="halves",
-        help=(
-            "When Gemini refuses a single page (RECITATION, safety block), retry it "
-            "as two horizontal halves cut on a blank row, cutting a refused half "
-            "again (at most PAGE_SPLIT_DEPTH times). 'none' disables it."
-        ),
-    )
+    p.add_argument("--start-page", type=int, default=None,
+                   help="1-based first PDF page to process. Default: first page.")
+    p.add_argument("--end-page", type=int, default=None,
+                   help="1-based last PDF page to process. Default: last page.")
     p.add_argument("--hedge-after", type=float, default=60.0,
                    help="Minimum HTTP age for speculative copies; also >= twice successful p95. 0 disables.")
     p.add_argument("--hedge-budget", type=int, default=-1,
-                   help="Max extra requests per conversion. -1 uses 10%% of chunks (minimum 2); 0 disables.")
+                   help="Max extra requests per conversion. -1 uses 10%% of pages (minimum 2); 0 disables.")
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output",
                    help="Dedicated generated artifact directory; cleared on each run.")
@@ -1390,20 +1105,19 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if len(args.prompt) > MAX_PROMPT_CHARS:
         raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
-    if not 1 <= args.images_per_request <= 20:
-        raise ValueError("images_per_request must be between 1 and 20")
     if not 1 <= args.concurrency <= 100:
         raise ValueError("concurrency must be between 1 and 100")
+    ocr_url = urlparse(args.ocr_url)
+    if ocr_url.scheme not in {"http", "https"} or not ocr_url.hostname:
+        raise ValueError("ocr_url must be an absolute http(s) URL")
+    if not 1 <= args.ocr_segment_pages <= 100:
+        raise ValueError("ocr_segment_pages must be between 1 and 100")
     if not 72 <= args.dpi <= 300:
         raise ValueError("dpi must be between 72 and 300")
     if not 50 <= args.jpeg_quality <= 100:
         raise ValueError("jpeg_quality must be between 50 and 100")
-    if args.image_format not in {"png", "jpeg"}:
-        raise ValueError("image_format must be png or jpeg")
     if not 0 <= args.verification_passes <= 3:
         raise ValueError("verification_passes must be between 0 and 3")
-    if args.thinking_level not in {"minimal", "low", "medium", "high"}:
-        raise ValueError("thinking_level must be minimal, low, medium, or high")
     if args.start_page is not None and args.start_page < 1:
         raise ValueError("start_page must be >= 1")
     if args.end_page is not None and args.end_page < 1:
@@ -1422,18 +1136,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("retry_rounds must be between 1 and 10")
     if not 1 <= args.attempts_per_page <= 5:
         raise ValueError("attempts_per_page must be between 1 and 5")
-    if args.media_resolution not in {
-        "unspecified",
-        "low",
-        "medium",
-        "high",
-        "ultra_high",
-    }:
-        raise ValueError(
-            "media_resolution must be unspecified, low, medium, high, or ultra_high"
-        )
-    if args.blocked_page_split not in {"none", "halves"}:
-        raise ValueError("blocked_page_split must be none or halves")
     if args.provider:
         resolve_provider(args.provider)
     if args.api_base:
@@ -1473,6 +1175,10 @@ async def async_main(args: argparse.Namespace) -> int:
             f"(e.g. {provider.model_example}) or the request will 404.",
             flush=True,
         )
+    ocr_tokens = parse_tokens(os.getenv("PADDLEOCR_TOKENS")) if args.ocr == "paddle" else []
+    if args.ocr == "paddle" and not ocr_tokens:
+        print("[warn] PADDLEOCR_TOKENS is empty; pages are transcribed from images only",
+              flush=True)
 
     source_pdf = work_dir / "source.pdf"
     images_dir = work_dir / "images"
@@ -1480,8 +1186,8 @@ async def async_main(args: argparse.Namespace) -> int:
     print(
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
+        f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
         f"concurrency={args.concurrency} "
-        f"images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
@@ -1490,7 +1196,6 @@ async def async_main(args: argparse.Namespace) -> int:
         f"model_fallbacks={','.join(fallback_models) or 'none'} "
         f"retry_rounds={args.retry_rounds} "
         f"attempts_per_page={args.attempts_per_page} "
-        f"blocked_page_split={args.blocked_page_split} "
         f"hedge_after={args.hedge_after:g}s hedge_budget={args.hedge_budget} "
         f"page_range={args.start_page or 1}-{args.end_page or 'end'}",
         flush=True,
@@ -1523,79 +1228,90 @@ async def async_main(args: argparse.Namespace) -> int:
             )
 
     plan = await asyncio.to_thread(RenderPlan.from_pdf, source_pdf, args.start_page, args.end_page)
-    blank_pages: set[int] = set()
-    chunks: list[Chunk] = []
-    rendered = stream_pdf_chunks(source_pdf, images_dir, plan, args.dpi,
-                                args.jpeg_quality, args.image_format,
-                                args.images_per_request, blank_pages)
-    async def chunk_source():
+    print(f"[plan] pages={plan.page_count} streaming=true", flush=True)
+    pages: list[Page] = []
+    rendered = stream_pages(source_pdf, images_dir, plan, args.dpi,
+                            args.jpeg_quality, args.image_format)
+
+    async def page_source():
         async with contextlib.aclosing(rendered):
-            async for chunk in rendered:
-                chunks.append(chunk)
-                yield chunk
-    print(f"[plan] pages={plan.page_count} chunks={math.ceil(plan.page_count / args.images_per_request)} streaming=true", flush=True)
+            async for page in rendered:
+                pages.append(page)
+                yield page
 
     pipeline_error = None
+
     def publish(results):
         return write_result(
             output_dir=output_dir, state_dir=state_dir, name=args.output_name,
             source_url=args.source_url, plan=plan, provider=provider.name, model=model,
+            ocr_model=args.ocr_model if ocr_tokens else None,
             converted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            chunks=chunks, results=results, pipeline_error=pipeline_error,
+            pages=pages, results=results, pipeline_error=pipeline_error,
         )
+
     # Always keep a compact partial package, including during cancellation.
     publish([])
-    try:
-        results = await process_chunks(
-            chunk_source(),
-            state_dir,
-            prompt,
-            model,
-            args.concurrency,
-            keys,
-            args.thinking_level,
-            args.verification_passes,
-            args.media_resolution,
-            args.rpm_per_key,
-            args.rpd_per_key,
-            fallback_models=fallback_models,
-            retry_rounds=args.retry_rounds,
-            attempts_per_page=args.attempts_per_page,
-            blocked_page_split=args.blocked_page_split,
-            provider=provider,
-            reasoning_effort=reasoning_effort,
-            api_base=api_base,
-            max_output_tokens=args.max_output_tokens,
-            total_chunks=math.ceil(plan.page_count / args.images_per_request),
-            total_pages=plan.page_count,
-            hedge_after=args.hedge_after,
-            hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
-            publish_progress=publish,
-        )
-    except (Exception, asyncio.CancelledError) as exc:
-        cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
-        pipeline_error = f"{type(exc).__name__}: {exc}"
-        print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as ocr_client:
+        ocr = PaddleOcr(ocr_tokens, client=ocr_client, work_dir=state_dir,
+                        model=args.ocr_model, job_url=args.ocr_url,
+                        segment_pages=args.ocr_segment_pages)
+        ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
-            result_index = state_dir / "results.json"
-            results = json.loads(result_index.read_text()) if result_index.exists() else []
-            if not (state_dir / 'progress.json').exists():
-                failed_progress = Progress(state_dir, total_chunks=math.ceil(plan.page_count / args.images_per_request),
-                                           total_pages=plan.page_count)
-                failed_progress.state = 'failed'
-                failed_progress.write(log=True)
+            results = await process_pages(
+                page_source(),
+                state_dir,
+                prompt,
+                model,
+                args.concurrency,
+                keys,
+                args.thinking_level,
+                args.verification_passes,
+                args.media_resolution,
+                args.rpm_per_key,
+                args.rpd_per_key,
+                fallback_models=fallback_models,
+                retry_rounds=args.retry_rounds,
+                attempts_per_page=args.attempts_per_page,
+                provider=provider,
+                reasoning_effort=reasoning_effort,
+                api_base=api_base,
+                max_output_tokens=args.max_output_tokens,
+                total_pages=plan.page_count,
+                hedge_after=args.hedge_after,
+                hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
+                publish_progress=publish,
+                ocr=ocr,
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
+            pipeline_error = f"{type(exc).__name__}: {exc}"
+            print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
+            try:
+                result_index = state_dir / "results.json"
+                results = json.loads(result_index.read_text()) if result_index.exists() else []
+                if not (state_dir / "progress.json").exists():
+                    failed_progress = Progress(state_dir, total_chunks=plan.page_count,
+                                               total_pages=plan.page_count)
+                    failed_progress.state = "failed"
+                    failed_progress.write(log=True)
+                files = publish(results)
+            except Exception as save_error:
+                print(f"[warn] Cannot save partial result: {type(save_error).__name__}: {save_error}",
+                      file=sys.stderr, flush=True)
+                raise
+            finally:
+                if cancelled:
+                    raise asyncio.CancelledError
+        else:
             files = publish(results)
-        except Exception as save_error:
-            print(f"[warn] Cannot save partial result: {type(save_error).__name__}: {save_error}",
-                  file=sys.stderr, flush=True)
-            raise
         finally:
-            if cancelled:
-                raise asyncio.CancelledError
-    else:
-        files = publish(results)
+            if ocr_task is not None:
+                ocr_task.cancel()
+                await asyncio.gather(ocr_task, return_exceptions=True)
     if files.partial:
-        print(f"[result] partial: {files.markdown}; see source.md for missing pages", file=sys.stderr, flush=True)
+        print(f"[result] partial: {files.markdown}; missing pages are listed in its header",
+              file=sys.stderr, flush=True)
         return 2
     print(f"[result] success: {files.markdown}", flush=True)
     return 0

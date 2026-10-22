@@ -33,12 +33,12 @@ on:
           - gemini
           - modelflare
       images_per_request:
-        description: "How many consecutive PDF pages/images to send in one model request"
+        description: "Deprecated and ignored: every page is one request (page image + its OCR draft). Kept so existing dispatchers keep working."
         required: true
         default: "1"
         type: string
       concurrency:
-        description: "Local page workers; Gemini additionally uses the shared quota API"
+        description: "Concurrent page requests, including speculative copies"
         required: true
         default: "50"
         type: string
@@ -73,7 +73,7 @@ on:
         default: "0"
         type: string
       retry_rounds:
-        description: "Maximum passes per failed page; retries are scheduled independently."
+        description: "Maximum passes per failed page; after the last one the page uses its OCR draft."
         required: false
         default: "5"
         type: string
@@ -160,7 +160,6 @@ jobs:
       PROVIDER: ${{ github.event.inputs.provider || 'gemini' }}
       OUTPUT_NAME: ${{ github.event.inputs.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url }}
-      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || '50' }}
       SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || '' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || '' }}
@@ -178,6 +177,7 @@ jobs:
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || '95' }}
       VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || '0' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
+      OCR: ${{ vars.CONVERTER_OCR || 'paddle' }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
       START_PAGE: ${{ github.event.inputs.start_page || '' }}
@@ -185,8 +185,7 @@ jobs:
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       MODELFLARE_API_KEYS: ${{ secrets.MODELFLARE_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
-      GEMINI_QUOTA_API_URL: ${{ vars.GEMINI_QUOTA_API_URL }}
-      GEMINI_QUOTA_API_TOKEN: ${{ secrets.GEMINI_QUOTA_API_TOKEN }}
+      PADDLEOCR_TOKENS: ${{ secrets.BAIDU_AI_STUDIO }}
 
     steps:
       - name: Checkout
@@ -214,12 +213,9 @@ jobs:
             exit 1
           fi
           if [[ "${PROVIDER}" == "gemini" ]]; then
-            if [[ -z "${GEMINI_API_KEYS}" || -z "${GEMINI_QUOTA_API_URL}" || -z "${GEMINI_QUOTA_API_TOKEN}" ]]; then
-              echo "Gemini requires GEMINI_API_KEYS, GEMINI_QUOTA_API_URL, and GEMINI_QUOTA_API_TOKEN" >&2
+            if [[ -z "${GEMINI_API_KEYS}" ]]; then
+              echo "Repository secret GEMINI_API_KEYS is required" >&2
               exit 1
-            fi
-            if [[ -z "${GEMINI_KEY_GROUPS}" ]]; then
-              echo "::warning::Repository variable GEMINI_KEY_GROUPS is empty. Generate the list with deploy/print-key-groups.py so the quota pool can group keys by Google Cloud project."
             fi
           elif [[ "${PROVIDER}" == "modelflare" ]]; then
             if [[ -z "${MODELFLARE_API_KEYS}" ]]; then
@@ -234,6 +230,9 @@ jobs:
             echo "Unsupported provider: ${PROVIDER}" >&2
             exit 1
           fi
+          if [[ "${OCR}" == "paddle" && -z "${PADDLEOCR_TOKENS}" ]]; then
+            echo "::warning::Repository secret BAIDU_AI_STUDIO is empty; pages are transcribed from images only."
+          fi
 
       - name: Convert PDF to Markdown
         shell: bash
@@ -244,7 +243,7 @@ jobs:
             --provider "${PROVIDER}"
             --source-url "${SOURCE_URL}"
             --output-name "${OUTPUT_NAME}"
-            --images-per-request "${IMAGES_PER_REQUEST}"
+            --ocr "${OCR}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
             --model-fallbacks "${MODEL_FALLBACKS}"
@@ -288,6 +287,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: file-converter-pdf-to-md-${{ github.run_id }}
-          path: output/*.md
+          path: output/
           if-no-files-found: warn
           retention-days: 3

@@ -29,7 +29,7 @@ import re
 import time
 from typing import ClassVar
 
-from quota_client import classify_quota_error, retry_after_seconds
+from key_pool import classify_quota_error, retry_after_seconds
 
 #: Finish reasons that mean "this page image was refused". Resending the same
 #: image reproduces the verdict, so these must never enter the backoff rounds.
@@ -134,10 +134,10 @@ class Provider(abc.ABC):
     fallbacks_env: ClassVar[str] = ""
     #: How to obtain the key, printed when it is missing.
     api_key_hint: ClassVar[str] = ""
-    #: Whether the run needs the shared Valkey quota pool. Only the Gemini
-    #: free tier does: it is billed per Google Cloud project, so keys must be
-    #: paced globally. A paid gateway needs no such coordination.
-    uses_shared_quota_pool: ClassVar[bool] = False
+    #: Environment variable mapping each key to its quota bucket. Only the
+    #: Gemini free tier needs it: RPM/RPD are metered per Google Cloud project,
+    #: so keys of one project share a pacing bucket. Empty: one bucket per key.
+    key_groups_env: ClassVar[str] = ""
     #: Fallback chain used when neither the CLI nor the environment sets one.
     default_model_fallbacks: ClassVar[tuple[str, ...]] = ()
     #: Model id used when ``--model`` is empty. Blank means the caller must
@@ -208,7 +208,7 @@ class GeminiProvider(Provider):
     api_key_env = "GEMINI_API_KEYS"
     fallbacks_env = "GEMINI_MODEL_FALLBACKS"
     api_key_hint = "Add a repository Actions secret with one Gemini API key per line."
-    uses_shared_quota_pool = True
+    key_groups_env = "GEMINI_KEY_GROUPS"
     default_model_fallbacks = ("gemini-flash-lite-latest",)
     default_model = "gemini-3.5-flash-lite"
     model_example = "gemini-3.5-flash-lite"
@@ -310,7 +310,6 @@ class OpenAICompatibleProvider(Provider):
         "openai-award for the cheap route or openai-stable for the reliable one "
         "-- is granted to the key itself, not to the request."
     )
-    uses_shared_quota_pool = False
     default_model_fallbacks = ()
     # Deliberately blank: which vision model is strongest changes faster than
     # this file does, and guessing would silently pick one for the user.

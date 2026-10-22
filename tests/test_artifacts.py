@@ -1,91 +1,108 @@
+import os
 import tempfile
 import unittest
-import os
 from pathlib import Path
 from unittest.mock import patch
+
 from artifacts import prepare_directories, validate_output_name, write_result
-from pdf2md import Chunk
+from helpers import page
 from render_stream import RenderPlan
 
 
 class ArtifactTests(unittest.TestCase):
-    def test_failed_write_does_not_leave_temporary_files_in_package(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepare_directories(root / 'work', root / 'output')
-            actual_write = Path.write_text
-            def disk_failure(path, text, **kwargs):
-                actual_write(path, text, **kwargs)
-                raise OSError('Disk failure after partial write')
-            with patch('artifacts.Path.write_text', disk_failure), self.assertRaises(OSError):
-                self.write(root, [], [])
-            self.assertEqual(list((root / 'output').iterdir()), [])
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.state = prepare_directories(self.root / 'work', self.root / 'output')
+        (self.state / 'pages').mkdir()
+        (self.state / 'figures').mkdir()
 
-    def write(self, root, chunks, results, **overrides):
-        options = dict(output_dir=root / 'output', state_dir=root / 'work/conversion',
+    def write(self, pages, results, **overrides):
+        options = dict(output_dir=self.root / 'output', state_dir=self.state,
                        name='数学笔记', source_url='https://example.test/book.pdf',
                        plan=RenderPlan(10, 2, 3, 3), provider='gemini', model='vision',
-                       converted_at='2026-09-30T10:00:00+00:00', chunks=chunks,
-                       results=results, pipeline_error=None)
+                       ocr_model='PaddleOCR-VL-1.6', converted_at='2026-09-30T10:00:00+00:00',
+                       pages=pages, results=results, pipeline_error=None)
         options.update(overrides)
-        return write_result(**options).markdown
+        return write_result(**options)
 
-    def test_package_has_only_source_and_final_with_ordered_current_pages(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepare_directories(root / 'work', root / 'output')
-            pages = root / 'work/conversion/pages'
-            pages.mkdir()
-            for name in ['2', '3', '999']:
-                (pages / f'{name}.md').write_text(f'Page {name}')
-            chunks = [Chunk(3, 3, (), '3'), Chunk(2, 2, (), '2')]
-            path = self.write(root, chunks, [{'chunk': c.stem, 'status': 'ok'} for c in chunks])
-            source = (root / 'output/source.md').read_text()
-            self.assertEqual({p.name for p in path.parent.iterdir()}, {'source.md', '数学笔记.md'})
-            self.assertTrue(path.read_text().startswith(source + '\n---\n\n'))
-            self.assertTrue(path.read_text().endswith('Page 2\n\nPage 3\n'))
-            self.assertEqual(path.read_text().count('https://example.test/book.pdf'), 1)
-            self.assertIn('10', source)
-            self.assertIn('2–3', source)
-            self.assertIn('2/2', source)
+    def page_text(self, number, text, source='ocr+model'):
+        (self.state / 'pages' / f'{number:03d}.md').write_text(text)
+        return {'chunk': f'{number:03d}', 'status': 'ok', 'source': source}
+
+    def test_package_is_merged_file_page_files_and_figures(self):
+        (self.state / 'figures/p003-1.jpg').write_bytes(b'figure')
+        (self.state / 'figures/p003-2.jpg').write_bytes(b'unused figure')
+        results = [self.page_text(3, 'Page 3 ![](images/p003-1.jpg)'), self.page_text(2, 'Page 2')]
+        files = self.write([page(3), page(2)], results)
+        output = self.root / 'output'
+        self.assertFalse(files.partial)
+        self.assertEqual(files.markdown, output / '数学笔记.md')
+        self.assertEqual({p.name for p in output.iterdir()}, {'数学笔记.md', 'pages', 'images'})
+        self.assertEqual(sorted(p.name for p in (output / 'pages').iterdir()), ['002.md', '003.md'])
+        self.assertEqual([p.name for p in (output / 'images').iterdir()], ['p003-1.jpg'])
+        self.assertEqual((output / 'pages/003.md').read_text(), 'Page 3 ![](../images/p003-1.jpg)\n')
+        merged = files.markdown.read_text()
+        self.assertTrue(merged.startswith('# 文档信息\n'))
+        self.assertIn('- 识别流程：PaddleOCR-VL-1.6 → gemini / vision', merged)
+        self.assertIn('- 转换结果：完成（2/2 页）', merged)
+        self.assertTrue(merged.endswith('<!-- 第 2 页 -->\n\nPage 2\n\n<!-- 第 3 页 -->\n\n'
+                                        'Page 3 ![](images/p003-1.jpg)\n'))
+        self.assertEqual(merged.count('https://example.test/book.pdf'), 1)
+
+    def test_fallback_sources_are_listed(self):
+        results = [self.page_text(2, 'A', source='ocr'), self.page_text(3, 'B', source='model')]
+        merged = self.write([page(2), page(3)], results).markdown.read_text()
+        self.assertIn('- 模型失败、直接使用 OCR 结果的页码：2', merged)
+        self.assertIn('- 未用 OCR 草稿（仅图片转写）的页码：3', merged)
+
+    def test_without_ocr_the_pipeline_names_only_the_model(self):
+        merged = self.write([], [], ocr_model=None).markdown.read_text()
+        self.assertIn('- 识别流程：gemini / vision', merged)
 
     def test_failed_and_unrendered_pages_are_visible_in_partial_header(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepare_directories(root / 'work', root / 'output')
-            pages = root / 'work/conversion/pages'
-            pages.mkdir()
-            (pages / '2.md').write_text('Kept content')
-            path = self.write(root, [Chunk(2, 2, (), '2')], [{'chunk': '2', 'status': 'ok'}],
-                              plan=RenderPlan(10, 2, 5, 3), pipeline_error='private internal details')
-            source = (root / 'output/source.md').read_text()
-            self.assertEqual(path.name, '数学笔记.partial.md')
-            self.assertIn('3–5', source)
-            self.assertIn('1/4', source)
-            self.assertNotIn('private internal details', source)
-            self.assertIn('Kept content', path.read_text())
+        results = [self.page_text(2, 'Kept content'), {'chunk': '003', 'status': 'failed'}]
+        files = self.write([page(2), page(3)], results, plan=RenderPlan(10, 2, 5, 3),
+                           pipeline_error='private internal details')
+        merged = files.markdown.read_text()
+        self.assertTrue(files.partial)
+        self.assertEqual(files.markdown.name, '数学笔记.md')
+        self.assertIn('- 未完成页码：3–5', merged)
+        self.assertIn('部分完成（1/4 页）', merged)
+        self.assertNotIn('private internal details', merged)
+        self.assertIn('Kept content', merged)
 
-    def test_recovered_page_with_missing_regions_is_partial(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepare_directories(root / 'work', root / 'output')
-            (root / 'work/conversion/pages').mkdir()
-            (root / 'work/conversion/pages/2.md').write_text('Recovered region')
-            results = [{'chunk': '2', 'status': 'ok', 'missing_parts': ['2-part1']}]
-            path = self.write(root, [Chunk(2, 2, (), '2')], results, plan=RenderPlan(10, 2, 2, 3))
-            self.assertEqual(path.name, '数学笔记.partial.md')
-            self.assertIn('部分内容未识别页码：2', (root / 'output/source.md').read_text())
+    def test_blank_pages_get_no_page_file(self):
+        (self.state / 'pages/002.md').write_text('')
+        files = self.write([page(2), page(3)], [{'chunk': '002', 'status': 'blank'},
+                                               self.page_text(3, 'Text')])
+        self.assertIn('- 空白页码：2', files.markdown.read_text())
+        self.assertEqual([p.name for p in (self.root / 'output/pages').iterdir()], ['003.md'])
 
     def test_source_url_cannot_inject_markdown(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            prepare_directories(root / 'work', root / 'output')
-            path = self.write(root, [], [], source_url='https://example.test/a>\n<script>.pdf')
-            source = (root / 'output/source.md').read_text()
-            self.assertIn('%3E%0A%3Cscript%3E', source)
-            self.assertNotIn('<script>', source)
-            self.assertTrue(path.read_text().startswith(source))
+        merged = self.write([], [], source_url='https://example.test/a>\n<script>.pdf').markdown.read_text()
+        self.assertIn('%3E%0A%3Cscript%3E', merged)
+        self.assertNotIn('<script>', merged)
 
+    def test_failed_write_does_not_leave_temporary_files_in_package(self):
+        actual_write = Path.write_text
+
+        def disk_failure(path, text, **kwargs):
+            actual_write(path, text, **kwargs)
+            raise OSError('Disk failure after partial write')
+
+        with patch('artifacts.Path.write_text', disk_failure), self.assertRaises(OSError):
+            self.write([], [])
+        self.assertEqual(list((self.root / 'output').iterdir()), [])
+
+    def test_republishing_keeps_files_current(self):
+        self.write([page(2)], [self.page_text(2, 'First')])
+        self.write([page(2)], [self.page_text(2, 'Second')])
+        self.assertEqual((self.root / 'output/pages/002.md').read_text(), 'Second\n')
+
+
+class DirectoryTests(unittest.TestCase):
     def test_rerun_clears_previous_generated_package_and_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -120,21 +137,14 @@ class ArtifactTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
-    def test_names_are_basenames_and_cannot_collide_with_source(self):
+    def test_names_are_basenames(self):
         self.assertEqual(validate_output_name('数学笔记'), '数学笔记')
-        for name in ['../escape', 'a/b', 'a\\b', '.', '.notes', 'CON.txt', 'source', 'Source',
-                     'notes.md', 'notes.zip', 'x\nhello', 'a'*121, '数'*81, '🙂'*61]:
+        self.assertEqual(validate_output_name('notes.v2'), 'notes.v2')
+        for name in ['../escape', 'a/b', 'a\\b', '.', '.notes', 'CON.txt',
+                     'notes.md', 'notes.zip', 'x\nhello', 'a' * 121, '数' * 81, '🙂' * 61]:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 validate_output_name(name)
 
-    def test_final_publication_removes_partial_and_keeps_dotted_name(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state = prepare_directories(root / 'work', root / 'output')
-            (state / 'pages').mkdir()
-            self.write(root, [], [], name='notes.partial', plan=RenderPlan(1, 1, 1, 3))
-            (state / 'pages/1.md').write_text('Complete')
-            self.write(root, [Chunk(1, 1, (), '1')], [{'chunk': '1', 'status': 'ok'}],
-                       name='notes.partial', plan=RenderPlan(1, 1, 1, 3))
-            self.assertEqual({p.name for p in (root / 'output').iterdir()}, {'source.md', 'notes.partial.md'})
-            self.assertIn('完成（1/1', (root / 'output/source.md').read_text())
+
+if __name__ == '__main__':
+    unittest.main()

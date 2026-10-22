@@ -11,15 +11,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from helpers import page, run_process_pages
 from pdf2md import (
-    Chunk,
     ContentBlockedError,
     ModelUnavailableError,
     PermanentProviderError,
     answer_from_payload,
     call_model,
     is_retryable_error,
-    process_chunks,
     resolve_fallback_models,
 )
 from providers import (
@@ -31,7 +30,6 @@ from providers import (
     resolve_model,
     resolve_provider,
 )
-from quota_client import LocalKeyPool, QuotaPoolExhaustedError
 
 GEMINI_LITE = "gemini-3.5-flash-lite"
 
@@ -109,9 +107,9 @@ class RegistryTests(unittest.TestCase):
             resolve_model(MODELFLARE, "")
         self.assertIn("--model is required", str(caught.exception))
 
-    def test_only_gemini_needs_the_shared_quota_pool(self):
-        self.assertTrue(GEMINI.uses_shared_quota_pool)
-        self.assertFalse(MODELFLARE.uses_shared_quota_pool)
+    def test_only_gemini_groups_keys_by_project(self):
+        self.assertEqual(GEMINI.key_groups_env, "GEMINI_KEY_GROUPS")
+        self.assertEqual(MODELFLARE.key_groups_env, "")
 
     def test_each_provider_reads_its_own_key_list(self):
         self.assertEqual(GEMINI.api_key_env, "GEMINI_API_KEYS")
@@ -368,118 +366,24 @@ class RefusalTaxonomyTests(unittest.TestCase):
         self.assertEqual(answer_from_payload(MODELFLARE, gateway), "# t")
 
 
-class LocalKeyPoolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_it_reports_like_the_shared_pool(self):
-        pool = await LocalKeyPool.create(["k1", "k2"], rpm_per_key=60, rpd_per_key=10)
-
-        index, key, lease = await pool.acquire()
-        self.assertEqual(key, ["k1", "k2"][index])
-        self.assertTrue(lease)
-
-        pool.record_http_result(200, 1.5)
-        await pool.mark_success(index, lease)
-
-        summary = pool.usage_summary()
-        self.assertEqual(summary["performance"]["success"], 1)
-        self.assertEqual(summary["keys"][str(index + 1)]["success"], 1)
-
-    async def test_a_daily_exhausted_key_blocks_the_pool(self):
-        pool = await LocalKeyPool.create(["only"], rpm_per_key=60, rpd_per_key=10)
-        index, _key, lease = await pool.acquire()
-
-        await pool.rate_limited(index, lease, 0.0, daily_exhausted=True, quota_type="rpd")
-
-        with self.assertRaises(QuotaPoolExhaustedError):
-            await pool.acquire()
-
-    async def test_it_exposes_the_interface_process_chunks_relies_on(self):
-        pool = await LocalKeyPool.create(["k"], rpm_per_key=60, rpd_per_key=10)
-        for name in ("acquire", "mark_success", "mark_error", "rate_limited", "record_http_result"):
-            self.assertTrue(callable(getattr(pool, name)), name)
-        self.assertEqual(await pool.remote_status(), {})
-        self.assertEqual(await pool.close(), None)
-
-
 class ProviderSelectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_modelflare_runs_without_the_shared_quota_service(self):
-        calls: list[str] = []
+    async def test_each_provider_reaches_the_model_call(self):
+        for provider, model in ((MODELFLARE, "gpt-5.6-sol"), (GEMINI, GEMINI_LITE)):
+            calls: list[str] = []
 
-        async def fake_call(
-            _client, _pool, provider, _model, _parts, chunk_name, _thinking, *_rest
-        ):
-            calls.append(provider.name)
-            return f"# page {chunk_name}"
+            async def fake_call(_client, _pool, chosen, _model, _parts, name, *_rest):
+                calls.append(chosen.name)
+                return f"# page {name}"
 
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-                patch("pdf2md.call_model", new=fake_call),
-                patch("pdf2md.random.uniform", return_value=0.0),
-                patch(
-                    "pdf2md.ProjectQuotaPool.create",
-                    new=AsyncMock(side_effect=AssertionError("the Valkey pool must not be used")),
-                ),
-            ):
-                results = await process_chunks(
-                    [Chunk(1, 1, (), "1")],
-                    Path(directory),
-                    prompt="Transcribe",
-                    model="gpt-5.6-sol",
-                    concurrency=1,
-                    keys=["sk-mf-test"],
-                    thinking_level="high",
-                    verification_passes=0,
-                    media_resolution="ultra_high",
-                    rpm_per_key=15,
-                    rpd_per_key=500,
-                    provider=MODELFLARE,
+            with self.subTest(provider=provider.name), tempfile.TemporaryDirectory() as directory:
+                results = await run_process_pages(
+                    [page(1)], directory, fake_call, provider=provider, model=model,
+                    keys=["k1", "k2"],
                 )
-                markdown = (Path(directory) / "pages" / "1.md").read_text()
-
-        self.assertEqual([result["status"] for result in results], ["ok"])
-        self.assertEqual(calls, ["modelflare"])
-        self.assertIn("# page 1", markdown)
-
-    async def test_gemini_still_uses_the_shared_pool_by_default(self):
-        async def fake_call(*_args, **_kwargs):
-            return "# page 1"
-
-        fake_pool = AsyncMock()
-        fake_pool.usage_summary = lambda: {"scope": "test"}
-        fake_pool.performance_summary = lambda: {
-            "success": 1,
-            "429": 0,
-            "503": 0,
-            "other_error": 0,
-            "p50_seconds": 1.0,
-            "p95_seconds": 1.0,
-        }
-        fake_pool.record_http_result = lambda *_args: None
-
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch.dict("os.environ", {"GEMINI_KEY_GROUPS": ""}),
-                patch("pdf2md.ProjectQuotaPool.create", new=AsyncMock(return_value=fake_pool)),
-                patch("pdf2md.LocalKeyPool.create", new=AsyncMock(side_effect=AssertionError("no"))),
-                patch("pdf2md.make_request_parts", return_value=([{"text": "page"}], 64)),
-                patch("pdf2md.call_model", new=fake_call),
-                patch("pdf2md.random.uniform", return_value=0.0),
-            ):
-                results = await process_chunks(
-                    [Chunk(1, 1, (), "1")],
-                    Path(directory),
-                    prompt="Transcribe",
-                    model=GEMINI_LITE,
-                    concurrency=1,
-                    keys=["dummy-key"],
-                    thinking_level="high",
-                    verification_passes=0,
-                    media_resolution="ultra_high",
-                    rpm_per_key=15,
-                    rpd_per_key=500,
-                )
-
-        self.assertEqual([result["status"] for result in results], ["ok"])
+                markdown = (Path(directory) / "pages" / "001.md").read_text()
+            self.assertEqual([result["status"] for result in results], ["ok"])
+            self.assertEqual(calls, [provider.name])
+            self.assertIn("# page 001", markdown)
 
 
 if __name__ == "__main__":

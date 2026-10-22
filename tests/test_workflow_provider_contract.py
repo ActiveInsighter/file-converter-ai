@@ -22,5 +22,18 @@ class WorkflowProviderContractTests(unittest.TestCase):
         self.assertIn("MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}", workflow)
 
 
+    def test_ocr_token_comes_from_the_baidu_secret_and_the_whole_package_is_uploaded(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("PADDLEOCR_TOKENS: ${{ secrets.BAIDU_AI_STUDIO }}", workflow)
+        self.assertIn('--ocr "${OCR}"', workflow)
+        self.assertIn("path: output/\n", workflow)
+        self.assertNotIn("GEMINI_QUOTA_API", workflow)
+
+    def test_legacy_dispatch_inputs_are_still_accepted(self):
+        workflow = WORKFLOW.read_text()
+        for name in ("images_per_request", "retry_rounds", "attempts_per_page", "verification_passes"):
+            self.assertIn(f"      {name}:\n", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
