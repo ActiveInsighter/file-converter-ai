@@ -179,6 +179,26 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
         self.assertTrue(all(page is not None for page in results.values()))
 
+    async def test_once_the_link_works_segments_are_submitted_concurrently(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        respond, in_flight, peak = service.handler, [0], [0]
+
+        async def handler(request):
+            if request.method != "POST":
+                return respond(request)
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.05)  # the service downloading the file
+            in_flight[0] -= 1
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=7, segment=2, source_url=link)
+        self.assertEqual(ocr.stats["remote_jobs"], 4)
+        self.assertGreaterEqual(peak[0], 2, "only the probe is serialised")
+        self.assertTrue(all(page is not None for page in results.values()))
+
     async def test_a_link_submission_that_times_out_switches_to_uploads_at_once(self):
         link = "https://slow.test/manual.pdf"
         service = FakeService(accepted_links={link})

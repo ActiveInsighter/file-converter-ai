@@ -46,9 +46,9 @@ TARGET_UPLOAD_BYTES = 1024 * 1024
 PARALLEL_JOBS = 3
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
-#: The service downloads a linked file while the submission is open; a slow
-#: origin (gnu.org took longer than 60 s every time) must not hold OCR back.
-REMOTE_SUBMIT_TIMEOUT = 30.0
+#: The service downloads the whole linked file while each submission is open:
+#: 28 MB from Cloudflare took 13-30 s, gnu.org never finished within 60 s.
+REMOTE_SUBMIT_TIMEOUT = 60.0
 #: A link job that is not done by then is abandoned for an upload, which
 #: finishes within about three minutes even at 20-25 KB/s.
 REMOTE_JOB_TIMEOUT = 300.0
@@ -205,9 +205,10 @@ class PaddleOcr:
         #: (``https://arxiv.org/pdf/<id>`` gets 10004), a submission that
         #: times out, or a link job that fails switches the run to uploads.
         self.remote_url = source_url or None
-        #: Serialises remote submissions so a bad link costs one probe, not
-        #: one per segment.
+        #: Holds the other segments back until the first link submission has
+        #: worked, so a bad link costs one probe, not one per segment.
         self.remote_lock = asyncio.Lock()
+        self.remote_proven = False
         self.started = time.monotonic()
         self.stats = {"jobs": 0, "remote_jobs": 0, "uploaded_jobs": 0, "pages": 0,
                       "failed_pages": 0, "figures": 0, "seconds": 0.0}
@@ -347,29 +348,40 @@ class PaddleOcr:
         """Ask the service to fetch the pages itself; ``None`` means upload."""
         if not self.remote_url:
             return None
-        async with self.remote_lock:
-            if not self.remote_url:
-                return None
-            headers = self._next_token_headers()
-            try:
-                response = await self.client.post(
-                    self.job_url,
-                    headers=headers,
-                    json={"fileUrl": self.remote_url, "model": self.model,
-                          "pageRanges": f"{first}-{last}", "optionalPayload": OPTIONAL_PAYLOAD},
-                    timeout=REMOTE_SUBMIT_TIMEOUT,
-                )
-                job_id = self._check(response)["jobId"]
-            except (OcrFatalError, OcrRetryableError):
-                # Bad token, used-up quota or a full queue: not the link's fault.
-                raise
-            except Exception as exc:  # noqa: BLE001 - rejected, timed out, odd answer
-                self._abandon_link(f"{type(exc).__name__}: {exc}")
-                return None
+        headers = self._next_token_headers()
+        if self.remote_proven:
+            job_id = await self._post_link(first, last, headers)
+        else:
+            async with self.remote_lock:
+                job_id = await self._post_link(first, last, headers)
+                self.remote_proven = job_id is not None
+        if job_id is None:
+            return None
         self.stats["jobs"] += 1
         self.stats["remote_jobs"] += 1
         print(f"[ocr] {name}: job {job_id} submitted by link", flush=True)
         return job_id, headers
+
+    async def _post_link(self, first: int, last: int, headers: dict[str, str]) -> str | None:
+        """Submit one page range by link; ``None`` once the link is abandoned."""
+        url = self.remote_url
+        if not url:
+            return None
+        try:
+            response = await self.client.post(
+                self.job_url,
+                headers=headers,
+                json={"fileUrl": url, "model": self.model,
+                      "pageRanges": f"{first}-{last}", "optionalPayload": OPTIONAL_PAYLOAD},
+                timeout=REMOTE_SUBMIT_TIMEOUT,
+            )
+            return self._check(response)["jobId"]
+        except (OcrFatalError, OcrRetryableError):
+            # Bad token, used-up quota or a full queue: not the link's fault.
+            raise
+        except Exception as exc:  # noqa: BLE001 - rejected, timed out, odd answer
+            self._abandon_link(f"{type(exc).__name__}: {exc}")
+            return None
 
     async def _submit_upload(self, data: bytes, name: str) -> tuple[str, dict[str, str]]:
         started = time.monotonic()
