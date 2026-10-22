@@ -103,6 +103,12 @@ class KeyPoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QuotaPoolExhaustedError):
             await pool.acquire()
 
+    async def test_retired_key_gets_no_more_traffic(self):
+        pool, _ = make_pool(["a", "b"])
+        pool.retire(0, "HTTP 402")
+        self.assertEqual({(await pool.acquire())[1] for _ in range(4)}, {"b"})
+        self.assertTrue(pool.usage_summary()["keys"]["1"]["disabled"])
+
     async def test_per_run_daily_cap(self):
         pool, _ = make_pool(["only"], rpd=2)
         await pool.acquire()

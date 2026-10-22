@@ -250,8 +250,14 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class StubPool:
+    def __init__(self):
+        self.retired = []
+
     def record_http_result(self, *_args):
         pass
+
+    def retire(self, key_index, reason):
+        self.retired.append((key_index, reason))
 
     async def acquire(self):
         return 0, "dummy-key", "lease"
@@ -275,8 +281,19 @@ class StubClient:
 
 
 class HttpLayerTests(unittest.IsolatedAsyncioTestCase):
-    async def call(self, response):
-        return await call_model_once(StubClient(response), StubPool(), GEMINI, "m", [], "001", "high")
+    async def call(self, response, pool=None, provider=GEMINI):
+        return await call_model_once(StubClient(response), pool or StubPool(), provider, "m", [], "001", "high")
+
+    async def test_depleted_credits_retire_the_key_and_keep_the_page_retryable(self):
+        from providers import MODELFLARE
+        for provider in (GEMINI, MODELFLARE):
+            pool = StubPool()
+            payload = {"error": {"code": 402, "message": "Your prepayment credits are depleted."}}
+            with self.subTest(provider=provider.name), self.assertRaises(RuntimeError) as caught:
+                await self.call(httpx.Response(402, json=payload), pool, provider)
+            self.assertTrue(is_retryable_error(caught.exception))
+            self.assertEqual(pool.retired[0][0], 0)
+            self.assertIn("credits are depleted", pool.retired[0][1])
 
     async def test_capacity_statuses_mean_model_unavailable(self):
         for status in (404, 500, 503, 504):

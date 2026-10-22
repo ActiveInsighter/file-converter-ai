@@ -282,6 +282,13 @@ class KeyPool:
                 flush=True,
             )
 
+    def retire(self, key_index: int, reason: str) -> None:
+        """Stop using a key's bucket for this run, e.g. after HTTP 402."""
+        bucket = self.bucket_of[key_index]
+        if not bucket.disabled:
+            bucket.disabled = True
+            print(f"[quota] {bucket.name} retired for this run: {reason}", flush=True)
+
     def record_http_result(self, status: int, elapsed_seconds: float) -> None:
         if status == 200:
             self.http_counts["success"] += 1

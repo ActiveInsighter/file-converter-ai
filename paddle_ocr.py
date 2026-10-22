@@ -37,7 +37,9 @@ SEGMENT_PAGES = 25
 #: runners a 375 KiB upload takes ~3 s while 1.8 MB stalls for ~90 s, so many
 #: small parallel uploads beat one large one.
 TARGET_UPLOAD_BYTES = 1024 * 1024
-PARALLEL_JOBS = 6
+#: The service accepts only a few pending jobs per user and answers 10010
+#: (queue full) beyond that, after the upload has already been paid for.
+PARALLEL_JOBS = 3
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
 #: Attempts per segment. A full submission queue (10010) clears within

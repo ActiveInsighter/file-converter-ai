@@ -591,20 +591,24 @@ async def _call_model_attempt(
     if kind == "rate_limited":
         quota_type = provider.quota_kind(error_payload)
         retry_after = provider.retry_after(response.headers, error_payload)
-        cooldown_seconds = retry_after if retry_after is not None else 30.0
         await finish_report(key_pool.rate_limited(
             key_index,
             lease_id,
-            cooldown_seconds,
+            retry_after,
             daily_exhausted=quota_type == "rpd",
             quota_type=quota_type,
         ))
         raise RuntimeError(
             f"{provider.label} HTTP 429 ({quota_type}; "
-            f"project cooldown={cooldown_seconds:.1f}s): {message}"
+            f"server retry_after={retry_after}): {message}"
         )
 
     await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
+    if response.status_code == 402:
+        # Credits of this key's project are used up. That says nothing about
+        # the page or the other keys: retire the key and let the page retry.
+        key_pool.retire(key_index, f"HTTP 402: {message[:200]}")
+        raise RuntimeError(f"{provider.label} HTTP 402 (key retired): {message}")
     error = f"{provider.label} HTTP {response.status_code}: {message}"
     if kind == "permanent":
         raise PermanentProviderError(error)
