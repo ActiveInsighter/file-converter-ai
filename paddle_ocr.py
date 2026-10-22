@@ -38,7 +38,10 @@ MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 PARALLEL_JOBS = 4
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
-SEGMENT_ATTEMPTS = 3
+#: Attempts per segment. A full submission queue (10010) clears within
+#: minutes, so retries back off exponentially up to a minute apart.
+SEGMENT_ATTEMPTS = 6
+MAX_RETRY_PAUSE = 60.0
 FIGURE_DOWNLOADS = 8
 
 #: Service codes that mean "slow down and try again".
@@ -151,7 +154,7 @@ class PaddleOcr:
         parallel_jobs: int = PARALLEL_JOBS,
         poll_seconds: float = POLL_SECONDS,
         job_timeout: float = JOB_TIMEOUT_SECONDS,
-        retry_pause: float = 5.0,
+        retry_pause: float = 10.0,
     ) -> None:
         self.tokens = tokens
         self.client = client
@@ -251,7 +254,7 @@ class PaddleOcr:
             except (OcrRetryableError, httpx.TransportError, TimeoutError, ValueError) as exc:
                 if attempt == SEGMENT_ATTEMPTS:
                     raise
-                pause = self.retry_pause * attempt
+                pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))
                 print(f"[ocr] {name} attempt {attempt}/{SEGMENT_ATTEMPTS} failed: "
                       f"{type(exc).__name__}: {exc}; retrying in {pause:.0f}s", flush=True)
                 await asyncio.sleep(pause)
@@ -285,9 +288,11 @@ class PaddleOcr:
             files={"file": (f"pages-{name}.pdf", data, "application/pdf")},
             timeout=120.0,
         )
+        upload_seconds = time.monotonic() - started
         job_id = self._check(response)["jobId"]
         self.stats["jobs"] += 1
-        print(f"[ocr] {name}: job {job_id} submitted ({len(data) >> 10} KiB)", flush=True)
+        print(f"[ocr] {name}: job {job_id} submitted ({len(data) >> 10} KiB "
+              f"in {upload_seconds:.1f}s)", flush=True)
         async with asyncio.timeout(self.job_timeout):
             while True:
                 status = self._check(await self.client.get(

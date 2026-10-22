@@ -8,7 +8,7 @@ from pathlib import Path
 import fitz
 import httpx
 
-from paddle_ocr import PaddleOcr, normalize_markdown, parse_tokens, plan_segments, tidy_inline_math
+from paddle_ocr import SEGMENT_ATTEMPTS, PaddleOcr, normalize_markdown, parse_tokens, plan_segments, tidy_inline_math
 
 JOBS = "https://ocr.test/api/v2/ocr/jobs"
 
@@ -119,7 +119,7 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(page is not None for page in results.values()))
 
     async def test_a_hopeless_segment_falls_back_to_vision_only(self):
-        service = FakeService({"Page 1": ["short", "short", "short"]})
+        service = FakeService({"Page 1": ["short"] * SEGMENT_ATTEMPTS})
         ocr, results, _ = await self.run_ocr(service, pages=3, segment=2)
         self.assertIsNone(results[1])
         self.assertIsNone(results[2])
