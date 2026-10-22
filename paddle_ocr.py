@@ -69,6 +69,10 @@ class OcrRetryableError(RuntimeError):
     """Throttled, queue full, or a transient service failure."""
 
 
+class OcrJobFailed(OcrRetryableError):
+    """The service accepted the job, then reported it as failed."""
+
+
 class OcrSourceRejected(RuntimeError):
     """The service will not fetch this link; upload the segment instead."""
 
@@ -248,10 +252,6 @@ class PaddleOcr:
         except TimeoutError:
             return None
 
-    def remaining(self, wait: float) -> float:
-        """Seconds left until ``wait`` seconds after OCR started."""
-        return self.started + wait - time.monotonic()
-
     def _resolve(self, number: int, value: OcrPage | None) -> None:
         future = self.pages.get(number)
         if future is not None and not future.done():
@@ -319,7 +319,7 @@ class PaddleOcr:
                 self.fatal = str(exc)
                 raise
             except (OcrRetryableError, httpx.TransportError, TimeoutError, ValueError) as exc:
-                if remote and self.remote_urls:
+                if remote and self.remote_urls and isinstance(exc, (OcrJobFailed, ValueError)):
                     # A link the service accepted but then could not fetch or
                     # parse will not get better; upload from now on.
                     print(f"[ocr] {name}: remote job failed ({exc}); "
@@ -417,7 +417,7 @@ class PaddleOcr:
                 if state == "done":
                     break
                 if state == "failed":
-                    raise OcrRetryableError(f"job {job_id} failed: {status.get('errorMsg')}")
+                    raise OcrJobFailed(f"job {job_id} failed: {status.get('errorMsg')}")
                 await asyncio.sleep(self.poll_seconds)
             result = await self.client.get(status["resultUrl"]["jsonUrl"], timeout=120.0)
             result.raise_for_status()
