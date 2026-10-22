@@ -112,6 +112,14 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ocr.stats["pages"], 5)
         self.assertEqual(set(service.tokens), {"bearer t1", "bearer t2"}, "tokens rotate")
 
+    async def test_large_segments_are_halved_until_uploads_are_small(self):
+        from unittest.mock import patch
+        service = FakeService()
+        with patch("paddle_ocr.TARGET_UPLOAD_BYTES", 1):
+            _, results, _ = await self.run_ocr(service, pages=4, segment=4)
+        self.assertEqual(sorted(len(s) for s in service.submissions), [1, 1, 1, 1])
+        self.assertEqual([page.markdown.split()[-2] for page in results.values()], ["1", "2", "3", "4"])
+
     async def test_throttled_and_failed_jobs_are_retried(self):
         service = FakeService({"Page 1": ["throttle", "fail"]})
         _, results, _ = await self.run_ocr(service, pages=2, segment=2)

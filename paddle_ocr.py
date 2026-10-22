@@ -33,9 +33,11 @@ OPTIONAL_PAYLOAD = {
 }
 #: Pages per job. Small jobs finish quickly and let the model stage start early.
 SEGMENT_PAGES = 25
-#: Local uploads are capped at 50 MB by the service; leave headroom.
-MAX_UPLOAD_BYTES = 45 * 1024 * 1024
-PARALLEL_JOBS = 4
+#: Segments are halved until an upload is at most this big. From GitHub's
+#: runners a 375 KiB upload takes ~3 s while 1.8 MB stalls for ~90 s, so many
+#: small parallel uploads beat one large one.
+TARGET_UPLOAD_BYTES = 1024 * 1024
+PARALLEL_JOBS = 6
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
 #: Attempts per segment. A full submission queue (10010) clears within
@@ -218,12 +220,12 @@ class PaddleOcr:
         try:
             async with self.jobs:
                 data = await asyncio.to_thread(extract_segment, pdf_path, first, last)
-                too_big = len(data) > MAX_UPLOAD_BYTES and last > first
+                too_big = len(data) > TARGET_UPLOAD_BYTES and last > first
                 if not too_big:
                     pages = await self._parse_with_retries(data, name, last - first + 1)
             if too_big:
                 middle = (first + last) // 2
-                print(f"[ocr] {name}: {len(data) >> 20} MiB, splitting", flush=True)
+                print(f"[ocr] {name}: {len(data) >> 10} KiB, splitting", flush=True)
                 await asyncio.gather(
                     self._segment(pdf_path, first, middle, width),
                     self._segment(pdf_path, middle + 1, last, width),
