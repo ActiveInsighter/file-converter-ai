@@ -241,7 +241,7 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
         usage = json.loads((root / 'work/conversion/quota-usage.json').read_text())
         self.assertEqual(progress['state'], 'completed')
         self.assertEqual(usage['speculation']['hedge_wins'], 1)
-        self.assertEqual(usage['page_sources'], {'ocr+model': 3, 'text+model': 0, 'model': 0, 'ocr': 0})
+        self.assertEqual(usage['page_sources'], {'ocr+model': 3, 'model': 0, 'ocr': 0})
         self.assertLessEqual(sum(counts.values()), 5)
 
         self.assertEqual({p.name for p in self.output.iterdir()}, {'merged.md', 'pages', 'images'})

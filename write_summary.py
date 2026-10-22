@@ -20,9 +20,8 @@ def write_summary(state_dir: Path, destination: Path):
         ('State', progress['state']),
         ('Completed pages', f"{progress['completed_chunks']}/{progress['total_chunks']} ({progress['percent']}%)"),
         ('Successful / blank / failed', f"{progress['success_chunks']} / {progress['blank_chunks']} / {progress['failed_chunks']}"),
-        ('OCR + model / text layer + model / model only / OCR only',
-         f"{sources.get('ocr+model', 0)} / {sources.get('text+model', 0)} / "
-         f"{sources.get('model', 0)} / {sources.get('ocr', 0)}"),
+        ('OCR + model / model only / OCR only',
+         f"{sources.get('ocr+model', 0)} / {sources.get('model', 0)} / {sources.get('ocr', 0)}"),
         ('OCR pages / failed / seconds',
          f"{ocr.get('pages', 0)} / {ocr.get('failed_pages', 0)} / {ocr.get('seconds', 0)}" if ocr else 'off'),
         ('OCR jobs by link / uploaded',

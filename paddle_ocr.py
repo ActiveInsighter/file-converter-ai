@@ -225,17 +225,9 @@ class PaddleOcr:
             return None
         return asyncio.create_task(self._run(pdf_path, first, last, width))
 
-    async def page(self, number: int, timeout: float | None = None) -> OcrPage | None:
-        """The page's draft; ``None`` if OCR failed or ``timeout`` ran out first."""
+    async def page(self, number: int) -> OcrPage | None:
         future = self.pages.get(number)
-        if future is None:
-            return None
-        if future.done() or timeout is None:
-            return await asyncio.shield(future)
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), max(0.0, timeout))
-        except TimeoutError:
-            return None
+        return None if future is None else await asyncio.shield(future)
 
     def _resolve(self, number: int, value: OcrPage | None) -> None:
         future = self.pages.get(number)

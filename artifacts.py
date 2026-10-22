@@ -15,11 +15,7 @@ from urllib.parse import quote
 
 from render_stream import RenderPlan
 
-FALLBACK_LABELS = {
-    'text+model': '未等到 OCR 草稿、按图片和 PDF 文本层转写的页码',
-    'model': '未用 OCR 草稿（仅图片转写）的页码',
-    'ocr': '模型失败、直接使用 OCR 结果的页码',
-}
+FALLBACK_LABELS = {'model': '未用 OCR 草稿（仅图片转写）的页码', 'ocr': '模型失败、直接使用 OCR 结果的页码'}
 
 
 @dataclass(frozen=True)
@@ -129,7 +125,7 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
         f'- 识别流程：{pipeline}{_text(provider)} / {_text(model)}',
     ]
     if ocr_model:
-        for source in FALLBACK_LABELS:
+        for source in ('model', 'ocr'):
             if by_source.get(source):
                 lines.append(f'- {FALLBACK_LABELS[source]}：{page_ranges(by_source[source])}')
     if missing:

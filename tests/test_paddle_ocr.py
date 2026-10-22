@@ -186,20 +186,6 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
         self.assertTrue(all(page is not None for page in results.values()))
 
-    async def test_a_draft_that_is_not_ready_in_time_is_none(self):
-        async def stall(_request):
-            await asyncio.sleep(10)
-
-        with tempfile.TemporaryDirectory() as directory:
-            pdf = write_pdf(Path(directory) / "s.pdf", 1)
-            async with httpx.AsyncClient(transport=httpx.MockTransport(stall)) as client:
-                ocr = PaddleOcr(["t"], client=client, work_dir=Path(directory), job_url=JOBS)
-                task = ocr.start(pdf, 1, 1, 3)
-                self.assertIsNone(await ocr.page(1, timeout=0.01))
-                self.assertIsNone(await ocr.page(1, timeout=-5))
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
     async def test_disabled_ocr_resolves_every_page_to_none(self):
         service = FakeService()
         ocr, results, _ = await self.run_ocr(service, pages=2, tokens=())

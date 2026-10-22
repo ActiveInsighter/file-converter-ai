@@ -28,8 +28,6 @@ class WorkflowProviderContractTests(unittest.TestCase):
         self.assertIn('--ocr "${OCR}"', workflow)
         self.assertIn("OCR_SOURCE: ${{ vars.CONVERTER_OCR_SOURCE || 'link' }}", workflow)
         self.assertIn('--ocr-source "${OCR_SOURCE}"', workflow)
-        self.assertIn('--ocr-wait "${OCR_WAIT}"', workflow)
-        self.assertIn('--text-layer "${TEXT_LAYER}"', workflow)
         self.assertIn("path: output/\n", workflow)
         self.assertNotIn("GEMINI_QUOTA_API", workflow)
 

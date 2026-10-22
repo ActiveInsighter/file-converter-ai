@@ -1,5 +1,4 @@
 """Shared drivers for tests that exercise process_pages without HTTP."""
-import asyncio
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -8,43 +7,26 @@ from paddle_ocr import OcrPage
 from pdf2md import Page, process_pages
 
 
-def page(number: int, blank: bool = False, text_layer: str | None = None) -> Page:
-    return Page(number, Path(f"{number:03d}.png"), f"{number:03d}", blank, text_layer)
+def page(number: int, blank: bool = False) -> Page:
+    return Page(number, Path(f"{number:03d}.png"), f"{number:03d}", blank)
 
 
-def fake_parts(page, prompt, media_resolution, draft=None, text_layer=None):
-    """Request parts that expose the OCR draft and text layer to a fake model call."""
-    text = f"page={page.number} draft={draft}"
-    if text_layer is not None:
-        text += f" text={text_layer}"
-    return [{"text": text}], 64
+def fake_parts(page, prompt, media_resolution, draft=None):
+    """Request parts that expose the OCR draft to a fake model call."""
+    return [{"text": f"page={page.number} draft={draft}"}], 64
 
 
 class FakeOcr:
-    """Serves fixed OCR drafts; a missing page means OCR failed for it.
-
-    Pages in ``delays`` are ready only that many seconds after the first call.
-    """
+    """Serves fixed OCR drafts; a missing page means OCR failed for it."""
 
     enabled = True
 
-    def __init__(self, drafts: dict[int, str], figures: dict[int, dict] | None = None,
-                 delays: dict[int, float] | None = None):
+    def __init__(self, drafts: dict[int, str], figures: dict[int, dict] | None = None):
         self.drafts = drafts
         self.figures = figures or {}
-        self.delays = delays or {}
-        self.started = None
         self.stats = {"pages": len(drafts)}
 
-    async def page(self, number, timeout=None):
-        loop = asyncio.get_running_loop()
-        self.started = self.started or loop.time()
-        wait = self.started + self.delays.get(number, 0) - loop.time()
-        if wait > 0:
-            if timeout is not None and timeout < wait:
-                await asyncio.sleep(max(0, timeout))
-                return None
-            await asyncio.sleep(wait)
+    async def page(self, number):
         if number not in self.drafts:
             return None
         return OcrPage(number, self.drafts[number], self.figures.get(number, {}))
