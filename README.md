@@ -7,9 +7,11 @@ PDF → Markdown 转换执行器。百度 PaddleOCR-VL 直接从原始链接下�
 1. **下载**：支持直接 HTTP(S) PDF 地址和 Google Drive 公开分享链接。
 2. **OCR（百度直接拉取）**：按 25 页切段，每段以 `fileUrl`（原始链接）+ `pageRanges`（如 `26-50`）提交到 PaddleOCR-VL-1.6 异步接口，由百度自己下载 PDF，Runner 不上传。最多 3 段同时进行（服务端每个用户只接受少量排队任务，超出返回 10010）。每段完成后立即放出各页的 Markdown 草稿和图表裁图。
    - 第一次提交兼作探测。百度会直接拒绝部分链接，例如 `https://arxiv.org/pdf/1706.03762` 返回 10004“格式不支持”（加 `#.pdf` 后缀也一样，已实测）。
-   - 百度在每次提交请求里同步下载整个文件（实测从 Cloudflare 拉 28 MB 需 13–30 秒）。第一次提交成功后，其余分段同时提交。以下情况都改为旧方式：链接被拒绝；提交 60 秒内没有响应（源站对百度很慢时会这样，如 gnu.org）；链接任务失败或 5 分钟未完成；来源是 Google Drive 分享页。只有“队列已满/限流”会继续用链接重试。旧方式是：从本地 PDF 切段上传，单段超过 1 MiB 时继续对半拆分（Runner 到百度上传约 20–25 KB/s）。
+   - 百度在每次提交请求里同步下载整个文件（实测从 Cloudflare 约 2 MB/s：28 MB 需 13–30 秒，47 MB 需 23 秒）。因此提交等待时间随文件大小增加：`30 秒 + 文件大小 ÷ 1 MB/s`，最少 60 秒、最多 300 秒（120 MB 约 150 秒）。第一次提交成功后，其余分段同时提交。
+   - 以下情况改为旧方式：链接被拒绝；提交在上述时间内没有响应（源站对百度很慢时会这样，如 gnu.org）；链接任务失败或 5 分钟未完成；文件超过百度链接上限 200 MB；来源是 Google Drive 分享页。只有“队列已满/限流”会继续用链接重试。旧方式是：从本地 PDF 切段上传，单段超过 1 MiB 时继续对半拆分（Runner 到百度上传约 20–25 KB/s）。平均每页超过 256 KiB 的分段（扫描件）先转成 150 DPI JPEG 页面再上传，体积通常缩小 4–8 倍。
 3. **渲染**：同时在独立线程中逐页渲染图片（默认 240 DPI PNG）。空白扫描页直接跳过，不发请求。
 4. **校对**：某页的图片和 OCR 草稿都就绪后，一起发送给模型。模型以图片为准、以草稿为底稿：保留正确文字，修正错字、公式与上下标，补全遗漏，删除页眉页脚，整理标题、段落、表格结构，保留草稿中的图片引用。
+   - 开启 `adjacent_pages` 后，每页请求还附带上一页底部和下一页顶部（各占页高 40%）的截图。被分页截断的最后一句话、公式或表格行由开始它的那一页补完整，下一页省略重复的后半截，合并文件里不再出现残缺公式。相邻页为空白或不在转换范围内时不附带。每个请求多两张截图，耗时和 Token 略增。
 5. **兜底**：
    - 模型拒答（RECITATION/SAFETY 等）、空回答，或重试轮次用尽时，该页直接使用 OCR 草稿。
    - 某段 OCR 失败（每段最多尝试 6 次）或未配置 OCR 时，该页退回为仅凭图片转写。
@@ -81,7 +83,7 @@ PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一�
 | `rpm_per_key` / `rpd_per_key` | `15` / `500` | 每个配额桶的 RPM 与单次任务请求上限 |
 | `start_page` / `end_page` | 整份 PDF | 1-based 页面范围 |
 | `retry_rounds` / `attempts_per_page` | `5` / `2` | 每页最大轮数和轮内即时尝试数 |
-| `images_per_request` | — | 已弃用，保留只为兼容旧调用方；现在固定每页一个请求 |
+| `adjacent_pages` | `false` | 附带上一页底部和下一页顶部截图，校对跨页截断的内容 |
 
 外部调用统一使用 `workflow_dispatch`：
 
@@ -104,7 +106,7 @@ export PADDLEOCR_TOKENS='AI Studio 令牌'
 python pdf2md.py --source-url 'https://example.com/document.pdf' --output-name '文档笔记'
 ```
 
-CLI 另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget` 等参数，见 `python pdf2md.py --help`。
+CLI 另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget`、`--adjacent-pages` 等参数，见 `python pdf2md.py --help`。
 
 ## 耗时
 

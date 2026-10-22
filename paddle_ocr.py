@@ -5,7 +5,8 @@ time. By default each job names the original PDF link plus a ``pageRanges``
 slice, so Baidu downloads the file itself and nothing is uploaded from the
 runner (GitHub -> Baidu uploads crawl at 20-25 KB/s). When the service will not
 fetch the link (unsupported URL, Google Drive, a fetch failure) the segment is
-cut out of the local PDF and uploaded instead. Each finished job yields one
+cut out of the local PDF and uploaded instead (scanned pages are re-encoded as
+compact JPEG pages first). Each finished job yields one
 Markdown draft per page plus the figure crops PaddleOCR found on it. Pages are
 published as soon as their segment finishes, so the model stage can start on
 the first segment while later ones are still parsing.
@@ -47,8 +48,20 @@ PARALLEL_JOBS = 3
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
 #: The service downloads the whole linked file while each submission is open:
-#: 28 MB from Cloudflare took 13-30 s, gnu.org never finished within 60 s.
+#: 28 MB from Cloudflare took 13-30 s and 47 MB took 23 s (about 2 MB/s), so a
+#: fixed limit wrongly gives up on big files: a 120 MB book needs about a minute
+#: per submission. The limit grows with the file at a conservative 1 MB/s.
 REMOTE_SUBMIT_TIMEOUT = 60.0
+REMOTE_SUBMIT_TIMEOUT_MAX = 300.0
+REMOTE_SUBMIT_BYTES_PER_SECOND = 1_000_000
+#: AI Studio refuses linked files above 200 MB; larger files are uploaded.
+REMOTE_MAX_BYTES = 200 * 1000 * 1000
+#: With the upload relay configured, a file above this size is not fetched
+#: whole for every segment: each segment is cut out here, put on the relay
+#: (GitHub -> Cloudflare is fast) and fetched from there by link.
+RELAY_PREFERRED_ABOVE_BYTES = 40 * 1000 * 1000
+#: The relay accepts one request of at most 90 MiB; bigger segments are halved.
+RELAY_MAX_BYTES = 80 * 1024 * 1024
 #: A link job that is not done by then is abandoned for an upload, which
 #: finishes within about three minutes even at 20-25 KB/s.
 REMOTE_JOB_TIMEOUT = 300.0
@@ -57,6 +70,13 @@ REMOTE_JOB_TIMEOUT = 300.0
 SEGMENT_ATTEMPTS = 6
 MAX_RETRY_PAUSE = 60.0
 FIGURE_DOWNLOADS = 8
+#: Scanned pages often weigh 0.5-1.5 MB each in the original PDF. Uploading
+#: them at 20-25 KB/s takes most of an hour for a book, so a segment above this
+#: average is re-encoded as JPEG page images, which are 4-8x smaller and still
+#: well above what the OCR model needs.
+COMPACT_ABOVE_BYTES_PER_PAGE = 256 * 1024
+COMPACT_DPI = 150
+COMPACT_JPEG_QUALITY = 80
 
 #: Service codes that mean "slow down and try again".
 RETRYABLE_CODES = {10010, 12002, 500}
@@ -103,9 +123,32 @@ def plan_segments(first: int, last: int, size: int = SEGMENT_PAGES) -> list[tupl
     return [(start, min(last, start + size - 1)) for start in range(first, last + 1, size)]
 
 
-def extract_segment(pdf_path: Path, first: int, last: int) -> bytes:
+def link_submit_timeout(size_bytes: int) -> float:
+    """Seconds one link submission may take while the service downloads the file."""
+    scaled = 30.0 + size_bytes / REMOTE_SUBMIT_BYTES_PER_SECOND
+    return min(REMOTE_SUBMIT_TIMEOUT_MAX, max(REMOTE_SUBMIT_TIMEOUT, scaled))
+
+
+def extract_segment(pdf_path: Path, first: int, last: int, compact: bool = True) -> bytes:
+    """The pages as their own PDF; heavy scans are re-encoded unless ``compact`` is off."""
     with fitz.open(pdf_path) as source, fitz.open() as target:
         target.insert_pdf(source, from_page=first - 1, to_page=last - 1)
+        data = target.tobytes(garbage=3, deflate=True)
+        if not compact or len(data) <= COMPACT_ABOVE_BYTES_PER_PAGE * (last - first + 1):
+            return data
+        compact = _rasterise(source, first, last)
+    return compact if len(compact) < len(data) else data
+
+
+def _rasterise(source: fitz.Document, first: int, last: int) -> bytes:
+    """The pages as JPEG images at the original page size: small enough to upload."""
+    with fitz.open() as target:
+        for number in range(first, last + 1):
+            page = source[number - 1]
+            image = page.get_pixmap(dpi=COMPACT_DPI, alpha=False).tobytes(
+                "jpeg", jpg_quality=COMPACT_JPEG_QUALITY)
+            target.new_page(width=page.rect.width, height=page.rect.height).insert_image(
+                fitz.Rect(0, 0, page.rect.width, page.rect.height), stream=image)
         return target.tobytes(garbage=3, deflate=True)
 
 
@@ -185,6 +228,8 @@ class PaddleOcr:
         job_timeout: float = JOB_TIMEOUT_SECONDS,
         retry_pause: float = 10.0,
         source_url: str | None = None,
+        relay_url: str | None = None,
+        relay_token: str | None = None,
     ) -> None:
         self.tokens = tokens
         self.client = client
@@ -209,9 +254,14 @@ class PaddleOcr:
         #: worked, so a bad link costs one probe, not one per segment.
         self.remote_lock = asyncio.Lock()
         self.remote_proven = False
+        self.submit_timeout = REMOTE_SUBMIT_TIMEOUT
+        #: Upload relay (the Remote Worker's R2 bucket): segments put there are
+        #: fetched by link, avoiding the 20-25 KB/s upload to the service.
+        self.relay_url = relay_url if relay_url and relay_token else None
+        self.relay_token = relay_token
         self.started = time.monotonic()
-        self.stats = {"jobs": 0, "remote_jobs": 0, "uploaded_jobs": 0, "pages": 0,
-                      "failed_pages": 0, "figures": 0, "seconds": 0.0}
+        self.stats = {"jobs": 0, "remote_jobs": 0, "relay_jobs": 0, "uploaded_jobs": 0,
+                      "pages": 0, "failed_pages": 0, "figures": 0, "seconds": 0.0}
 
     @property
     def enabled(self) -> bool:
@@ -231,6 +281,18 @@ class PaddleOcr:
             for future in self.pages.values():
                 future.set_result(None)
             return None
+        if self.remote_url:
+            size = pdf_path.stat().st_size
+            if self.relay_url and size > RELAY_PREFERRED_ABOVE_BYTES:
+                print(f"[ocr] {size / 1e6:.0f} MB source: segments go through the relay "
+                      "instead of fetching the whole file per segment", flush=True)
+                self.remote_url = None
+            elif size > REMOTE_MAX_BYTES:
+                self._abandon_link(f"{size / 1e6:.0f} MB is above the 200 MB link limit")
+            else:
+                self.submit_timeout = link_submit_timeout(size)
+                print(f"[ocr] link submissions may take {self.submit_timeout:.0f}s "
+                      f"for {size / 1e6:.0f} MB", flush=True)
         return asyncio.create_task(self._run(pdf_path, first, last, width))
 
     async def page(self, number: int) -> OcrPage | None:
@@ -287,9 +349,15 @@ class PaddleOcr:
         for attempt in range(1, SEGMENT_ATTEMPTS + 1):
             if self.fatal:
                 raise OcrFatalError(self.fatal)
-            remote = False
+            kind = "upload"
             try:
                 job = await self._submit_remote(first, last, name)
+                if job is not None:
+                    kind = "link"
+                else:
+                    job = await self._submit_relay(pdf_path, first, last, name)
+                    if job is not None:
+                        kind = "relay"
                 if job is None:
                     if upload is None:
                         upload = await asyncio.to_thread(extract_segment, pdf_path, first, last)
@@ -297,18 +365,20 @@ class PaddleOcr:
                             print(f"[ocr] {name}: {len(upload) >> 10} KiB, splitting", flush=True)
                             raise _SplitSegment
                     job = await self._submit_upload(upload, name)
-                else:
-                    remote = True
-                timeout = min(self.job_timeout, REMOTE_JOB_TIMEOUT) if remote else self.job_timeout
+                timeout = self.job_timeout if kind == "upload" else min(self.job_timeout, REMOTE_JOB_TIMEOUT)
                 return await self._collect(job, name, last - first + 1, timeout)
             except OcrFatalError as exc:
                 self.fatal = str(exc)
                 raise
             except (OcrRetryableError, httpx.TransportError, TimeoutError, ValueError) as exc:
-                if remote and isinstance(exc, (OcrJobFailed, ValueError, TimeoutError)):
+                if kind != "upload" and isinstance(exc, (OcrJobFailed, ValueError, TimeoutError)):
                     # A link job that failed, came back wrong or stalled will
                     # not get better; upload this and every later segment.
-                    self._abandon_link(f"{name}: {type(exc).__name__}: {exc}")
+                    reason = f"{name}: {type(exc).__name__}: {exc}"
+                    if kind == "link":
+                        self._abandon_link(reason)
+                    else:
+                        self._abandon_relay(reason)
                 if attempt == SEGMENT_ATTEMPTS:
                     raise
                 pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))
@@ -343,6 +413,66 @@ class PaddleOcr:
                   "uploading segments instead", flush=True)
             self.remote_url = None
 
+    def _abandon_relay(self, reason: str) -> None:
+        if self.relay_url:
+            print(f"[ocr] not using the relay any more ({reason}); "
+                  "uploading segments instead", flush=True)
+            self.relay_url = None
+
+    async def _submit_relay(self, pdf_path: Path, first: int, last: int,
+                            name: str) -> tuple[str, dict[str, str]] | None:
+        """Put the segment on the relay and let the service fetch it; ``None`` means upload."""
+        if not self.relay_url:
+            return None
+        data = await asyncio.to_thread(extract_segment, pdf_path, first, last, False)
+        if len(data) > RELAY_MAX_BYTES and last > first:
+            print(f"[ocr] {name}: {len(data) >> 20} MiB, splitting for the relay", flush=True)
+            raise _SplitSegment
+        started = time.monotonic()
+        headers = self._next_token_headers()
+        try:
+            url = await self._relay_upload(data, name)
+            response = await self.client.post(
+                self.job_url,
+                headers=headers,
+                json={"fileUrl": url, "model": self.model,
+                      "pageRanges": f"1-{last - first + 1}", "optionalPayload": OPTIONAL_PAYLOAD},
+                timeout=link_submit_timeout(len(data)),
+            )
+            job_id = self._check(response)["jobId"]
+        except (OcrFatalError, OcrRetryableError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - refused upload, rejected link, odd answer
+            self._abandon_relay(f"{name}: {type(exc).__name__}: {exc}")
+            return None
+        self.stats["jobs"] += 1
+        self.stats["relay_jobs"] += 1
+        print(f"[ocr] {name}: job {job_id} submitted through the relay "
+              f"({len(data) >> 10} KiB in {time.monotonic() - started:.1f}s)", flush=True)
+        return job_id, headers
+
+    async def _relay_upload(self, data: bytes, name: str) -> str:
+        """Store ``data`` on the relay and return its public link."""
+        try:
+            response = await self.client.put(
+                self.relay_url,
+                content=data,
+                headers={"Authorization": f"Bearer {self.relay_token}",
+                         "Content-Type": "application/pdf",
+                         "X-File-Name": f"pages-{name}.pdf"},
+                timeout=120.0,
+            )
+        except httpx.TransportError as exc:
+            raise OcrRetryableError(f"relay upload failed: {type(exc).__name__}") from exc
+        if response.status_code == 429 or response.status_code >= 500:
+            raise OcrRetryableError(f"relay upload HTTP {response.status_code}")
+        if response.status_code != 201:
+            raise RuntimeError(f"relay upload HTTP {response.status_code}: {response.text[:200]}")
+        url = response.json().get("sourceUrl")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise RuntimeError("relay upload returned no https link")
+        return url
+
     async def _submit_remote(self, first: int, last: int,
                              name: str) -> tuple[str, dict[str, str]] | None:
         """Ask the service to fetch the pages itself; ``None`` means upload."""
@@ -373,7 +503,7 @@ class PaddleOcr:
                 headers=headers,
                 json={"fileUrl": url, "model": self.model,
                       "pageRanges": f"{first}-{last}", "optionalPayload": OPTIONAL_PAYLOAD},
-                timeout=REMOTE_SUBMIT_TIMEOUT,
+                timeout=self.submit_timeout,
             )
             return self._check(response)["jobId"]
         except (OcrFatalError, OcrRetryableError):

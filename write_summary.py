@@ -24,8 +24,9 @@ def write_summary(state_dir: Path, destination: Path):
          f"{sources.get('ocr+model', 0)} / {sources.get('model', 0)} / {sources.get('ocr', 0)}"),
         ('OCR pages / failed / seconds',
          f"{ocr.get('pages', 0)} / {ocr.get('failed_pages', 0)} / {ocr.get('seconds', 0)}" if ocr else 'off'),
-        ('OCR jobs by link / uploaded',
-         f"{ocr.get('remote_jobs', 0)} / {ocr.get('uploaded_jobs', 0)}" if ocr else 'off'),
+        ('OCR jobs by link / relay / uploaded',
+         f"{ocr.get('remote_jobs', 0)} / {ocr.get('relay_jobs', 0)} / {ocr.get('uploaded_jobs', 0)}"
+         if ocr else 'off'),
         ('Model HTTP 429 / 503', f"{performance.get('429', 0)} / {performance.get('503', 0)}"),
         ('Requests per key bucket (min–max)', f"{spread.get('min_requests', 0)}–{spread.get('max_requests', 0)}"),
         ('Elapsed seconds', progress['elapsed_seconds']),

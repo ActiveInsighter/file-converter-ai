@@ -84,6 +84,28 @@ class RequestPartsTests(unittest.TestCase):
     def test_an_empty_draft_is_announced(self):
         self.assertIn("OCR 未识别到内容", self.build("")[0]["text"])
 
+    def test_neighbouring_strips_follow_the_page_with_their_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("006.bottom.png", "007.png", "008.top.png"):
+                (root / name).write_bytes(b"png")
+            previous = Page(6, root / "006.png", "006", bottom_path=root / "006.bottom.png")
+            following = Page(8, root / "008.png", "008", top_path=root / "008.top.png")
+            current = Page(7, root / "007.png", "007")
+            both, _ = make_request_parts(current, "要求", "high", "# 草稿", previous, following)
+            only_next, _ = make_request_parts(current, "要求", "high", None, None, following)
+        self.assertEqual([("text" in part, "inlineData" in part) for part in both],
+                         [(True, False), (False, True)] * 3)
+        self.assertIn("第一张图片是 PDF 第 7 页", both[0]["text"])
+        self.assertIn("上一页（第 6 页）底部", both[2]["text"])
+        self.assertIn("下一页（第 8 页）顶部", both[4]["text"])
+        self.assertIn("补完整", both[0]["text"])
+        self.assertIn("省略这段后半截", both[0]["text"])
+        self.assertTrue(both[0]["text"].rstrip().endswith("</ocr_draft>"), "the draft stays last")
+        self.assertIn("补完整", only_next[0]["text"])
+        self.assertNotIn("省略", only_next[0]["text"], "no rule for a strip that is not attached")
+        self.assertEqual(len(only_next), 4)
+
     def test_only_figures_that_exist_survive(self):
         text = "a ![](images/p001-1.jpg) b ![x](images/made-up.png) c"
         kept = keep_known_figures(text, {"images/p001-1.jpg": Path("x")})
@@ -106,6 +128,27 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["source"], "ocr+model")
         self.assertEqual(results[0]["figures"], ["images/p001-1.jpg"])
         self.assertEqual(written, "# Refined ![](images/p001-1.jpg)\n")
+
+    async def test_adjacent_pages_attach_rendered_non_blank_neighbours(self):
+        seen = {}
+
+        async def model(_c, _p, _prov, _m, parts, name, *_rest):
+            seen[name] = parts[0]["text"]
+            return "# text"
+
+        async def stream():
+            for item in (page(1), page(2), page(3, blank=True), page(4)):
+                yield item
+
+        with tempfile.TemporaryDirectory() as directory:
+            results = await run_process_pages(stream(), directory, model, ocr=FakeOcr({}),
+                                              total_pages=4, adjacent_pages=True)
+        self.assertEqual([r["status"] for r in results], ["ok", "ok", "blank", "ok"])
+        self.assertEqual(seen, {
+            "001": "page=1 draft=None previous=None following=2",
+            "002": "page=2 draft=None previous=1 following=None",
+            "004": "page=4 draft=None",
+        })
 
     async def test_page_without_ocr_is_transcribed_from_the_image(self):
         async def model(_c, _p, _prov, _m, parts, *_rest):

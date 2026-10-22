@@ -32,11 +32,11 @@ on:
         options:
           - gemini
           - modelflare
-      images_per_request:
-        description: "Deprecated and ignored: every page is one request (page image + its OCR draft). Kept so existing dispatchers keep working."
-        required: true
-        default: "1"
-        type: string
+      adjacent_pages:
+        description: "Also send the bottom of the previous page and the top of the next page, so content cut by a page break is completed once"
+        required: false
+        default: false
+        type: boolean
       concurrency:
         description: "Concurrent page requests, including speculative copies"
         required: true
@@ -177,9 +177,12 @@ jobs:
       JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || '95' }}
       VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || '0' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
+      ADJACENT_PAGES: ${{ github.event.inputs.adjacent_pages || 'false' }}
       OCR: ${{ vars.CONVERTER_OCR || 'paddle' }}
       OCR_PARALLEL_JOBS: ${{ vars.CONVERTER_OCR_JOBS || '3' }}
       OCR_SOURCE: ${{ vars.CONVERTER_OCR_SOURCE || 'link' }}
+      PDF_RELAY_URL: ${{ vars.CONVERTER_PDF_RELAY_URL || 'https://awremote.any1.tech/api/file-conversion/relay' }}
+      PDF_RELAY_TOKEN: ${{ secrets.PDF_RELAY_TOKEN }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
       START_PAGE: ${{ github.event.inputs.start_page || '' }}
@@ -273,6 +276,9 @@ jobs:
           fi
           if [[ -n "${USER_PROMPT}" ]]; then
             args+=(--prompt "${USER_PROMPT}")
+          fi
+          if [[ "${ADJACENT_PAGES}" == "true" ]]; then
+            args+=(--adjacent-pages)
           fi
           if [[ -n "${START_PAGE}" ]]; then
             args+=(--start-page "${START_PAGE}")

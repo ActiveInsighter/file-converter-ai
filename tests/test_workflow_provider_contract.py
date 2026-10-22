@@ -33,8 +33,19 @@ class WorkflowProviderContractTests(unittest.TestCase):
 
     def test_legacy_dispatch_inputs_are_still_accepted(self):
         workflow = WORKFLOW.read_text()
-        for name in ("images_per_request", "retry_rounds", "attempts_per_page", "verification_passes"):
+        for name in ("retry_rounds", "attempts_per_page", "verification_passes"):
             self.assertIn(f"      {name}:\n", workflow)
+
+    def test_adjacent_pages_is_an_opt_in_flag(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("      adjacent_pages:\n", workflow)
+        self.assertIn("ADJACENT_PAGES: ${{ github.event.inputs.adjacent_pages || 'false' }}", workflow)
+        self.assertIn('if [[ "${ADJACENT_PAGES}" == "true" ]]; then\n            args+=(--adjacent-pages)', workflow)
+
+    def test_dispatch_stays_within_githubs_input_limit(self):
+        inputs = WORKFLOW.read_text().split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+        names = [line for line in inputs.splitlines() if line.startswith("      ") and not line.startswith("       ")]
+        self.assertLessEqual(len(names), 25, "workflow_dispatch accepts at most 25 inputs")
 
 
 if __name__ == "__main__":

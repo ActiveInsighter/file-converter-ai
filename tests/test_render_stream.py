@@ -39,6 +39,21 @@ class RenderStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(p.number, p.blank) for p in pages], [(2, True), (3, False)])
             self.assertEqual(pages[0].image_path.suffix, '.jpg')
 
+    async def test_edge_strips_are_rendered_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = self.write_pdf(root, ['Page 1', 'Page 2'])
+            plan = RenderPlan.from_pdf(pdf, 1, None)
+            plain = [page async for page in stream_pages(pdf, root / 'plain', plan, 72, 95, 'png')]
+            self.assertEqual({(p.top_path, p.bottom_path) for p in plain}, {(None, None)})
+            pages = [page async for page in stream_pages(pdf, root / 'edges', plan, 72, 95, 'png', True)]
+            first = pages[0]
+            self.assertEqual((first.top_path.name, first.bottom_path.name), ('001.top.png', '001.bottom.png'))
+            full = fitz.Pixmap(str(first.image_path))
+            top = fitz.Pixmap(str(first.top_path))
+            self.assertEqual(top.width, full.width)
+            self.assertAlmostEqual(top.height / full.height, 0.4, delta=0.02)
+
 
 if __name__ == '__main__':
     unittest.main()

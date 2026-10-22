@@ -80,6 +80,23 @@ REFINE_INSTRUCTIONS = """下方 <ocr_draft> 是 OCR 模型（PaddleOCR-VL）对�
 5. 草稿中的图片引用 ![...](images/...) 原样保留在它在页面中的位置，不改路径，不新增图片引用。"""
 
 
+def adjacent_instructions(previous: bool, following: bool) -> str:
+    """How the model uses the neighbouring strips; only rules for strips that are attached."""
+    attached = "、".join(label for label, present in (
+        ("上一页底部", previous), ("下一页顶部", following)) if present)
+    rules = [f"本页之后另附{attached}的截图，只用来处理被分页截断的内容，不属于本页正文；"
+             "除下面两种情况外，不要转写截图中的任何内容。"]
+    if following:
+        rules.append("本页最后一句话、最后一个公式或最后一个表格行如果在本页底部被截断、"
+                     "到下一页顶部才结束，参照下一页顶部把它补完整后结束本页。")
+    if previous:
+        rules.append("本页开头如果是上一页最后一句话、公式或表格行的后半截（对照上一页底部可以确认），"
+                     "省略这段后半截，从本页第一个完整的句子、公式、段落或表格行开始转写。"
+                     "续写的完整段落、续表的完整行和列表的新条目照常转写。")
+    rules.append("输出的公式和表格必须语法完整：$ 与 $$ 成对，LaTeX 环境闭合。")
+    return "\n".join(f"{index}. {rule}" if index else rule for index, rule in enumerate(rules))
+
+
 def compose_prompt(system_prompt: str, user_prompt: str) -> str:
     """Join the shared system prompt with this conversion's own prompt.
 
@@ -119,6 +136,10 @@ class Page:
     image_path: Path
     stem: str
     blank: bool = False
+    #: Top and bottom strips of the page, rendered only when neighbouring
+    #: pages are sent along (``--adjacent-pages``).
+    top_path: Path | None = None
+    bottom_path: Path | None = None
 
     @property
     def start_page(self) -> int:
@@ -187,19 +208,19 @@ def download_pdf(source_url: str, destination: Path) -> None:
                 handle.write(data)
 
 
-async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format):
+async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, edges=False):
     """Render pages one by one on a dedicated thread and yield them in order."""
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
     iterator = render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
-                            image_format, is_blank_page)
+                            image_format, is_blank_page, edges)
     loop = asyncio.get_running_loop()
     try:
         while True:
             item = await loop.run_in_executor(executor, next, iterator, None)
             if item is None:
                 return
-            path, blank = item
-            yield Page(int(path.stem), path, path.stem, blank)
+            path, blank, (top, bottom) = item
+            yield Page(int(path.stem), path, path.stem, blank, top, bottom)
     finally:
         # close is queued behind any in-progress render on the same thread.
         await loop.run_in_executor(executor, iterator.close)
@@ -260,19 +281,35 @@ def _check_request_size(name: str, raw_bytes: int, text: str) -> int:
 
 
 def make_request_parts(
-    page: Page, prompt: str, media_resolution: str, draft: str | None = None
+    page: Page, prompt: str, media_resolution: str, draft: str | None = None,
+    previous: Page | None = None, following: Page | None = None,
 ) -> tuple[list[dict], int]:
-    """The page image plus, when OCR produced one, the draft to refine."""
-    text = f"以下图片是 PDF 第 {page.number} 页。\n"
+    """The page image plus, when OCR produced one, the draft to refine.
+
+    ``previous``/``following`` attach the bottom of the page before and the top
+    of the page after, so text cut by the page break can be checked.
+    """
+    strips = [
+        (f"上一页（第 {previous.number} 页）底部", previous.bottom_path) if previous and previous.bottom_path else None,
+        (f"下一页（第 {following.number} 页）顶部", following.top_path) if following and following.top_path else None,
+    ]
+    text = f"以下第一张图片是 PDF 第 {page.number} 页。\n" if any(strips) else f"以下图片是 PDF 第 {page.number} 页。\n"
     if draft is None:
         text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
     else:
-        text += (
-            f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}\n\n"
-            f"<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
-        )
+        text += f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}"
+    if any(strips):
+        text += "\n\n跨页内容：\n" + adjacent_instructions(bool(strips[0]), bool(strips[1]))
+    if draft is not None:
+        text += f"\n\n<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
     image, raw_bytes = image_part(page.image_path, media_resolution)
-    return [{"text": text}, image], _check_request_size(page.stem, raw_bytes, text)
+    parts = [{"text": text}, image]
+    for strip in filter(None, strips):
+        label, path = strip
+        strip_image, strip_bytes = image_part(path, media_resolution)
+        parts += [{"text": f"参考截图：{label}"}, strip_image]
+        raw_bytes += strip_bytes
+    return parts, _check_request_size(page.stem, raw_bytes, text)
 
 
 def make_verification_parts(
@@ -690,6 +727,7 @@ async def process_pages(
     hedge_budget: int | None = None,
     publish_progress=None,
     ocr: PaddleOcr | None = None,
+    adjacent_pages: bool = False,
 ) -> list[dict]:
     """Finalise every page with the model, using its OCR draft when there is one."""
     provider = provider or resolve_provider(None)
@@ -736,15 +774,35 @@ async def process_pages(
         tracker.request_summary = policy.summary
         policy_token = CURRENT_POLICY.set(policy)
 
-        async def source():
+        rendered: dict[int, Page] = {}
+
+        async def each_page():
             if isinstance(pages, list):
                 for page in pages:
-                    started_at.setdefault(page.stem, time.monotonic())
                     yield page
             else:
                 async for page in pages:
-                    started_at.setdefault(page.stem, time.monotonic())
                     yield page
+
+        async def source():
+            # With neighbours attached a page waits until the next one is
+            # rendered, so its request can carry the top of that page.
+            held: Page | None = None
+            async for page in each_page():
+                rendered[page.number] = page
+                if adjacent_pages:
+                    page, held = held, page
+                    if page is None:
+                        continue
+                started_at.setdefault(page.stem, time.monotonic())
+                yield page
+            if held is not None:
+                started_at.setdefault(held.stem, time.monotonic())
+                yield held
+
+        def neighbour(number: int) -> Page | None:
+            page = rendered.get(number) if adjacent_pages else None
+            return None if page is None or page.blank else page
 
         def record_success(page: Page, text: str, estimated: int, source: str, **extra) -> dict:
             md_path = pages_dir / f"{page.stem}.md"
@@ -798,7 +856,10 @@ async def process_pages(
             attempts = max(1, attempts_per_page)
 
             async def transcribe() -> tuple[str, int]:
-                parts, estimated = make_request_parts(page, prompt, media_resolution, draft)
+                parts, estimated = make_request_parts(
+                    page, prompt, media_resolution, draft,
+                    previous=neighbour(page.number - 1), following=neighbour(page.number + 1),
+                )
                 text = await call_model(
                     client, key_pool, provider, model, parts, page.stem, thinking_level,
                     fallback_models, reasoning_effort, api_base, max_output_tokens,
@@ -978,6 +1039,15 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
     p.add_argument("--ocr-url", default=JOB_URL, help="PaddleOCR async job endpoint.")
+    p.add_argument(
+        "--ocr-relay-url",
+        default=os.getenv("PDF_RELAY_URL", ""),
+        help=(
+            "Upload relay for OCR segments (token in PDF_RELAY_TOKEN). Large or "
+            "unfetchable sources are cut into segments, stored there and fetched "
+            "by PaddleOCR from the relay. Empty uploads segments directly."
+        ),
+    )
     p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
                    help="Pages per PaddleOCR job.")
     p.add_argument("--ocr-parallel-jobs", type=int, default=PARALLEL_JOBS,
@@ -1067,6 +1137,15 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--jpeg-quality", type=int, default=95)
     p.add_argument(
+        "--adjacent-pages",
+        action="store_true",
+        help=(
+            "Also send the bottom of the previous page and the top of the next "
+            "page with every page, so sentences, formulas and table rows cut by "
+            "a page break are completed once instead of left broken."
+        ),
+    )
+    p.add_argument(
         "--verification-passes",
         type=int,
         default=0,
@@ -1123,6 +1202,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
     if not 1 <= args.concurrency <= 100:
         raise ValueError("concurrency must be between 1 and 100")
+    if args.ocr_relay_url:
+        relay = urlparse(args.ocr_relay_url)
+        if relay.scheme != "https" or not relay.hostname:
+            raise ValueError("ocr_relay_url must be an absolute https URL")
     ocr_url = urlparse(args.ocr_url)
     if ocr_url.scheme not in {"http", "https"} or not ocr_url.hostname:
         raise ValueError("ocr_url must be an absolute http(s) URL")
@@ -1206,11 +1289,13 @@ async def async_main(args: argparse.Namespace) -> int:
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
         f"ocr_source={args.ocr_source} "
+        f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
         f"concurrency={args.concurrency} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
+        f"adjacent_pages={'on' if args.adjacent_pages else 'off'} "
         f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key} "
         f"model_fallbacks={','.join(fallback_models) or 'none'} "
         f"retry_rounds={args.retry_rounds} "
@@ -1250,7 +1335,7 @@ async def async_main(args: argparse.Namespace) -> int:
     print(f"[plan] pages={plan.page_count} streaming=true", flush=True)
     pages: list[Page] = []
     rendered = stream_pages(source_pdf, images_dir, plan, args.dpi,
-                            args.jpeg_quality, args.image_format)
+                            args.jpeg_quality, args.image_format, args.adjacent_pages)
 
     async def page_source():
         async with contextlib.aclosing(rendered):
@@ -1278,7 +1363,9 @@ async def async_main(args: argparse.Namespace) -> int:
                         model=args.ocr_model, job_url=args.ocr_url,
                         segment_pages=args.ocr_segment_pages,
                         parallel_jobs=args.ocr_parallel_jobs,
-                        source_url=args.source_url if fetchable else None)
+                        source_url=args.source_url if fetchable else None,
+                        relay_url=args.ocr_relay_url or None,
+                        relay_token=os.getenv("PDF_RELAY_TOKEN"))
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(
@@ -1305,6 +1392,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
                 publish_progress=publish,
                 ocr=ocr,
+                adjacent_pages=args.adjacent_pages,
             )
         except (Exception, asyncio.CancelledError) as exc:
             cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
