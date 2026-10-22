@@ -178,6 +178,7 @@ jobs:
       VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || '0' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
       OCR: ${{ vars.CONVERTER_OCR || 'paddle' }}
+      OCR_PARALLEL_JOBS: ${{ vars.CONVERTER_OCR_JOBS || '3' }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
       START_PAGE: ${{ github.event.inputs.start_page || '' }}
@@ -244,6 +245,7 @@ jobs:
             --source-url "${SOURCE_URL}"
             --output-name "${OUTPUT_NAME}"
             --ocr "${OCR}"
+            --ocr-parallel-jobs "${OCR_PARALLEL_JOBS}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
             --model-fallbacks "${MODEL_FALLBACKS}"

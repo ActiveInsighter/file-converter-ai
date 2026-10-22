@@ -37,7 +37,7 @@ import httpx
 from artifacts import prepare_directories, validate_output_name, write_result
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
-from paddle_ocr import JOB_URL, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
+from paddle_ocr import JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
 from pipeline import Progress, schedule_chunks
 from providers import (
     GEMINI,
@@ -970,6 +970,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--ocr-url", default=JOB_URL, help="PaddleOCR async job endpoint.")
     p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
                    help="Pages per PaddleOCR job.")
+    p.add_argument("--ocr-parallel-jobs", type=int, default=PARALLEL_JOBS,
+                   help="PaddleOCR jobs in flight; more jobs upload faster but hit 10010 (queue full).")
     p.add_argument(
         "--provider",
         default="",
@@ -1114,6 +1116,8 @@ def validate_args(args: argparse.Namespace) -> None:
     ocr_url = urlparse(args.ocr_url)
     if ocr_url.scheme not in {"http", "https"} or not ocr_url.hostname:
         raise ValueError("ocr_url must be an absolute http(s) URL")
+    if not 1 <= args.ocr_parallel_jobs <= 10:
+        raise ValueError("ocr_parallel_jobs must be between 1 and 10")
     if not 1 <= args.ocr_segment_pages <= 100:
         raise ValueError("ocr_segment_pages must be between 1 and 100")
     if not 72 <= args.dpi <= 300:
@@ -1259,7 +1263,8 @@ async def async_main(args: argparse.Namespace) -> int:
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as ocr_client:
         ocr = PaddleOcr(ocr_tokens, client=ocr_client, work_dir=state_dir,
                         model=args.ocr_model, job_url=args.ocr_url,
-                        segment_pages=args.ocr_segment_pages)
+                        segment_pages=args.ocr_segment_pages,
+                        parallel_jobs=args.ocr_parallel_jobs)
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(

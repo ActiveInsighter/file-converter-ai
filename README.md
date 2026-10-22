@@ -57,6 +57,7 @@ PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一�
 | `GEMINI_KEY_GROUPS` | Variable，可选 | 每个 Key 所属的 Project，与 Key 一一对应；可用 `deploy/print-key-groups.py` 生成 |
 | `BAIDU_AI_STUDIO` | Secret | AI Studio 访问令牌，可多行；工作流以 `PADDLEOCR_TOKENS` 传给转换器 |
 | `CONVERTER_OCR` | Variable，可选 | `paddle`（默认）或 `none` |
+| `CONVERTER_OCR_JOBS` | Variable，可选 | 同时进行的 OCR 任务数，默认 `3`；调大上传更快，但更容易收到 10010 |
 | `MODELFLARE_API_KEYS` | Secret，可选 | 使用 Modelflare 时需要 |
 | `CONVERTER_HEDGE_AFTER` / `CONVERTER_HEDGE_BUDGET` | Variable，可选 | 补发阈值与预算，默认 `60` / `-1`，填 `0` 关闭 |
 
@@ -101,6 +102,10 @@ python pdf2md.py --source-url 'https://example.com/document.pdf' --output-name '
 ```
 
 CLI 另有 `--ocr none`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget` 等参数，见 `python pdf2md.py --help`。
+
+## 耗时
+
+实测（GitHub Runner，Gemini 3.5 Flash-Lite，66 个 Key）：75 页论文约 7 分钟完成，全部页面为“OCR + 模型校对”，零 429/503。瓶颈在 OCR：Runner 到百度的上传约 20–25 KB/s，单个 OCR 任务在服务端排队 30–150 秒。模型请求本身 P50 约 13 秒。需要更快时可调大 `CONVERTER_OCR_JOBS`，或设 `CONVERTER_OCR=none` 回到纯图片转写。
 
 ## 代码结构
 
