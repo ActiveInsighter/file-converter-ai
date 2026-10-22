@@ -1,12 +1,14 @@
 """PDF -> Markdown: PaddleOCR drafts every page, a vision model finalises it.
 
-1. The PDF is downloaded and handed to PaddleOCR-VL in small segments.
-2. Pages are rendered to images in a background thread at the same time.
-3. Each page goes to the model as soon as both its image and its OCR draft are
-   ready. The model checks the draft against the image and writes the final
-   Markdown for that page.
+1. The PDF is downloaded; PaddleOCR-VL fetches the same link itself, in page
+   segments (segments are uploaded only when the link cannot be fetched).
+2. Meanwhile a background thread renders every page and extracts its PDF text
+   layer.
+3. Each page goes to the model with its image, its text layer and its OCR
+   draft. A page with a text layer waits for OCR only until ``ocr_wait``
+   seconds into the run, then goes without the draft; a scanned page waits.
 4. A page whose model request keeps failing or is refused falls back to its OCR
-   draft; a page without a draft is transcribed from the image alone.
+   draft; a page without a draft is transcribed from the image (and text layer).
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from collections.abc import AsyncIterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -78,6 +81,11 @@ REFINE_INSTRUCTIONS = """下方 <ocr_draft> 是 OCR 模型（PaddleOCR-VL）对�
 4. 表格输出为 Markdown 表格；存在合并单元格等 Markdown 无法表达的结构时，保留 HTML <table>。
 5. 草稿中的图片引用 ![...](images/...) 原样保留在它在页面中的位置，不改路径，不新增图片引用。"""
 
+#: How the model is asked to use the PDF's own text layer, with or without an
+#: OCR draft next to it.
+TEXT_LAYER_NOTE = """下方 <pdf_text> 是从 PDF 文本层直接提取的文字，不是识别结果：字符本身通常准确，可用来核对拼写、数字和专有名词；但它没有任何格式，公式会被拆成零散符号，多栏和表格的顺序可能错乱，也可能含页眉页脚或页面上看不见的文字。结构、公式、阅读顺序和取舍一律以图片为准，不要输出图片中没有的内容。"""
+TEXT_LAYER_ONLY = "请以图片为准输出这一页的 Markdown，并用 <pdf_text> 核对文字。"
+
 
 def compose_prompt(system_prompt: str, user_prompt: str) -> str:
     """Join the shared system prompt with this conversion's own prompt.
@@ -109,6 +117,13 @@ BLANK_ANALYSIS_SCALE = 0.25
 
 _FIGURE_LINK = re.compile(r"!\[[^\]\n]*\]\((images/[^)\s]+)\)")
 
+# A text layer is sent only when it plausibly holds the page's words: enough
+# visible characters, and few replacement / private-use / control characters
+# (the signature of a font without a usable Unicode map).
+TEXT_LAYER_MIN_CHARS = 20
+TEXT_LAYER_MAX_GARBLED = 0.05
+TEXT_LAYER_MAX_CHARS = 20000
+
 
 @dataclass(frozen=True)
 class Page:
@@ -118,6 +133,8 @@ class Page:
     image_path: Path
     stem: str
     blank: bool = False
+    #: Words from the PDF's text layer; ``None`` for scans and garbled layers.
+    text_layer: str | None = None
 
     @property
     def start_page(self) -> int:
@@ -186,19 +203,21 @@ def download_pdf(source_url: str, destination: Path) -> None:
                 handle.write(data)
 
 
-async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format):
+async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format,
+                       text_layer=True):
     """Render pages one by one on a dedicated thread and yield them in order."""
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
     iterator = render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
-                            image_format, is_blank_page)
+                            image_format, is_blank_page,
+                            read_text_layer if text_layer else lambda page: None)
     loop = asyncio.get_running_loop()
     try:
         while True:
             item = await loop.run_in_executor(executor, next, iterator, None)
             if item is None:
                 return
-            path, blank = item
-            yield Page(int(path.stem), path, path.stem, blank)
+            path, blank, text = item
+            yield Page(int(path.stem), path, path.stem, blank, text)
     finally:
         # close is queued behind any in-progress render on the same thread.
         await loop.run_in_executor(executor, iterator.close)
@@ -223,6 +242,24 @@ def is_blank_page(page: fitz.Page) -> tuple[bool, float, int]:
     ink, darkest = page_ink_stats(page)
     blank = ink < BLANK_PAGE_INK_RATIO and darkest >= BLANK_PAGE_DARK_LEVEL
     return blank, ink, darkest
+
+
+def read_text_layer(page: fitz.Page) -> str | None:
+    """The page's text layer, or ``None`` when it is missing or garbled."""
+    lines = (line.rstrip() for line in page.get_text("text").splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    visible = [char for char in text if not char.isspace()]
+    if len(visible) < TEXT_LAYER_MIN_CHARS:
+        return None
+    garbled = sum(
+        char == "\ufffd" or "\ue000" <= char <= "\uf8ff" or unicodedata.category(char) == "Cc"
+        for char in visible
+    )
+    if garbled / len(visible) > TEXT_LAYER_MAX_GARBLED:
+        return None
+    if len(text) > TEXT_LAYER_MAX_CHARS:
+        text = text[:TEXT_LAYER_MAX_CHARS] + "\n……（文本层过长，已截断）"
+    return text
 
 
 def media_resolution_payload(level: str) -> dict | None:
@@ -259,17 +296,22 @@ def _check_request_size(name: str, raw_bytes: int, text: str) -> int:
 
 
 def make_request_parts(
-    page: Page, prompt: str, media_resolution: str, draft: str | None = None
+    page: Page, prompt: str, media_resolution: str, draft: str | None = None,
+    text_layer: str | None = None,
 ) -> tuple[list[dict], int]:
-    """The page image plus, when OCR produced one, the draft to refine."""
+    """The page image plus whatever text is ready: OCR draft, PDF text layer."""
     text = f"以下图片是 PDF 第 {page.number} 页。\n"
-    if draft is None:
+    if draft is None and text_layer is None:
         text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
     else:
-        text += (
-            f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}\n\n"
-            f"<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
-        )
+        text += REFINE_INSTRUCTIONS if draft is not None else TEXT_LAYER_ONLY
+        if text_layer is not None:
+            text += f"\n\n{TEXT_LAYER_NOTE}"
+        text += f"\n\n转录要求：\n{prompt.strip()}"
+        if draft is not None:
+            text += f"\n\n<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
+        if text_layer is not None:
+            text += f"\n\n<pdf_text>\n{text_layer.strip()}\n</pdf_text>"
     image, raw_bytes = image_part(page.image_path, media_resolution)
     return [{"text": text}, image], _check_request_size(page.stem, raw_bytes, text)
 
@@ -689,8 +731,13 @@ async def process_pages(
     hedge_budget: int | None = None,
     publish_progress=None,
     ocr: PaddleOcr | None = None,
+    ocr_wait: float | None = None,
 ) -> list[dict]:
-    """Finalise every page with the model, using its OCR draft when there is one."""
+    """Finalise every page with the model, using its OCR draft when there is one.
+
+    A page with a text layer waits for its draft only until ``ocr_wait``
+    seconds after this call; ``None`` waits for OCR on every page.
+    """
     provider = provider or resolve_provider(None)
 
     pages_dir = state_dir / "pages"
@@ -720,6 +767,7 @@ async def process_pages(
             raise ValueError("Streaming input requires total_pages")
         tracker = Progress(state_dir, total_chunks=total_pages, total_pages=total_pages)
         started_at: dict[str, float] = {}
+        ocr_deadline = None if ocr_wait is None else time.monotonic() + ocr_wait
         stop_metrics = asyncio.Event()
 
         def can_hedge():
@@ -791,13 +839,25 @@ async def process_pages(
                     f"{BLANK_PAGE_DARK_LEVEL})",
                 )
 
-            ocr_page: OcrPage | None = await ocr.page(page.number) if ocr else None
+            text_layer = page.text_layer
+            ocr_page: OcrPage | None = None
+            if ocr is not None:
+                # A scanned page has nothing but OCR to lean on, so it waits;
+                # a page with a text layer goes ahead once the deadline passes.
+                timeout = (None if text_layer is None or ocr_deadline is None
+                           else ocr_deadline - time.monotonic())
+                ocr_page = await ocr.page(page.number, timeout)
+                if ocr_page is None and timeout is not None and ocr.enabled and round_number == 1:
+                    print(f"[ocr-wait] {page.stem}: no OCR draft yet; "
+                          "sending the image with the PDF text layer", flush=True)
             draft = ocr_page.markdown if ocr_page else None
             figures = ocr_page.figures if ocr_page else {}
             attempts = max(1, attempts_per_page)
 
             async def transcribe() -> tuple[str, int]:
-                parts, estimated = make_request_parts(page, prompt, media_resolution, draft)
+                parts, estimated = make_request_parts(
+                    page, prompt, media_resolution, draft, text_layer
+                )
                 text = await call_model(
                     client, key_pool, provider, model, parts, page.stem, thinking_level,
                     fallback_models, reasoning_effort, api_base, max_output_tokens,
@@ -831,8 +891,10 @@ async def process_pages(
                     await asyncio.sleep(pause)
                     continue
                 text = keep_known_figures(text, figures)
+                source = ("ocr+model" if draft is not None
+                          else "text+model" if text_layer is not None else "model")
                 return record_success(
-                    page, text, estimated, "ocr+model" if draft is not None else "model"
+                    page, text, estimated, source, text_layer=text_layer is not None
                 )
 
             exc = last_error or RuntimeError("transcription failed without an exception")
@@ -913,7 +975,7 @@ async def process_pages(
         usage["ocr"] = ocr.stats if ocr and ocr.enabled else None
         usage["page_sources"] = {
             source: sum(r.get("source") == source for r in results)
-            for source in ("ocr+model", "model", "ocr")
+            for source in ("ocr+model", "text+model", "model", "ocr")
         }
         (state_dir / "quota-usage.json").write_text(
             json.dumps(usage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -965,6 +1027,30 @@ def parser() -> argparse.ArgumentParser:
             "Draft every page with PaddleOCR-VL first (tokens in PADDLEOCR_TOKENS) "
             "and let the model refine it. 'none' sends only the page image."
         ),
+    )
+    p.add_argument(
+        "--ocr-source",
+        choices=["link", "upload"],
+        default="link",
+        help=(
+            "link: PaddleOCR downloads source_url itself, one page range per job "
+            "(falls back to upload if it cannot); upload: send PDF segments from here."
+        ),
+    )
+    p.add_argument(
+        "--ocr-wait",
+        type=float,
+        default=120.0,
+        help=(
+            "Seconds into the run after which a page with a PDF text layer stops "
+            "waiting for its OCR draft; -1 waits for OCR on every page."
+        ),
+    )
+    p.add_argument(
+        "--text-layer",
+        choices=["auto", "off"],
+        default="auto",
+        help="Send each page's PDF text layer to the model when it looks usable.",
     )
     p.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
     p.add_argument("--ocr-url", default=JOB_URL, help="PaddleOCR async job endpoint.")
@@ -1120,6 +1206,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("ocr_parallel_jobs must be between 1 and 10")
     if not 1 <= args.ocr_segment_pages <= 100:
         raise ValueError("ocr_segment_pages must be between 1 and 100")
+    if not (args.ocr_wait == -1 or 0 <= args.ocr_wait <= 3600):
+        raise ValueError("ocr_wait must be -1 or between 0 and 3600")
     if not 72 <= args.dpi <= 300:
         raise ValueError("dpi must be between 72 and 300")
     if not 50 <= args.jpeg_quality <= 100:
@@ -1195,6 +1283,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
+        f"ocr_source={args.ocr_source} ocr_wait={args.ocr_wait:g}s text_layer={args.text_layer} "
         f"concurrency={args.concurrency} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
@@ -1239,7 +1328,8 @@ async def async_main(args: argparse.Namespace) -> int:
     print(f"[plan] pages={plan.page_count} streaming=true", flush=True)
     pages: list[Page] = []
     rendered = stream_pages(source_pdf, images_dir, plan, args.dpi,
-                            args.jpeg_quality, args.image_format)
+                            args.jpeg_quality, args.image_format,
+                            text_layer=args.text_layer == "auto")
 
     async def page_source():
         async with contextlib.aclosing(rendered):
@@ -1261,10 +1351,13 @@ async def async_main(args: argparse.Namespace) -> int:
     # Always keep a compact partial package, including during cancellation.
     publish([])
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as ocr_client:
+        # Baidu cannot fetch a Drive share page; those segments are uploaded.
+        fetchable = args.ocr_source == "link" and not is_google_drive_url(args.source_url)
         ocr = PaddleOcr(ocr_tokens, client=ocr_client, work_dir=state_dir,
                         model=args.ocr_model, job_url=args.ocr_url,
                         segment_pages=args.ocr_segment_pages,
-                        parallel_jobs=args.ocr_parallel_jobs)
+                        parallel_jobs=args.ocr_parallel_jobs,
+                        source_url=args.source_url if fetchable else None)
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(
@@ -1291,6 +1384,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
                 publish_progress=publish,
                 ocr=ocr,
+                ocr_wait=None if args.ocr_wait < 0 else args.ocr_wait,
             )
         except (Exception, asyncio.CancelledError) as exc:
             cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0

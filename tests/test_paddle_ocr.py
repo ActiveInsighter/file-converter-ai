@@ -8,7 +8,15 @@ from pathlib import Path
 import fitz
 import httpx
 
-from paddle_ocr import SEGMENT_ATTEMPTS, PaddleOcr, normalize_markdown, parse_tokens, plan_segments, tidy_inline_math
+from paddle_ocr import (
+    SEGMENT_ATTEMPTS,
+    PaddleOcr,
+    normalize_markdown,
+    parse_tokens,
+    plan_segments,
+    remote_candidates,
+    tidy_inline_math,
+)
 
 JOBS = "https://ocr.test/api/v2/ocr/jobs"
 
@@ -32,10 +40,13 @@ class FakeService:
     successive submissions; anything not listed succeeds.
     """
 
-    def __init__(self, fates=None):
+    def __init__(self, fates=None, accepted_links=(), source: Path | None = None):
         self.fates = {key: list(value) for key, value in (fates or {}).items()}
+        self.accepted_links = set(accepted_links)
+        self.source = source
         self.jobs = {}
         self.submissions = []
+        self.links = []
         self.tokens = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -43,8 +54,17 @@ class FakeService:
         if request.method == "POST":
             self.tokens.append(request.headers["Authorization"])
             body = request.read()
-            with fitz.open(stream=body[body.index(b"%PDF"):], filetype="pdf") as document:
-                texts = [page.get_text().strip() for page in document]
+            if request.headers["Content-Type"] == "application/json":
+                payload = json.loads(body)
+                self.links.append((payload["fileUrl"], payload["pageRanges"]))
+                if payload["fileUrl"] not in self.accepted_links:
+                    return httpx.Response(400, json={"code": 10004, "msg": "unsupported format"})
+                first, last = map(int, payload["pageRanges"].split("-"))
+                with fitz.open(self.source) as document:
+                    texts = [document[n - 1].get_text().strip() for n in range(first, last + 1)]
+            else:
+                with fitz.open(stream=body[body.index(b"%PDF"):], filetype="pdf") as document:
+                    texts = [page.get_text().strip() for page in document]
             self.submissions.append(texts)
             queue = self.fates.get(texts[0]) or self.fates.get("*") or []
             fate = queue.pop(0) if queue else "ok"
@@ -86,14 +106,16 @@ class FakeService:
 
 
 class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
-    async def run_ocr(self, service, pages=5, segment=2, tokens=("t1", "t2")):
+    async def run_ocr(self, service, pages=5, segment=2, tokens=("t1", "t2"), source_url=None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         pdf = write_pdf(root / "source.pdf", pages)
+        service.source = pdf
         async with httpx.AsyncClient(transport=httpx.MockTransport(service.handler)) as client:
             ocr = PaddleOcr(list(tokens), client=client, work_dir=root / "state", job_url=JOBS,
-                            segment_pages=segment, poll_seconds=0, retry_pause=0)
+                            segment_pages=segment, poll_seconds=0, retry_pause=0,
+                            source_url=source_url)
             task = ocr.start(pdf, 1, pages, 3)
             results = {number: await ocr.page(number) for number in range(1, pages + 1)}
             if task is not None:
@@ -141,6 +163,52 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("12001", ocr.fatal)
         self.assertLessEqual(len(service.submissions), 3, "no retries once the quota is gone")
 
+    async def test_the_service_fetches_the_link_one_page_range_per_job(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        ocr, results, _ = await self.run_ocr(service, pages=5, segment=2, source_url=link)
+        self.assertEqual(sorted(service.links), [(link, "1-2"), (link, "3-4"), (link, "5-5")])
+        self.assertEqual([page.markdown.split()[-2] for page in results.values()],
+                         ["1", "2", "3", "4", "5"])
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (3, 0))
+
+    async def test_an_extensionless_link_is_retried_with_a_pdf_suffix_once(self):
+        link = "https://arxiv.test/pdf/2401.00001"
+        service = FakeService(accepted_links={link + "#.pdf"})
+        ocr, results, _ = await self.run_ocr(service, pages=6, segment=2, source_url=link)
+        self.assertEqual([url for url, _ in service.links].count(link), 1, "rejected link is not retried")
+        self.assertEqual(ocr.stats["remote_jobs"], 3)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_link_the_service_rejects_falls_back_to_uploads(self):
+        link = "https://private.test/download?id=7"
+        service = FakeService()
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, source_url=link)
+        self.assertEqual(len(service.links), 2, "each candidate is offered once, then uploads")
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_failed_link_job_switches_the_run_to_uploads(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService({"Page 1": ["fail"]}, accepted_links={link})
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_draft_that_is_not_ready_in_time_is_none(self):
+        async def stall(_request):
+            await asyncio.sleep(10)
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = write_pdf(Path(directory) / "s.pdf", 1)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(stall)) as client:
+                ocr = PaddleOcr(["t"], client=client, work_dir=Path(directory), job_url=JOBS)
+                task = ocr.start(pdf, 1, 1, 3)
+                self.assertIsNone(await ocr.page(1, timeout=0.01))
+                self.assertIsNone(await ocr.page(1, timeout=-5))
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_disabled_ocr_resolves_every_page_to_none(self):
         service = FakeService()
         ocr, results, _ = await self.run_ocr(service, pages=2, tokens=())
@@ -187,6 +255,13 @@ class MarkdownNormalizationTests(unittest.TestCase):
 class HelperTests(unittest.TestCase):
     def test_segments_cover_the_range(self):
         self.assertEqual(plan_segments(3, 9, 3), [(3, 5), (6, 8), (9, 9)])
+
+    def test_only_extensionless_links_get_a_pdf_suffix_candidate(self):
+        self.assertEqual(remote_candidates("https://a.test/x.PDF?sig=1"), ["https://a.test/x.PDF?sig=1"])
+        self.assertEqual(remote_candidates("https://arxiv.org/pdf/1"),
+                         ["https://arxiv.org/pdf/1", "https://arxiv.org/pdf/1#.pdf"])
+        self.assertEqual(remote_candidates("https://a.test/v#p=2"), ["https://a.test/v#p=2"])
+        self.assertEqual(remote_candidates(None), [])
 
     def test_tokens_are_split_and_deduplicated(self):
         self.assertEqual(parse_tokens(" a\nb, a ;\n"), ["a", "b"])

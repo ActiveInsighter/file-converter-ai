@@ -52,8 +52,11 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(merged.count('https://example.test/book.pdf'), 1)
 
     def test_fallback_sources_are_listed(self):
-        results = [self.page_text(2, 'A', source='ocr'), self.page_text(3, 'B', source='model')]
-        merged = self.write([page(2), page(3)], results).markdown.read_text()
+        results = [self.page_text(2, 'A', source='ocr'), self.page_text(3, 'B', source='model'),
+                   self.page_text(4, 'C', source='text+model')]
+        merged = self.write([page(2), page(3), page(4)], results,
+                            plan=RenderPlan(10, 2, 4, 3)).markdown.read_text()
+        self.assertIn('- 未等到 OCR 草稿、按图片和 PDF 文本层转写的页码：4', merged)
         self.assertIn('- 模型失败、直接使用 OCR 结果的页码：2', merged)
         self.assertIn('- 未用 OCR 草稿（仅图片转写）的页码：3', merged)
 

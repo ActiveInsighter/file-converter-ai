@@ -179,6 +179,9 @@ jobs:
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
       OCR: ${{ vars.CONVERTER_OCR || 'paddle' }}
       OCR_PARALLEL_JOBS: ${{ vars.CONVERTER_OCR_JOBS || '3' }}
+      OCR_SOURCE: ${{ vars.CONVERTER_OCR_SOURCE || 'link' }}
+      OCR_WAIT: ${{ vars.CONVERTER_OCR_WAIT || '120' }}
+      TEXT_LAYER: ${{ vars.CONVERTER_TEXT_LAYER || 'auto' }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
       START_PAGE: ${{ github.event.inputs.start_page || '' }}
@@ -246,6 +249,9 @@ jobs:
             --output-name "${OUTPUT_NAME}"
             --ocr "${OCR}"
             --ocr-parallel-jobs "${OCR_PARALLEL_JOBS}"
+            --ocr-source "${OCR_SOURCE}"
+            --ocr-wait "${OCR_WAIT}"
+            --text-layer "${TEXT_LAYER}"
             --concurrency "${CONCURRENCY}"
             --model "${MODEL}"
             --model-fallbacks "${MODEL_FALLBACKS}"

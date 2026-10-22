@@ -27,7 +27,8 @@ class RenderPlan:
         return cls(total, first, last, max(3, len(str(total))))
 
 
-def render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, classify_blank):
+def render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, classify_blank,
+                 read_text=lambda page: None):
     image_dir.mkdir(parents=True, exist_ok=True)
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     extension = 'png' if image_format == 'png' else 'jpg'
@@ -39,6 +40,9 @@ def render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, cla
             path.write_bytes(pix.tobytes('png') if image_format == 'png'
                              else pix.tobytes('jpeg', jpg_quality=jpeg_quality))
             blank, ink_ratio, darkest = classify_blank(page)
+            text = None if blank else read_text(page)
             detail = f' blank ink_ratio={ink_ratio:.6f} darkest={darkest}' if blank else ''
+            if text is not None:
+                detail += f' text_layer={len(text)}'
             print(f'[render] {number}/{plan.total_pdf_pages}: {path.name}{detail}', flush=True)
-            yield path, blank
+            yield path, blank, text

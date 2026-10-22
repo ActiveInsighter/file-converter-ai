@@ -63,11 +63,13 @@ class BlankPageTests(unittest.TestCase):
 
 
 class RequestPartsTests(unittest.TestCase):
-    def build(self, draft):
+    def build(self, draft, text_layer=None):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "007.png"
             image.write_bytes(b"png")
-            return make_request_parts(Page(7, image, "007"), "转录要求原文", "high", draft)[0]
+            return make_request_parts(
+                Page(7, image, "007"), "转录要求原文", "high", draft, text_layer
+            )[0]
 
     def test_draft_and_image_travel_together(self):
         parts = self.build("# OCR 草稿")
@@ -80,6 +82,14 @@ class RequestPartsTests(unittest.TestCase):
         parts = self.build(None)
         self.assertNotIn("ocr_draft", parts[0]["text"])
         self.assertIn("转录要求原文", parts[0]["text"])
+
+    def test_text_layer_travels_with_or_without_a_draft(self):
+        alone = self.build(None, "Exact words")[0]["text"]
+        self.assertIn("<pdf_text>\nExact words\n</pdf_text>", alone)
+        self.assertNotIn("ocr_draft", alone)
+        both = self.build("# 草稿", "Exact words")[0]["text"]
+        self.assertLess(both.index("<ocr_draft>"), both.index("<pdf_text>"))
+        self.assertIn("转录要求原文", both)
 
     def test_an_empty_draft_is_announced(self):
         self.assertIn("OCR 未识别到内容", self.build("")[0]["text"])
@@ -115,6 +125,36 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             results = await run_process_pages([page(2)], directory, model, ocr=FakeOcr({}))
         self.assertEqual(results[0]["source"], "model")
+
+    async def test_text_layer_page_goes_ahead_when_ocr_is_late(self):
+        seen = {}
+
+        async def model(_c, _p, _prov, _m, parts, name, *_rest):
+            seen[name] = parts[0]["text"]
+            return f"# {name}"
+
+        ocr = FakeOcr({1: "# late", 2: "# scan"}, delays={1: 5, 2: 0.2})
+        pages = [page(1, text_layer="Words"), page(2)]
+        with tempfile.TemporaryDirectory() as directory:
+            results = await run_process_pages(
+                pages, directory, model, ocr=ocr, ocr_wait=0.05, concurrency=2
+            )
+        self.assertEqual(seen["001"], "page=1 draft=None text=Words")
+        self.assertEqual(seen["002"], "page=2 draft=# scan", "a scanned page waits for OCR")
+        self.assertEqual([r["source"] for r in results], ["text+model", "ocr+model"])
+
+    async def test_ocr_that_arrives_in_time_travels_with_the_text_layer(self):
+        async def model(_c, _p, _prov, _m, parts, *_rest):
+            self.assertEqual(parts[0]["text"], "page=1 draft=# ocr text=Words")
+            return "# Refined"
+
+        ocr = FakeOcr({1: "# ocr"}, delays={1: 0.05})
+        with tempfile.TemporaryDirectory() as directory:
+            results = await run_process_pages(
+                [page(1, text_layer="Words")], directory, model, ocr=ocr, ocr_wait=5
+            )
+        self.assertEqual(results[0]["source"], "ocr+model")
+        self.assertTrue(results[0]["text_layer"])
 
     async def test_refused_page_falls_back_to_the_ocr_draft_without_retrying(self):
         calls = []
