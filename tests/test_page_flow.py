@@ -156,6 +156,19 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["source"], "ocr+model")
         self.assertTrue(results[0]["text_layer"])
 
+    async def test_a_page_that_went_ahead_without_ocr_still_falls_back_to_its_late_draft(self):
+        async def model(*_args):
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+
+        ocr = FakeOcr({1: "Late OCR text"}, delays={1: 0.2})
+        with tempfile.TemporaryDirectory() as directory:
+            results = await run_process_pages(
+                [page(1, text_layer="Words")], directory, model, ocr=ocr, ocr_wait=0
+            )
+            written = (Path(directory) / "pages/001.md").read_text()
+        self.assertEqual(results[0]["source"], "ocr")
+        self.assertEqual(written, "Late OCR text\n")
+
     async def test_refused_page_falls_back_to_the_ocr_draft_without_retrying(self):
         calls = []
 

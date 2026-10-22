@@ -14,7 +14,6 @@ from paddle_ocr import (
     normalize_markdown,
     parse_tokens,
     plan_segments,
-    remote_candidates,
     tidy_inline_math,
 )
 
@@ -172,19 +171,11 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
                          ["1", "2", "3", "4", "5"])
         self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (3, 0))
 
-    async def test_an_extensionless_link_is_retried_with_a_pdf_suffix_once(self):
-        link = "https://arxiv.test/pdf/2401.00001"
-        service = FakeService(accepted_links={link + "#.pdf"})
-        ocr, results, _ = await self.run_ocr(service, pages=6, segment=2, source_url=link)
-        self.assertEqual([url for url, _ in service.links].count(link), 1, "rejected link is not retried")
-        self.assertEqual(ocr.stats["remote_jobs"], 3)
-        self.assertTrue(all(page is not None for page in results.values()))
-
     async def test_a_link_the_service_rejects_falls_back_to_uploads(self):
-        link = "https://private.test/download?id=7"
+        link = "https://arxiv.test/pdf/2401.00001"
         service = FakeService()
         ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, source_url=link)
-        self.assertEqual(len(service.links), 2, "each candidate is offered once, then uploads")
+        self.assertEqual(len(service.links), 1, "the link is offered once, then segments upload")
         self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
         self.assertTrue(all(page is not None for page in results.values()))
 
@@ -255,13 +246,6 @@ class MarkdownNormalizationTests(unittest.TestCase):
 class HelperTests(unittest.TestCase):
     def test_segments_cover_the_range(self):
         self.assertEqual(plan_segments(3, 9, 3), [(3, 5), (6, 8), (9, 9)])
-
-    def test_only_extensionless_links_get_a_pdf_suffix_candidate(self):
-        self.assertEqual(remote_candidates("https://a.test/x.PDF?sig=1"), ["https://a.test/x.PDF?sig=1"])
-        self.assertEqual(remote_candidates("https://arxiv.org/pdf/1"),
-                         ["https://arxiv.org/pdf/1", "https://arxiv.org/pdf/1#.pdf"])
-        self.assertEqual(remote_candidates("https://a.test/v#p=2"), ["https://a.test/v#p=2"])
-        self.assertEqual(remote_candidates(None), [])
 
     def test_tokens_are_split_and_deduplicated(self):
         self.assertEqual(parse_tokens(" a\nb, a ;\n"), ["a", "b"])

@@ -898,8 +898,13 @@ async def process_pages(
                 )
 
             exc = last_error or RuntimeError("transcription failed without an exception")
-            has_draft = bool(draft and draft.strip())
             last_round = round_number >= retry_rounds or not is_retryable_error(exc)
+            if last_round and draft is None and ocr is not None:
+                # The page went ahead without its draft; the draft is still
+                # the best fallback, so wait for it now.
+                late = await ocr.page(page.number)
+                draft = late.markdown if late else None
+            has_draft = bool(draft and draft.strip())
             if has_draft and last_round:
                 print(
                     f"[fallback] {page.stem}: model gave up with {type(exc).__name__}: "

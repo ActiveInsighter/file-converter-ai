@@ -81,23 +81,6 @@ class _SplitSegment(Exception):
     """The segment is too big to upload in one piece."""
 
 
-def remote_candidates(url: str | None) -> list[str]:
-    """Links to offer the service, best first.
-
-    The service judges the format by the link's suffix and rejects extension-
-    less links such as ``https://arxiv.org/pdf/2401.00001`` with 10004. A
-    ``#.pdf`` fragment never reaches the origin server but gives the link a
-    ``.pdf`` suffix, so it is tried second.
-    """
-    if not url:
-        return []
-    candidates = [url]
-    path = url.split("#", 1)[0].split("?", 1)[0]
-    if "#" not in url and not path.lower().endswith(".pdf"):
-        candidates.append(url + "#.pdf")
-    return candidates
-
-
 @dataclass(frozen=True)
 class OcrPage:
     number: int
@@ -211,8 +194,10 @@ class PaddleOcr:
         self.turn = 0
         self.fatal: str | None = None
         self.pages: dict[int, asyncio.Future] = {}
-        #: Untested or accepted links, best first; empty means "upload".
-        self.remote_urls = remote_candidates(source_url)
+        #: The link the service fetches; empty means "upload". The service
+        #: rejects some links outright (``https://arxiv.org/pdf/<id>`` gets
+        #: 10004), so the first submission doubles as a probe.
+        self.remote_urls = [source_url] if source_url else []
         #: Serialises remote submissions while the link is being probed, so a
         #: rejected link is tried once, not once per segment.
         self.remote_lock = asyncio.Lock()
