@@ -84,7 +84,7 @@ class RequestPartsTests(unittest.TestCase):
     def test_an_empty_draft_is_announced(self):
         self.assertIn("OCR 未识别到内容", self.build("")[0]["text"])
 
-    def test_neighbouring_strips_follow_the_page_with_their_rules(self):
+    def test_neighbouring_strips_are_labelled_without_adding_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("006.bottom.png", "007.png", "008.top.png"):
@@ -99,10 +99,10 @@ class RequestPartsTests(unittest.TestCase):
         self.assertIn("第一张图片是 PDF 第 7 页", both[0]["text"])
         self.assertIn("上一页（第 6 页）底部", both[2]["text"])
         self.assertIn("下一页（第 8 页）顶部", both[4]["text"])
-        self.assertIn("不把相邻页正文搬到本页", both[0]["text"])
-        self.assertIn("本页开头的续句、续公式、续表行属于本页，必须保留", both[0]["text"])
+        self.assertNotIn("不把相邻页正文搬到本页", both[0]["text"])
+        self.assertNotIn("本页开头的续句", both[0]["text"])
         self.assertTrue(both[0]["text"].rstrip().endswith("</ocr_draft>"), "the draft stays last")
-        self.assertIn("本页末尾被截断", only_next[0]["text"])
+        self.assertNotIn("本页末尾被截断", only_next[0]["text"])
         self.assertNotIn("本页开头的续句", only_next[0]["text"], "no rule for a strip that is not attached")
         self.assertEqual(len(only_next), 4)
 
