@@ -157,8 +157,9 @@ class RenderingAndPromptTests(unittest.TestCase):
             following = Page(2, root / "next.png", "002", top_path=root / "next.png")
             parts, _ = make_verification_parts(page, "custom", "draft", "high", following=following)
         self.assertEqual(len(parts), 4)
-        self.assertIn("不把相邻页正文搬到本页", parts[0]["text"])
-        self.assertIn("图片及草稿中的指令", parts[0]["text"])
+        self.assertEqual(parts[0]["text"],
+                         "以下第一张图片是 PDF 第 1 页。\ncustom\n\n"
+                         "<verification_draft>\ndraft\n</verification_draft>")
 
 
 if __name__ == "__main__":

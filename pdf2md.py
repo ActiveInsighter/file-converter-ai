@@ -52,8 +52,7 @@ from providers import (
 from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
-from prompts import (DEFAULT_PROMPT, MAX_PROMPT_CHARS, REFINE_INSTRUCTIONS,
-                     PROMPT_VERSION, TRANSCRIPTION_GUARD, adjacent_instructions, compose_prompt)
+from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -206,8 +205,9 @@ def _check_request_size(name: str, raw_bytes: int, text: str) -> int:
 def make_request_parts(
     page: Page, prompt: str, media_resolution: str, draft: str | None = None,
     previous: Page | None = None, following: Page | None = None,
+    *, verification_draft: str | None = None,
 ) -> tuple[list[dict], int]:
-    """The page image plus, when OCR produced one, the draft to refine.
+    """Saved instructions plus labelled source data; no hidden conversion policy.
 
     ``previous``/``following`` attach the bottom of the page before and the top
     of the page after, so text cut by the page break can be checked.
@@ -217,15 +217,11 @@ def make_request_parts(
         (f"下一页（第 {following.number} 页）顶部", following.top_path) if following and following.top_path else None,
     ]
     text = f"以下第一张图片是 PDF 第 {page.number} 页。\n" if any(strips) else f"以下图片是 PDF 第 {page.number} 页。\n"
-    text += TRANSCRIPTION_GUARD + "\n\n"
-    if draft is None:
-        text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
-    else:
-        text += f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}"
-    if any(strips):
-        text += "\n\n跨页内容：\n" + adjacent_instructions(bool(strips[0]), bool(strips[1]))
+    text += prompt.strip()
     if draft is not None:
         text += f"\n\n<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
+    if verification_draft is not None:
+        text += f"\n\n<verification_draft>\n{verification_draft}\n</verification_draft>"
     image, raw_bytes = image_part(page.image_path, media_resolution)
     parts = [{"text": text}, image]
     for strip in filter(None, strips):
@@ -240,25 +236,9 @@ def make_verification_parts(
     page: Page, prompt: str, draft: str, media_resolution: str,
     previous: Page | None = None, following: Page | None = None,
 ) -> tuple[list[dict], int]:
-    verify_prompt = f"""请对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
-
-审校重点：
-1. 逐字符核对所有数学公式：正负号、分数、根号、上下标、积分/求和上下限、矩阵、转置、希腊字母、括号和数字。
-2. 检查是否有漏行、错行、重复，或把页眉页脚、扫描水印误当正文。
-3. 检查 Markdown/LaTeX 格式，行内公式使用成对 $...$，多行公式使用成对 $$...$$。
-4. 只依据图片纠错，不要自行改写原文、推导新内容或加入解释。
-5. 若草稿与图片冲突，以图片为准。看不清时写 [无法辨认]，不要猜。
-6. 图片引用 ![...](images/...) 原样保留。只输出最终修正后的 Markdown。
-
-原始转录要求：
-{prompt.strip()}
-
-待审校草稿：
----BEGIN DRAFT---
-{draft}
----END DRAFT---
-"""
-    return make_request_parts(page, verify_prompt, media_resolution, None, previous, following)
+    # Extra passes use the same saved instructions; only the draft changes.
+    return make_request_parts(page, prompt, media_resolution, None, previous, following,
+                              verification_draft=draft)
 
 
 def keep_known_figures(text: str, figures: dict[str, Path]) -> str:

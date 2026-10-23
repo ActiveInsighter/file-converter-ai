@@ -203,6 +203,8 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
                         jobs[job] = texts
                     return self.reply({'code': 0, 'data': {'jobId': job}})
                 text = json.loads(body)['messages'][0]['content'][0]['text']
+                assert 'Frontend saved policy.\n\nTask-specific policy.' in text
+                assert '不翻译' not in text and 'REFINE_INSTRUCTIONS' not in text
                 page = int(re.search(r'第 (\d+) 页', text).group(1))
                 draft = re.search(r'<ocr_draft>\n(.*)\n</ocr_draft>', text, re.S)
                 with lock:
@@ -219,6 +221,7 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
         base = f'http://127.0.0.1:{server.server_port}'
         args = parser().parse_args([
             '--provider', 'modelflare', '--model', 'test-vision', '--api-base', base + '/v1',
+            '--system-prompt', 'Frontend saved policy.', '--prompt', 'Task-specific policy.',
             '--ocr-url', base + '/ocr/jobs', '--ocr-segment-pages', '2',
             '--source-url', base + '/source.pdf', '--work-dir', str(root / 'work'),
             '--output-dir', str(self.output), '--dpi', '72', '--concurrency', '4',

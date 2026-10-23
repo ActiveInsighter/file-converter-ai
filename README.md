@@ -118,7 +118,7 @@ CLI 另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`
 | 文件 | 职责 |
 | --- | --- |
 | `pdf2md.py` | 命令行入口、请求构造、单页流程与兜底 |
-| `prompts.py` | 版本化默认提示词、OCR 审校规则和跨页归属约束 |
+| `prompts.py` | 与前端配置一致的默认提示词，以及系统/任务提示词拼接 |
 | `downloads.py` | 原子下载、下载中断恢复和 PDF 格式检查 |
 | `paddle_ocr.py` | PaddleOCR 异步任务：按链接或上传提交分段、轮询、解析、下载图表 |
 | `key_pool.py` | 本地密钥轮询与 429 处理 |
@@ -137,6 +137,6 @@ python -m unittest discover -s tests
 
 本地单元和端到端测试不访问外网：OCR 接口、模型网关和 PDF 下载都由本地假服务模拟。
 
-2026-10-23 的历史日志诊断、真实 API 对照、可重跑的性能评测及结果见 [架构与质量验证记录](docs/reliability-quality-2026-10-23.md)。公共保真约束在自定义 system_prompt/prompt 之外发送，因此已有保存提示词的任务也会采用新版的逐页归属、脚注和表格保留规则；两段自定义提示词仍按原顺序拼接。
+2026-10-23 的历史日志诊断、真实 API 对照、可重跑的性能评测及结果见 [架构与质量验证记录](docs/reliability-quality-2026-10-23.md)。提示词现统一由 Remote「转换配置 → 系统提示词」管理，OCR 校对、保真、相邻页和额外审校规则都放在这段可编辑文本中。转换器只按顺序发送已保存的 `system_prompt` 和本次 `prompt`，再附加页码、`<ocr_draft>`、`<verification_draft>` 与图片等输入，不额外注入隐藏规则；未传两段提示词的直接 CLI/Actions 调用才使用相同内容的内置默认值。额外审校沿用同一份已保存提示词。后端升级迁移仅更新精确匹配旧默认词的配置并递增版本，不修改自定义词或已有任务快照。
 
 普通 HTTP 下载与 Google Drive 的连接中断最多尝试 3 次，完整下载并通过 PDF 头检查后才替换目标文件。未共享、404 和非 PDF 等不可恢复错误不会盲目重试。配置了中继时，已实测百度拉取超时的 raw.githubusercontent.com 来源直接通过中继提交，省去重复的 60 秒链接探测。
