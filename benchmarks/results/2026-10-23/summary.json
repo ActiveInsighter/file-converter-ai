@@ -1,0 +1,567 @@
+{
+  "baseline_revision": "b12eaefe683832f821d308798952b31aebc77fc9",
+  "prompt_candidate_revision": "a2837ce1e043a6de81120b9dac95ef969612ec05",
+  "final_code_revision": "3d836bad023793e32ecf7498fa7d68419ae0ba9e",
+  "corpus_sha256": "65abe951f87a7b7b52dc0da711e7c25cdafbfbdcc175249321242cbbdea3c604",
+  "local_tests": {
+    "baseline": 167,
+    "final": 179,
+    "original_regressions_reproduced_on_baseline": 9
+  },
+  "runtime": {
+    "baseline": {
+      "code_root": "work/baseline",
+      "blank_render": {
+        "pages": 20,
+        "repeats": 3,
+        "seconds": [
+          5.041222396976082,
+          5.101087190996623,
+          5.026092691987287
+        ],
+        "median_seconds": 5.041222396976082
+      },
+      "text_render": {
+        "pages": 20,
+        "repeats": 3,
+        "seconds": [
+          5.254229306010529,
+          5.143312716012588,
+          5.369615873001749
+        ],
+        "median_seconds": 5.254229306010529
+      },
+      "credit_failure_replay": {
+        "seconds": 3.014006188022904,
+        "request_count": 2,
+        "status": "ok",
+        "injected_page_backoff_seconds": 3
+      }
+    },
+    "candidate": {
+      "code_root": ".",
+      "blank_render": {
+        "pages": 20,
+        "repeats": 3,
+        "seconds": [
+          0.051306520006619394,
+          0.05084897199412808,
+          0.049841422005556524
+        ],
+        "median_seconds": 0.05084897199412808
+      },
+      "text_render": {
+        "pages": 20,
+        "repeats": 3,
+        "seconds": [
+          5.130149664997589,
+          4.9943548500014,
+          5.159446497011231
+        ],
+        "median_seconds": 5.130149664997589
+      },
+      "credit_failure_replay": {
+        "seconds": 0.01177287200698629,
+        "request_count": 2,
+        "status": "ok",
+        "injected_page_backoff_seconds": 3
+      }
+    }
+  },
+  "runs": [
+    {
+      "label": "saved-baseline",
+      "run_id": 39881338201,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881338201",
+      "conclusion": "success",
+      "conversion_seconds": 91.29,
+      "model_batch_seconds": 14.98,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 75.3
+      },
+      "performance": null,
+      "scores": {
+        "page_checks_passed": 40,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 2,
+            "total": 3,
+            "failed_checks": [
+              "must not include: 不得提前终止"
+            ]
+          },
+          {
+            "page": 6,
+            "passed": 4,
+            "total": 6,
+            "failed_checks": [
+              "不得提前终止",
+              "全部原始记录"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "label": "saved-candidate-before-routing",
+      "run_id": 39881340436,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881340436",
+      "conclusion": "success",
+      "conversion_seconds": 85.48,
+      "model_batch_seconds": 11.33,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 74.0,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "performance": null,
+      "scores": {
+        "page_checks_passed": 43,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 3,
+            "total": 3,
+            "failed_checks": []
+          },
+          {
+            "page": 6,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          }
+        ]
+      }
+    },
+    {
+      "label": "default-baseline",
+      "run_id": 39881342846,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881342846",
+      "conclusion": "success",
+      "conversion_seconds": 90.95,
+      "model_batch_seconds": 12.59,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 77.7
+      },
+      "performance": null,
+      "scores": {
+        "page_checks_passed": 40,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 2,
+            "total": 3,
+            "failed_checks": [
+              "must not include: 不得提前终止"
+            ]
+          },
+          {
+            "page": 6,
+            "passed": 4,
+            "total": 6,
+            "failed_checks": [
+              "不得提前终止",
+              "全部原始记录"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "label": "default-candidate-before-routing",
+      "run_id": 39881345176,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881345176",
+      "conclusion": "success",
+      "conversion_seconds": 113.47,
+      "model_batch_seconds": 10.42,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 102.9,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "performance": null,
+      "scores": {
+        "page_checks_passed": 43,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 3,
+            "total": 3,
+            "failed_checks": []
+          },
+          {
+            "page": 6,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          }
+        ]
+      }
+    },
+    {
+      "label": "saved-final",
+      "run_id": 39881819917,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881819917",
+      "conclusion": "success",
+      "conversion_seconds": 62.57,
+      "model_batch_seconds": 10.76,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 51.7,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "performance": {
+        "success": 6,
+        "429": 0,
+        "503": 0,
+        "other_error": 0,
+        "requests": 6,
+        "p50_seconds": 4.22,
+        "p95_seconds": 7.79,
+        "success_p95_seconds": 7.79,
+        "quota_wait_seconds": 0.2
+      },
+      "scores": {
+        "page_checks_passed": 43,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 3,
+            "total": 3,
+            "failed_checks": []
+          },
+          {
+            "page": 6,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          }
+        ]
+      }
+    },
+    {
+      "label": "default-final",
+      "run_id": 39881822513,
+      "url": "https://github.com/ActiveInsighter/file-converter-ai/actions/runs/39881822513",
+      "conclusion": "success",
+      "conversion_seconds": 32.31,
+      "model_batch_seconds": 10.71,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 0,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 6,
+        "failed_pages": 0,
+        "figures": 0,
+        "seconds": 21.2,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "performance": {
+        "success": 6,
+        "429": 0,
+        "503": 0,
+        "other_error": 0,
+        "requests": 6,
+        "p50_seconds": 3.52,
+        "p95_seconds": 7.58,
+        "success_p95_seconds": 7.58,
+        "quota_wait_seconds": 0.2
+      },
+      "scores": {
+        "page_checks_passed": 43,
+        "page_checks_total": 43,
+        "document_content": {
+          "passed": 40,
+          "total": 40,
+          "missing": []
+        },
+        "formulas": {
+          "passed": 5,
+          "total": 5,
+          "missing": []
+        },
+        "table_rows": {
+          "passed": 3,
+          "total": 3,
+          "missing": []
+        },
+        "pages": [
+          {
+            "page": 1,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 2,
+            "passed": 10,
+            "total": 10,
+            "failed_checks": []
+          },
+          {
+            "page": 3,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          },
+          {
+            "page": 4,
+            "passed": 12,
+            "total": 12,
+            "failed_checks": []
+          },
+          {
+            "page": 5,
+            "passed": 3,
+            "total": 3,
+            "failed_checks": []
+          },
+          {
+            "page": 6,
+            "passed": 6,
+            "total": 6,
+            "failed_checks": []
+          }
+        ]
+      }
+    }
+  ]
+}
