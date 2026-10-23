@@ -2,7 +2,7 @@
 
 工作目录：`/home/dev/Documents/Project/file-converter-ai`。
 基线为本机原有 `fix/large-pdf-relay-adjacent` 的 `b12eaef`，不是较旧的 main。
-改动位于 `codex/converter-reliability-quality-20261023`，未合并 main。
+验证时改动位于 `codex/converter-reliability-quality-20261023`；本报告保留合并前的基线与候选版本信息，合并记录见 [PR #29](https://github.com/ActiveInsighter/file-converter-ai/pull/29)。
 
 ## 历史证据与处理
 
