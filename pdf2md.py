@@ -32,10 +32,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import fitz
-import gdown
 import httpx
 
 from artifacts import prepare_directories, validate_output_name, write_result
+from downloads import download_pdf, is_google_drive_url
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
 from paddle_ocr import JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
@@ -52,63 +52,8 @@ from providers import (
 from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
-DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
-
-要求：
-1. 不要遗漏正文、标题、列表、表格、公式、题目、选项、注释、评分等有效内容，并严格保持原始顺序。
-2. 数学内容必须逐字符核对图片：重点检查正负号、等号/不等号、上下标、根号、分数、积分/求和上下限、导数阶数、矩阵元素、向量转置、希腊字母和括号。不要仅凭上下文猜公式。
-3. 不要自行修正原文、补全推导或加入解释。看不清时写 [无法辨认]，不要编造。
-4. 数学公式使用标准 LaTeX。行内公式只用成对的 $...$；多行公式、aligned、cases、matrix 等必须使用成对的 $$...$$，禁止用单个 $ 跨多行包裹。
-5. 不要输出处理备注、模型解释、占位说明或类似“此行视具体排版”的元信息。
-6. 忽略页眉、页脚、纯页码、扫描水印、装饰性字符和无意义的重复数字/编码；除非它们明显属于正文。
-7. 表格尽量转换为 Markdown 表格；无法可靠转换时按原有阅读顺序保留文本，不要虚构表格结构。
-8. 输出前自行复核一遍图片与 Markdown，尤其复核所有数学公式和数字。
-9. 直接输出 Markdown，不要使用 Markdown 代码围栏。"""
-# The prompt that actually runs is the DB-backed system prompt plus this
-# conversion's own prompt, joined by a blank line. Both are optional and
-# independent, and each is capped so the pair stays well inside the inline
-# request budget (the same bound the PocketBase config enforces).
-MAX_PROMPT_CHARS = 12000
-
-#: How the model is asked to use the OCR draft. The transcription rules
-#: (``DEFAULT_PROMPT`` or the configured prompts) follow it.
-REFINE_INSTRUCTIONS = """下方 <ocr_draft> 是 OCR 模型（PaddleOCR-VL）对这一页的识别草稿。请以图片为准、以草稿为底稿，输出这一页最终的 Markdown：
-1. 草稿的文字识别通常可靠：逐段对照图片，保留正确内容，只修正与图片不符之处（错字、漏字、多字、数字、公式符号、上下标）。
-2. 草稿漏掉的正文、公式、表格或题目，按图片补全；草稿里的页眉、页脚、页码和水印删除。
-3. 按图片整理结构：标题层级、段落拆分与合并、列表、阅读顺序（多栏页面按栏阅读）。
-4. 表格输出为 Markdown 表格；存在合并单元格等 Markdown 无法表达的结构时，保留 HTML <table>。
-5. 草稿中的图片引用 ![...](images/...) 原样保留在它在页面中的位置，不改路径，不新增图片引用。"""
-
-
-def adjacent_instructions(previous: bool, following: bool) -> str:
-    """How the model uses the neighbouring strips; only rules for strips that are attached."""
-    attached = "、".join(label for label, present in (
-        ("上一页底部", previous), ("下一页顶部", following)) if present)
-    rules = [f"本页之后另附{attached}的截图，只用来处理被分页截断的内容，不属于本页正文；"
-             "除下面两种情况外，不要转写截图中的任何内容。"]
-    if following:
-        rules.append("本页最后一句话、最后一个公式或最后一个表格行如果在本页底部被截断、"
-                     "到下一页顶部才结束，参照下一页顶部把它补完整后结束本页。")
-    if previous:
-        rules.append("本页开头如果是上一页最后一句话、公式或表格行的后半截（对照上一页底部可以确认），"
-                     "省略这段后半截，从本页第一个完整的句子、公式、段落或表格行开始转写。"
-                     "续写的完整段落、续表的完整行和列表的新条目照常转写。")
-    rules.append("输出的公式和表格必须语法完整：$ 与 $$ 成对，LaTeX 环境闭合。")
-    return "\n".join(f"{index}. {rule}" if index else rule for index, rule in enumerate(rules))
-
-
-def compose_prompt(system_prompt: str, user_prompt: str) -> str:
-    """Join the shared system prompt with this conversion's own prompt.
-
-    ``system_prompt`` is read from the saved file-conversion config and applies
-    to every conversion; ``user_prompt`` is the per-task instruction. Either may
-    be empty and neither overrides the other. When both are empty the built-in
-    faithful Markdown prompt is used, so a manual workflow dispatch still
-    produces a faithful transcription.
-    """
-    parts = [part.strip() for part in (system_prompt, user_prompt)]
-    composed = "\n\n".join(part for part in parts if part)
-    return composed or DEFAULT_PROMPT
+from prompts import (DEFAULT_PROMPT, MAX_PROMPT_CHARS, REFINE_INSTRUCTIONS,
+                     PROMPT_VERSION, TRANSCRIPTION_GUARD, adjacent_instructions, compose_prompt)
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -184,28 +129,6 @@ def resolve_fallback_models(provider: Provider, model: str, raw: str | None) -> 
     if explicit:
         return explicit
     return provider.default_model_fallbacks if model == provider.default_model else ()
-
-
-def is_google_drive_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host == "drive.google.com" or host.endswith(".drive.google.com")
-
-
-def download_pdf(source_url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if is_google_drive_url(source_url):
-        result = gdown.download(url=source_url, output=str(destination), quiet=False, fuzzy=True)
-        if not result or not destination.exists():
-            raise RuntimeError(
-                "Google Drive download failed. Make sure the file is shared as Anyone with the link."
-            )
-        return
-
-    with httpx.stream("GET", source_url, follow_redirects=True, timeout=120.0) as response:
-        response.raise_for_status()
-        with destination.open("wb") as handle:
-            for data in response.iter_bytes(chunk_size=1024 * 1024):
-                handle.write(data)
 
 
 async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, edges=False):
@@ -294,6 +217,7 @@ def make_request_parts(
         (f"下一页（第 {following.number} 页）顶部", following.top_path) if following and following.top_path else None,
     ]
     text = f"以下第一张图片是 PDF 第 {page.number} 页。\n" if any(strips) else f"以下图片是 PDF 第 {page.number} 页。\n"
+    text += TRANSCRIPTION_GUARD + "\n\n"
     if draft is None:
         text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
     else:
@@ -313,7 +237,8 @@ def make_request_parts(
 
 
 def make_verification_parts(
-    page: Page, prompt: str, draft: str, media_resolution: str
+    page: Page, prompt: str, draft: str, media_resolution: str,
+    previous: Page | None = None, following: Page | None = None,
 ) -> tuple[list[dict], int]:
     verify_prompt = f"""请对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
 
@@ -333,8 +258,7 @@ def make_verification_parts(
 {draft}
 ---END DRAFT---
 """
-    image, raw_bytes = image_part(page.image_path, media_resolution)
-    return [{"text": verify_prompt}, image], _check_request_size(page.stem, raw_bytes, verify_prompt)
+    return make_request_parts(page, verify_prompt, media_resolution, None, previous, following)
 
 
 def keep_known_figures(text: str, figures: dict[str, Path]) -> str:
@@ -476,12 +400,13 @@ class ContentBlockedError(RuntimeError):
     """
 
 
-class EmptyAnswerError(ContentBlockedError):
+class EmptyAnswerError(RuntimeError):
     """The model stopped without emitting any text for a page image.
 
     Seen on blank scan pages (nothing to transcribe), on figure-only pages and
     on responses whose whole output landed in thinking parts. Retrying the same
-    image does not change it.
+    image may succeed later. A rendered nonblank page must not become blank
+    merely because an upstream generation returned no text.
     """
 
 
@@ -508,6 +433,10 @@ class ModelUnavailableError(RuntimeError):
     """
 
 
+class CredentialRejectedError(RuntimeError):
+    """The credential was retired; the same page can use another one."""
+
+
 async def call_model_once(
     client: httpx.AsyncClient,
     key_pool,
@@ -522,10 +451,18 @@ async def call_model_once(
 ) -> str:
     policy = CURRENT_POLICY.get()
     async def attempt(on_started=lambda: None):
-        return await _call_model_attempt(
-            client, key_pool, provider, model, parts, chunk_name, thinking_level,
-            reasoning_effort, api_base, max_output_tokens, on_started,
-        )
+        # Credential failover does not consume page retries or add a sleep.
+        # Each rejected credential is retired, so this loop is bounded.
+        for _ in range(max(1, len(getattr(key_pool, "keys", [None])))):
+            try:
+                return await _call_model_attempt(
+                    client, key_pool, provider, model, parts, chunk_name, thinking_level,
+                    reasoning_effort, api_base, max_output_tokens, on_started,
+                )
+            except CredentialRejectedError:
+                if not hasattr(key_pool, "keys"):
+                    raise
+        raise QuotaPoolExhaustedError("All available credentials rejected this request")
     if policy is None:
         return await attempt()
     return await policy.run(attempt, chunk_name, max_duration=provider.request_timeout_seconds)
@@ -620,12 +557,24 @@ async def _call_model_attempt(
         return text
 
     message = response.text[:800]
+    for secret in getattr(key_pool, "keys", [api_key]):
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
     try:
         error_payload: object = response.json()
     except ValueError:
         error_payload = {"message": message}
 
     kind = provider.status_error_kind(response.status_code, error_payload)
+    scope = provider.credential_error_scope(response.status_code, error_payload)
+    if scope:
+        await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
+        reason = f"HTTP {response.status_code}: {message[:200]}"
+        if scope == "bucket":
+            key_pool.retire(key_index, reason)
+        else:
+            key_pool.retire_key(key_index, reason)
+        raise CredentialRejectedError(f"{provider.label} credential retired: {reason}")
     if kind == "rate_limited":
         quota_type = provider.quota_kind(error_payload)
         retry_after = provider.retry_after(response.headers, error_payload)
@@ -642,11 +591,6 @@ async def _call_model_attempt(
         )
 
     await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
-    if response.status_code == 402:
-        # Credits of this key's project are used up. That says nothing about
-        # the page or the other keys: retire the key and let the page retry.
-        key_pool.retire(key_index, f"HTTP 402: {message[:200]}")
-        raise RuntimeError(f"{provider.label} HTTP 402 (key retired): {message}")
     error = f"{provider.label} HTTP {response.status_code}: {message}"
     if kind == "permanent":
         raise PermanentProviderError(error)
@@ -850,7 +794,10 @@ async def process_pages(
                     f"{BLANK_PAGE_DARK_LEVEL})",
                 )
 
+            ocr_started = time.monotonic()
             ocr_page: OcrPage | None = await ocr.page(page.number) if ocr else None
+            ocr_wait = time.monotonic() - ocr_started
+            model_started = time.monotonic()
             draft = ocr_page.markdown if ocr_page else None
             figures = ocr_page.figures if ocr_page else {}
             attempts = max(1, attempts_per_page)
@@ -865,7 +812,9 @@ async def process_pages(
                     fallback_models, reasoning_effort, api_base, max_output_tokens,
                 )
                 for verify_index in range(verification_passes):
-                    verify_parts, _ = make_verification_parts(page, prompt, text, media_resolution)
+                    verify_parts, _ = make_verification_parts(
+                        page, prompt, text, media_resolution,
+                        neighbour(page.number - 1), neighbour(page.number + 1))
                     text = await call_model(
                         client, key_pool, provider, model, verify_parts,
                         f"{page.stem}-verify-{verify_index + 1}", thinking_level,
@@ -894,7 +843,9 @@ async def process_pages(
                     continue
                 text = keep_known_figures(text, figures)
                 return record_success(
-                    page, text, estimated, "ocr+model" if draft is not None else "model"
+                    page, text, estimated, "ocr+model" if draft is not None else "model",
+                    stage_seconds={"ocr_wait": round(ocr_wait, 3),
+                                   "model_including_quota_wait": round(time.monotonic() - model_started, 3)},
                 )
 
             exc = last_error or RuntimeError("transcription failed without an exception")
@@ -909,10 +860,6 @@ async def process_pages(
                 return record_success(
                     page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
                 )
-            if isinstance(exc, EmptyAnswerError):
-                # No OCR text and no model text: nothing to transcribe here.
-                return record_blank(page, "no_transcribable_text", str(exc))
-
             error = {
                 "chunk": page.stem,
                 "page": page.number,
@@ -1312,7 +1259,7 @@ async def async_main(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        f"[prompt] system_chars={len(system_prompt)} task_chars={len(user_prompt)} "
+        f"[prompt] version={PROMPT_VERSION} system_chars={len(system_prompt)} task_chars={len(user_prompt)} "
         f"effective_chars={len(prompt)} "
         f"sha256={hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:12]}",
         flush=True,

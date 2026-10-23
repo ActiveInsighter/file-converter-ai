@@ -1,3 +1,4 @@
 PyMuPDF>=1.26,<2
 gdown>=5.2,<6
 httpx>=0.28,<1
+requests>=2.32,<3

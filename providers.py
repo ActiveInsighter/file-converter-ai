@@ -198,6 +198,22 @@ class Provider(abc.ABC):
             return "unavailable"
         return "retryable"
 
+    def credential_error_scope(self, status: int, payload: object) -> str | None:
+        """Separate a bad credential/account from a bad page or request."""
+        compact = _compact(payload)
+        if status == 402:
+            return "bucket"
+        if status in (401, 403):
+            return "key"
+        if status == 400 and any(marker in compact for marker in (
+            "api key not valid", "api key expired", "api key invalid",
+            "api key service blocked", "invalid api key",
+        )):
+            return "key"
+        if status == 429 and _is_permanent_gateway_error(payload):
+            return "key" if "invalid api key" in compact else "bucket"
+        return None
+
 
 class GeminiProvider(Provider):
     """Google AI Studio / Generative Language API."""
@@ -243,6 +259,14 @@ class GeminiProvider(Provider):
         }
 
     def extract_text(self, payload: dict) -> str:
+        for candidate in payload.get("candidates", []):
+            reason = candidate.get("finishReason")
+            if reason == "MAX_TOKENS":
+                raise ProviderRefusal("truncated", "Gemini answer truncated (MAX_TOKENS); raise --max-output-tokens")
+            if reason in BLOCKED_FINISH_REASONS:
+                raise ProviderRefusal("blocked", f"Gemini refused this page image: {reason}")
+            if reason in {"MALFORMED_RESPONSE", "OTHER"}:
+                raise RuntimeError(f"Gemini transient generation failure: {reason}")
         texts = []
         for candidate in payload.get("candidates", []):
             for part in (candidate.get("content") or {}).get("parts", []):
@@ -270,9 +294,6 @@ class GeminiProvider(Provider):
                 raise ProviderRefusal("blocked", f"Gemini refused this page image. {detail}")
             raise ProviderRefusal("empty", f"Gemini returned no answer text. {detail}")
 
-        # MAX_TOKENS is deliberately not treated as truncation here: Gemini's
-        # ceiling has never been reached by this pipeline, and reclassifying it
-        # would turn pages that used to pass into failures.
         return result
 
     def quota_kind(self, payload: object) -> str:

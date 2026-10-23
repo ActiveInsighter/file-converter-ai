@@ -47,9 +47,12 @@ def render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, cla
         for number in range(plan.first, plan.last + 1):
             page = document[number - 1]
             stem = f'{number:0{plan.width}d}'
-            path = save(page.get_pixmap(matrix=matrix, alpha=False), image_dir / f'{stem}.{extension}')
+            blank, ink_ratio, darkest = classify_blank(page)
+            # Blank scans never go to the model; a small preview is enough.
+            render_matrix = fitz.Matrix(0.25, 0.25) if blank else matrix
+            path = save(page.get_pixmap(matrix=render_matrix, alpha=False), image_dir / f'{stem}.{extension}')
             strips = (None, None)
-            if edges:
+            if edges and not blank:
                 box, cut = page.rect, page.rect.height * EDGE_FRACTION
                 top = fitz.Rect(box.x0, box.y0, box.x1, box.y0 + cut)
                 bottom = fitz.Rect(box.x0, box.y1 - cut, box.x1, box.y1)
@@ -58,7 +61,6 @@ def render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, cla
                          image_dir / f'{stem}.{name}.{extension}')
                     for name, clip in (('top', top), ('bottom', bottom))
                 )
-            blank, ink_ratio, darkest = classify_blank(page)
             detail = f' blank ink_ratio={ink_ratio:.6f} darkest={darkest}' if blank else ''
             print(f'[render] {number}/{plan.total_pdf_pages}: {path.name}{detail}', flush=True)
             yield path, blank, strips

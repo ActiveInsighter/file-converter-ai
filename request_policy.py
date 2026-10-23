@@ -44,7 +44,7 @@ class RequestPolicy:
                     def on_started():
                         nonlocal deadline
                         self.active[task] = time.monotonic()
-                        if index == 0:
+                        if index == 0 and not started.is_set():
                             if max_duration is not None:
                                 deadline = time.monotonic() + max_duration
                             started.set()

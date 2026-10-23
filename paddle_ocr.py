@@ -25,9 +25,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+import random
 
 import fitz
 import httpx
+from key_pool import retry_after_seconds
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_MODEL = "PaddleOCR-VL-1.6"
@@ -94,6 +96,10 @@ class OcrFatalError(RuntimeError):
 class OcrRetryableError(RuntimeError):
     """Throttled, queue full, or a transient service failure."""
 
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class OcrJobFailed(OcrRetryableError):
     """The service accepted the job, then reported it as failed."""
@@ -101,6 +107,10 @@ class OcrJobFailed(OcrRetryableError):
 
 class OcrSourceRejected(RuntimeError):
     """The service will not fetch this link; upload the segment instead."""
+
+
+class OcrTokenRetired(OcrRetryableError):
+    """Retry with another token, without treating the source as broken."""
 
 
 class _SplitSegment(Exception):
@@ -244,6 +254,7 @@ class PaddleOcr:
         self.retry_pause = retry_pause
         self.turn = 0
         self.fatal: str | None = None
+        self.retired_tokens: set[str] = set()
         self.pages: dict[int, asyncio.Future] = {}
         #: The link the service fetches; ``None`` means "upload". The first
         #: submission doubles as a probe: a rejected link
@@ -261,7 +272,8 @@ class PaddleOcr:
         self.relay_token = relay_token
         self.started = time.monotonic()
         self.stats = {"jobs": 0, "remote_jobs": 0, "relay_jobs": 0, "uploaded_jobs": 0,
-                      "pages": 0, "failed_pages": 0, "figures": 0, "seconds": 0.0}
+                      "pages": 0, "failed_pages": 0, "figures": 0, "seconds": 0.0,
+                      "retired_tokens": 0, "poll_retries": 0}
 
     @property
     def enabled(self) -> bool:
@@ -269,7 +281,10 @@ class PaddleOcr:
 
     def _next_token_headers(self) -> dict[str, str]:
         """Round-robin over tokens; a job is polled with the token that owns it."""
-        token = self.tokens[self.turn % len(self.tokens)]
+        live = [token for token in self.tokens if token not in self.retired_tokens]
+        if not live:
+            raise OcrFatalError(self.fatal or "All OCR tokens retired")
+        token = live[self.turn % len(live)]
         self.turn += 1
         return {"Authorization": f"bearer {token}"}
 
@@ -367,6 +382,10 @@ class PaddleOcr:
                     job = await self._submit_upload(upload, name)
                 timeout = self.job_timeout if kind == "upload" else min(self.job_timeout, REMOTE_JOB_TIMEOUT)
                 return await self._collect(job, name, last - first + 1, timeout)
+            except OcrTokenRetired:
+                if attempt == SEGMENT_ATTEMPTS:
+                    raise
+                continue
             except OcrFatalError as exc:
                 self.fatal = str(exc)
                 raise
@@ -382,6 +401,8 @@ class PaddleOcr:
                 if attempt == SEGMENT_ATTEMPTS:
                     raise
                 pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))
+                pause *= random.uniform(1.0, 1.2)
+                pause = max(pause, getattr(exc, "retry_after", None) or 0)
                 print(f"[ocr] {name} attempt {attempt}/{SEGMENT_ATTEMPTS} failed: "
                       f"{type(exc).__name__}: {exc}; retrying in {pause:.0f}s", flush=True)
                 await asyncio.sleep(pause)
@@ -402,10 +423,27 @@ class PaddleOcr:
         if code in REMOTE_REJECTED_CODES:
             raise OcrSourceRejected(message)
         if code in RETRYABLE_CODES or response.status_code == 429 or response.status_code >= 500:
-            raise OcrRetryableError(message)
+            raise OcrRetryableError(message, retry_after_seconds(response.headers, body))
         if response.status_code != 200 or code != 0:
             raise RuntimeError(message)
         return body.get("data") or {}
+
+    def _check_owned(self, response: httpx.Response, headers: dict[str, str]) -> dict:
+        """Retire only the token rejected by the service; keep healthy tokens."""
+        try:
+            return self._check(response)
+        except OcrFatalError as exc:
+            token = headers["Authorization"].split(" ", 1)[1]
+            self.retired_tokens.add(token)
+            self.stats["retired_tokens"] = len(self.retired_tokens)
+            reason = str(exc)
+            for secret in self.tokens:
+                reason = reason.replace(secret, "[REDACTED]")
+            if all(t in self.retired_tokens for t in self.tokens):
+                self.fatal = reason
+                raise OcrFatalError(reason) from exc
+            print(f"[ocr] token retired ({len(self.retired_tokens)}/{len(self.tokens)}); trying another token", flush=True)
+            raise OcrTokenRetired(reason) from exc
 
     def _abandon_link(self, reason: str) -> None:
         if self.remote_url:
@@ -439,7 +477,7 @@ class PaddleOcr:
                       "pageRanges": f"1-{last - first + 1}", "optionalPayload": OPTIONAL_PAYLOAD},
                 timeout=link_submit_timeout(len(data)),
             )
-            job_id = self._check(response)["jobId"]
+            job_id = self._check_owned(response, headers)["jobId"]
         except (OcrFatalError, OcrRetryableError):
             raise
         except Exception as exc:  # noqa: BLE001 - refused upload, rejected link, odd answer
@@ -505,7 +543,7 @@ class PaddleOcr:
                       "pageRanges": f"{first}-{last}", "optionalPayload": OPTIONAL_PAYLOAD},
                 timeout=self.submit_timeout,
             )
-            return self._check(response)["jobId"]
+            return self._check_owned(response, headers)["jobId"]
         except (OcrFatalError, OcrRetryableError):
             # Bad token, used-up quota or a full queue: not the link's fault.
             raise
@@ -525,7 +563,7 @@ class PaddleOcr:
         )
         upload_seconds = time.monotonic() - started
         try:
-            job_id = self._check(response)["jobId"]
+            job_id = self._check_owned(response, headers)["jobId"]
         except OcrSourceRejected as exc:
             raise RuntimeError(str(exc)) from exc
         self.stats["jobs"] += 1
@@ -539,9 +577,22 @@ class PaddleOcr:
         job_id, headers = job
         started = time.monotonic()
         async with asyncio.timeout(timeout):
+            failures = 0
             while True:
-                status = self._check(await self.client.get(
-                    f"{self.job_url}/{job_id}", headers=headers, timeout=60.0))
+                try:
+                    status = self._check_owned(await self.client.get(
+                        f"{self.job_url}/{job_id}", headers=headers, timeout=60.0), headers)
+                except OcrTokenRetired:
+                    raise
+                except (OcrRetryableError, httpx.TransportError) as exc:
+                    # The accepted job still exists. Poll it again instead of
+                    # uploading a duplicate and increasing server queue pressure.
+                    failures += 1
+                    self.stats["poll_retries"] += 1
+                    pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** min(failures - 1, 4))
+                    await asyncio.sleep(max(pause, getattr(exc, "retry_after", None) or 0))
+                    continue
+                failures = 0
                 state = status.get("state")
                 if state == "done":
                     break
