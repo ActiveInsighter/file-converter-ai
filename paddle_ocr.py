@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
+from urllib.parse import urlparse
 
 import fitz
 import httpx
@@ -62,6 +63,9 @@ REMOTE_MAX_BYTES = 200 * 1000 * 1000
 #: whole for every segment: each segment is cut out here, put on the relay
 #: (GitHub -> Cloudflare is fast) and fetched from there by link.
 RELAY_PREFERRED_ABOVE_BYTES = 40 * 1000 * 1000
+# Four paired live runs on 2026-10-23 timed out fetching this host before
+# succeeding through the relay. Avoid paying the same 60-second probe again.
+RELAY_PREFERRED_HOSTS = {"raw.githubusercontent.com"}
 #: The relay accepts one request of at most 90 MiB; bigger segments are halved.
 RELAY_MAX_BYTES = 80 * 1024 * 1024
 #: A link job that is not done by then is abandoned for an upload, which
@@ -298,7 +302,11 @@ class PaddleOcr:
             return None
         if self.remote_url:
             size = pdf_path.stat().st_size
-            if self.relay_url and size > RELAY_PREFERRED_ABOVE_BYTES:
+            host = (urlparse(self.remote_url).hostname or "").lower()
+            if self.relay_url and host in RELAY_PREFERRED_HOSTS:
+                print(f"[ocr] {host}: submitting segments through the relay without a link probe", flush=True)
+                self.remote_url = None
+            elif self.relay_url and size > RELAY_PREFERRED_ABOVE_BYTES:
                 print(f"[ocr] {size / 1e6:.0f} MB source: segments go through the relay "
                       "instead of fetching the whole file per segment", flush=True)
                 self.remote_url = None

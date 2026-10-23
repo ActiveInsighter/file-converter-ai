@@ -79,6 +79,22 @@ class CredentialRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OcrRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_known_slow_source_uses_configured_relay_without_probe(self):
+        from test_paddle_ocr import FakeService, write_pdf, JOBS, RELAY
+        service = FakeService()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf = write_pdf(root / "source.pdf", 1)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(service.handler)) as client:
+                ocr = PaddleOcr(["token"], client=client, work_dir=root, job_url=JOBS,
+                                source_url="https://raw.githubusercontent.com/example/doc.pdf",
+                                relay_url=RELAY, relay_token="relay-secret", poll_seconds=0)
+                await ocr.start(pdf, 1, 1, 3)
+                self.assertIsNotNone(await ocr.page(1))
+        self.assertEqual(ocr.stats["remote_jobs"], 0)
+        self.assertEqual(ocr.stats["relay_jobs"], 1)
+        self.assertTrue(all(url.startswith("https://relay-files.test/") for url, _ in service.links))
+
     async def test_poll_throttling_keeps_same_job_instead_of_resubmitting(self):
         polls = []
         def handler(request):

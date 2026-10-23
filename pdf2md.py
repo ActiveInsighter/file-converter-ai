@@ -934,6 +934,7 @@ async def process_pages(
             f"sources={json.dumps(usage['page_sources'])}",
             flush=True,
         )
+        print(f"[performance] {json.dumps(usage['performance'])}", flush=True)
         return results
 
 
@@ -1088,8 +1089,8 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Also send the bottom of the previous page and the top of the next "
-            "page with every page, so sentences, formulas and table rows cut by "
-            "a page break are completed once instead of left broken."
+            "page as reference for edge characters and reading order. Each "
+            "page retains only its own visible content, including continuations."
         ),
     )
     p.add_argument(
