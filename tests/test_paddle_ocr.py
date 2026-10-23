@@ -8,9 +8,19 @@ from pathlib import Path
 import fitz
 import httpx
 
-from paddle_ocr import SEGMENT_ATTEMPTS, PaddleOcr, normalize_markdown, parse_tokens, plan_segments, tidy_inline_math
+from paddle_ocr import (
+    SEGMENT_ATTEMPTS,
+    PaddleOcr,
+    extract_segment,
+    link_submit_timeout,
+    normalize_markdown,
+    parse_tokens,
+    plan_segments,
+    tidy_inline_math,
+)
 
 JOBS = "https://ocr.test/api/v2/ocr/jobs"
+RELAY = "https://relay.test/api/file-conversion/relay"
 
 
 def write_pdf(path: Path, pages: int) -> Path:
@@ -32,19 +42,44 @@ class FakeService:
     successive submissions; anything not listed succeeds.
     """
 
-    def __init__(self, fates=None):
+    def __init__(self, fates=None, accepted_links=(), source: Path | None = None):
         self.fates = {key: list(value) for key, value in (fates or {}).items()}
+        self.accepted_links = set(accepted_links)
+        self.source = source
         self.jobs = {}
         self.submissions = []
+        self.links = []
         self.tokens = []
+        #: Relay objects by public link, and the status the relay answers with.
+        self.relayed = {}
+        self.relay_status = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+        if request.method == "PUT" and url == RELAY:
+            assert request.headers["Authorization"] == "Bearer relay-secret"
+            status = self.relay_status.pop(0) if self.relay_status else 201
+            if status != 201:
+                return httpx.Response(status, json={"message": "no"})
+            link = f"https://relay-files.test/{len(self.relayed) + 1}.pdf"
+            self.relayed[link] = request.read()
+            return httpx.Response(201, json={"sourceUrl": link})
         if request.method == "POST":
             self.tokens.append(request.headers["Authorization"])
             body = request.read()
-            with fitz.open(stream=body[body.index(b"%PDF"):], filetype="pdf") as document:
-                texts = [page.get_text().strip() for page in document]
+            if request.headers["Content-Type"] == "application/json":
+                payload = json.loads(body)
+                self.links.append((payload["fileUrl"], payload["pageRanges"]))
+                relayed = self.relayed.get(payload["fileUrl"])
+                if payload["fileUrl"] not in self.accepted_links and relayed is None:
+                    return httpx.Response(400, json={"code": 10004, "msg": "unsupported format"})
+                first, last = map(int, payload["pageRanges"].split("-"))
+                with (fitz.open(stream=relayed, filetype="pdf") if relayed
+                      else fitz.open(self.source)) as document:
+                    texts = [document[n - 1].get_text().strip() for n in range(first, last + 1)]
+            else:
+                with fitz.open(stream=body[body.index(b"%PDF"):], filetype="pdf") as document:
+                    texts = [page.get_text().strip() for page in document]
             self.submissions.append(texts)
             queue = self.fates.get(texts[0]) or self.fates.get("*") or []
             fate = queue.pop(0) if queue else "ok"
@@ -85,15 +120,45 @@ class FakeService:
         return httpx.Response(404)
 
 
+class SegmentTests(unittest.TestCase):
+    def test_scanned_pages_are_reencoded_before_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "scan.pdf"
+            with fitz.open() as text, fitz.open() as document:
+                source = text.new_page()
+                for line in range(60):
+                    source.insert_text((40, 30 + line * 13), f"Line {line} " * 12, fontsize=9)
+                # A 300 DPI scan stored as a high-quality JPEG, like a scanned book.
+                scan = source.get_pixmap(dpi=300).tobytes("jpeg", jpg_quality=95)
+                for _ in range(2):
+                    document.new_page().insert_image(fitz.Rect(0, 0, 595, 842), stream=scan)
+                document.save(pdf)
+            original = len(fitz.open(pdf).tobytes(garbage=3, deflate=True))
+            compact = extract_segment(pdf, 1, 2)
+            text_pdf = write_pdf(Path(directory) / "text.pdf", 2)
+            text_segment = extract_segment(text_pdf, 1, 2)
+        self.assertLess(len(compact), original / 2)
+        with fitz.open(stream=compact, filetype="pdf") as document:
+            self.assertEqual(document.page_count, 2)
+            self.assertEqual(document[0].rect, fitz.Rect(0, 0, 595, 842))
+        with fitz.open(stream=text_segment, filetype="pdf") as document:
+            self.assertEqual(document[0].get_text().strip(), "Page 1", "vector pages keep their text")
+
+
 class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
-    async def run_ocr(self, service, pages=5, segment=2, tokens=("t1", "t2")):
+    async def run_ocr(self, service, pages=5, segment=2, tokens=("t1", "t2"), source_url=None,
+                      relay=False):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         pdf = write_pdf(root / "source.pdf", pages)
+        service.source = pdf
         async with httpx.AsyncClient(transport=httpx.MockTransport(service.handler)) as client:
             ocr = PaddleOcr(list(tokens), client=client, work_dir=root / "state", job_url=JOBS,
-                            segment_pages=segment, poll_seconds=0, retry_pause=0)
+                            segment_pages=segment, poll_seconds=0, retry_pause=0,
+                            source_url=source_url,
+                            relay_url=RELAY if relay else None,
+                            relay_token="relay-secret" if relay else None)
             task = ocr.start(pdf, 1, pages, 3)
             results = {number: await ocr.page(number) for number in range(1, pages + 1)}
             if task is not None:
@@ -140,6 +205,155 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(page is None for page in results.values()))
         self.assertIn("12001", ocr.fatal)
         self.assertLessEqual(len(service.submissions), 3, "no retries once the quota is gone")
+
+    async def test_the_service_fetches_the_link_one_page_range_per_job(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        ocr, results, _ = await self.run_ocr(service, pages=5, segment=2, source_url=link)
+        self.assertEqual(sorted(service.links), [(link, "1-2"), (link, "3-4"), (link, "5-5")])
+        self.assertEqual([page.markdown.split()[-2] for page in results.values()],
+                         ["1", "2", "3", "4", "5"])
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (3, 0))
+
+    async def test_a_link_the_service_rejects_falls_back_to_uploads(self):
+        link = "https://arxiv.test/pdf/2401.00001"
+        service = FakeService()
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, source_url=link)
+        self.assertEqual(len(service.links), 1, "the link is offered once, then segments upload")
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_once_the_link_works_segments_are_submitted_concurrently(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        respond, in_flight, peak = service.handler, [0], [0]
+
+        async def handler(request):
+            if request.method != "POST":
+                return respond(request)
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.05)  # the service downloading the file
+            in_flight[0] -= 1
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=7, segment=2, source_url=link)
+        self.assertEqual(ocr.stats["remote_jobs"], 4)
+        self.assertGreaterEqual(peak[0], 2, "only the probe is serialised")
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_link_submission_that_times_out_switches_to_uploads_at_once(self):
+        link = "https://slow.test/manual.pdf"
+        service = FakeService(accepted_links={link})
+        respond, hangs = service.handler, []
+
+        def handler(request):
+            if request.method == "POST" and request.headers["Content-Type"] == "application/json":
+                hangs.append(request)
+                raise httpx.ReadTimeout("origin download too slow", request=request)
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=6, segment=2, source_url=link)
+        self.assertEqual(len(hangs), 1, "one probe, no retries on the link")
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 3))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_link_submissions_get_time_for_the_whole_file(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        timeouts, respond = [], service.handler
+
+        def handler(request):
+            if request.method == "POST":
+                timeouts.append(request.extensions["timeout"]["read"])
+            return respond(request)
+
+        service.handler = handler
+        from unittest.mock import patch
+        with patch("paddle_ocr.link_submit_timeout", return_value=123.0) as scaled:
+            ocr, _, root = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        scaled.assert_called_once_with((root / "source.pdf").stat().st_size)
+        self.assertEqual(timeouts, [123.0])
+        self.assertEqual(link_submit_timeout(1_000_000), 60.0)
+        self.assertEqual(link_submit_timeout(120_000_000), 150.0)
+        self.assertEqual(link_submit_timeout(2_000_000_000), 300.0)
+
+    async def test_files_above_the_link_limit_are_uploaded_without_a_probe(self):
+        from unittest.mock import patch
+        link = "https://files.test/huge.pdf"
+        service = FakeService(accepted_links={link})
+        with patch("paddle_ocr.REMOTE_MAX_BYTES", 10):
+            ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, source_url=link)
+        self.assertEqual(service.links, [])
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_large_sources_go_through_the_relay_segment_by_segment(self):
+        from unittest.mock import patch
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        with patch("paddle_ocr.RELAY_PREFERRED_ABOVE_BYTES", 0):
+            ocr, results, _ = await self.run_ocr(service, pages=5, segment=2, source_url=link,
+                                                 relay=True)
+        self.assertNotIn(link, [url for url, _ in service.links], "the big file is never fetched whole")
+        self.assertEqual(sorted(ranges for _, ranges in service.links), ["1-1", "1-2", "1-2"])
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (3, 0))
+        self.assertEqual([page.markdown.split()[-2] for page in results.values()],
+                         ["1", "2", "3", "4", "5"])
+
+    async def test_an_unfetchable_link_falls_back_to_the_relay(self):
+        service = FakeService()
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2,
+                                             source_url="https://arxiv.test/pdf/1", relay=True)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]),
+                         (0, 2, 0))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_busy_relay_is_retried_and_a_refusing_one_is_dropped(self):
+        busy = FakeService()
+        busy.relay_status = [503]
+        ocr, results, _ = await self.run_ocr(busy, pages=2, segment=2, relay=True)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (1, 0))
+        refusing = FakeService()
+        refusing.relay_status = [401, 401]
+        ocr, results, _ = await self.run_ocr(refusing, pages=4, segment=2, relay=True)
+        self.assertIsNone(ocr.relay_url)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_full_queue_is_retried_on_the_same_link(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        respond, busy = service.handler, []
+
+        def handler(request):
+            if request.method == "POST" and not busy:
+                busy.append(request)
+                return httpx.Response(200, json={"code": 10010, "msg": "queue full"})
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 0))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_stalled_link_job_is_replaced_by_an_upload(self):
+        from unittest.mock import patch
+        link = "https://files.test/book.pdf"
+        service = FakeService(accepted_links={link})
+        with patch("paddle_ocr.REMOTE_JOB_TIMEOUT", 0):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_failed_link_job_switches_the_run_to_uploads(self):
+        link = "https://files.test/book.pdf"
+        service = FakeService({"Page 1": ["fail"]}, accepted_links={link})
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, source_url=link)
+        self.assertEqual((ocr.stats["remote_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
+        self.assertTrue(all(page is not None for page in results.values()))
 
     async def test_disabled_ocr_resolves_every_page_to_none(self):
         service = FakeService()

@@ -191,8 +191,13 @@ class ConversionE2ETests(unittest.IsolatedAsyncioTestCase):
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 if self.path == '/ocr/jobs':
                     assert self.headers['Authorization'] == 'bearer ocr-token'
-                    with fitz.open(stream=body[body.index(b'%PDF'):], filetype='pdf') as document:
-                        texts = [page.get_text().strip() for page in document]
+                    # The service fetches the source link itself, one page range per job.
+                    request = json.loads(body)
+                    assert request['fileUrl'] == f'{base}/source.pdf'
+                    first, last = map(int, request['pageRanges'].split('-'))
+                    with fitz.open(root / 'source.pdf') as document:
+                        texts = [document[number - 1].get_text().strip()
+                                 for number in range(first, last + 1)]
                     with lock:
                         job = str(len(jobs) + 1)
                         jobs[job] = texts

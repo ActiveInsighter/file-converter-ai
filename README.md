@@ -1,16 +1,20 @@
 # AnyWorkflow File Converter
 
-PDF → Markdown 转换执行器。GitHub Actions 下载 PDF，先用百度 PaddleOCR-VL 识别每一页，再把每页的 OCR 草稿和页面图片一起发给视觉模型（默认 Gemini 3.5 Flash-Lite）校对、整理成最终 Markdown。
+PDF → Markdown 转换执行器。百度 PaddleOCR-VL 直接从原始链接下载 PDF 并识别每一页，GitHub Actions 同时在本地渲染页面图片；某页的 OCR 结果出来后，把 OCR 草稿和页面图片一起发给视觉模型（默认 Gemini 3.5 Flash-Lite）校对、整理成最终 Markdown。
 
 ## 处理流程
 
 1. **下载**：支持直接 HTTP(S) PDF 地址和 Google Drive 公开分享链接。
-2. **OCR**：PDF 按 25 页切段，单段超过 1 MiB 时继续对半拆分（从 GitHub Runner 上传大文件到百度会卡顿：375 KiB 约 3 秒，1.8 MB 约 90 秒），最多 3 段同时提交到 PaddleOCR-VL-1.6 异步接口（服务端每个用户只接受少量排队任务，超出会返回 10010）。每段完成后立即放出各页的 Markdown 草稿和图表裁图。
+2. **OCR（百度直接拉取）**：按 25 页切段，每段以 `fileUrl`（原始链接）+ `pageRanges`（如 `26-50`）提交到 PaddleOCR-VL-1.6 异步接口，由百度自己下载 PDF，Runner 不上传。最多 3 段同时进行（服务端每个用户只接受少量排队任务，超出返回 10010）。每段完成后立即放出各页的 Markdown 草稿和图表裁图。
+   - 第一次提交兼作探测。百度会直接拒绝部分链接，例如 `https://arxiv.org/pdf/1706.03762` 返回 10004“格式不支持”（加 `#.pdf` 后缀也一样，已实测）。
+   - 百度在每次提交请求里同步下载整个文件（实测从 Cloudflare 约 2 MB/s：28 MB 需 13–30 秒，47 MB 需 23 秒）。因此提交等待时间随文件大小增加：`30 秒 + 文件大小 ÷ 1 MB/s`，最少 60 秒、最多 300 秒（120 MB 约 150 秒）。第一次提交成功后，其余分段同时提交。
+   - 以下情况改为旧方式：链接被拒绝；提交在上述时间内没有响应（源站对百度很慢时会这样，如 gnu.org）；链接任务失败或 5 分钟未完成；文件超过百度链接上限 200 MB；来源是 Google Drive 分享页。只有“队列已满/限流”会继续用链接重试。旧方式是：从本地 PDF 切段上传，单段超过 1 MiB 时继续对半拆分（Runner 到百度上传约 20–25 KB/s）。平均每页超过 256 KiB 的分段（扫描件）先转成 150 DPI JPEG 页面再上传，体积通常缩小 4–8 倍。
 3. **渲染**：同时在独立线程中逐页渲染图片（默认 240 DPI PNG）。空白扫描页直接跳过，不发请求。
-4. **校对**：某页的图片和草稿都就绪后，发送给模型。模型以图片为准、以草稿为底稿：保留正确文字，修正错字、公式与上下标，补全遗漏，删除页眉页脚，整理标题、段落、表格结构，保留草稿中的图片引用。
+4. **校对**：某页的图片和 OCR 草稿都就绪后，一起发送给模型。模型以图片为准、以草稿为底稿：保留正确文字，修正错字、公式与上下标，补全遗漏，删除页眉页脚，整理标题、段落、表格结构，保留草稿中的图片引用。
+   - 开启 `adjacent_pages` 后，每页请求还附带上一页底部和下一页顶部（各占页高 40%）的截图。相邻截图用于辨认边缘字符与阅读顺序，每页只转写本页可见内容，保留本页开头的续句、续公式和续表行，避免依赖另一页是否成功而删除内容。不会自动跨页拼接正文。相邻页为空白或不在转换范围内时不附带。每个请求多两张截图，耗时和 Token 略增。
 5. **兜底**：
-   - 模型拒答（RECITATION/SAFETY 等）、空回答，或重试轮次用尽时，该页直接使用 OCR 草稿。
-   - 某段 OCR 失败（重试 3 次）或未配置 OCR 时，该页退回为仅凭图片转写。
+   - 模型拒答（RECITATION/SAFETY 等）、回答被输出长度截断，或重试轮次用尽时，该页直接使用 OCR 草稿。空回答及 MALFORMED_RESPONSE 按暂时故障重试；非空白扫描页不会因为模型空答而被标成空白。
+   - 某段 OCR 失败（每段最多尝试 6 次）或未配置 OCR 时，该页退回为仅凭图片转写。
    - 两者都没有结果的页面列为未完成。
 
 每页每轮最多立即尝试 2 次；仍失败的页面独立退避后进入下一轮，最多 5 轮，期间不会阻塞其他页面。慢请求在 `max(60 秒, 2 × 近期 P95)` 后最多补发两个副本，先返回有效结果的胜出。
@@ -41,13 +45,14 @@ output/
 - 桶内两次请求至少间隔 `60 / rpm × 1.1` 秒（默认 15 RPM，即 4.4 秒），并带少量抖动，不会突发。
 - 下一个请求交给“已就绪且已用次数最少”的桶，次数相同时选空闲最久的，因此负载均匀分布到所有 Key。
 - 任意两个请求之间还有一个全局最小间隔（`桶间隔 / 桶数`，最多 0.25 秒），避免任务开始时几十个请求同时打出。
-- 429：该桶冷却 20 秒，连续 429 时依次翻倍（最多 300 秒）；服务端给出更长的 `retryDelay` 时以服务端为准。成功一次后清零。
-- 每日额度耗尽（RPD）或预付费额度用完（HTTP 402）：该桶在本次任务中停用，页面换其他 Key 重试。`rpd_per_key` 是单次任务内每个桶的请求上限。
+- 429：该桶冷却 20 秒，连续 429 时依次翻倍（最多 300 秒）；服务端给出更长的 `retryDelay` 时以服务端为准。成功一次后清零。触发限流还会逐步放慢该桶的请求间隔（最多原间隔的 8 倍），成功后逐步恢复。
+- 无效 Key（401/403、明确的 API_KEY_INVALID 等）只停用该 Key，同一 Project 中的其他 Key 保持可用；立即换 Key，不等待页面退避。
+- 每日额度耗尽（RPD）或预付费额度用完（HTTP 402）：该桶在本次任务中停用，页面立即换其他桶；网关用 429 返回余额耗尽时同样处理。`rpd_per_key` 是单次任务内每个桶的请求上限。
 - 近期 429/503 占比超过 20% 时不再补发副本。
 
-PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一任务始终用提交它的 Token 查询。限流（12002）、队列已满（10010）和服务端错误会指数退避重试（每段最多 6 次，间隔最长 60 秒）；Token 无效或每日页数用尽（12001）时停止提交，剩余页面转为仅图片转写。
+PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一任务始终用提交它的 Token 查询。限流（12002）、队列已满（10010）和服务端错误会指数退避重试（每段最多 6 次，间隔最长 60 秒）；Token 无效或每日页数用尽（12001）时仅停用该 Token，其他 Token 继续工作；全部 Token 失效后剩余页面转为仅图片转写。轮询遇到 429/5xx 或连接中断时继续查询原任务，遵守 Retry-After，不重复提交。
 
-`quota-usage.json` 和 Actions Summary 记录每个桶的请求数分布、429/503 次数、各页来源（OCR+模型 / 仅模型 / 仅 OCR）和 OCR 耗时。
+`quota-usage.json` 和 Actions Summary 记录每个桶的请求数分布、429/503 次数、各页来源（OCR+模型 / 仅模型 / 仅 OCR）、OCR 耗时，以及按链接提交与上传的 OCR 任务数。
 
 ## 配置
 
@@ -57,7 +62,8 @@ PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一�
 | `GEMINI_KEY_GROUPS` | Variable，可选 | 每个 Key 所属的 Project，与 Key 一一对应；可用 `deploy/print-key-groups.py` 生成 |
 | `BAIDU_AI_STUDIO` | Secret | AI Studio 访问令牌，可多行；工作流以 `PADDLEOCR_TOKENS` 传给转换器 |
 | `CONVERTER_OCR` | Variable，可选 | `paddle`（默认）或 `none` |
-| `CONVERTER_OCR_JOBS` | Variable，可选 | 同时进行的 OCR 任务数，默认 `3`；调大上传更快，但更容易收到 10010 |
+| `CONVERTER_OCR_JOBS` | Variable，可选 | 同时进行的 OCR 任务数，默认 `3`；调大更容易收到 10010 |
+| `CONVERTER_OCR_SOURCE` | Variable，可选 | `link`（默认，百度从原始链接下载）或 `upload`（始终从 Runner 分段上传） |
 | `MODELFLARE_API_KEYS` | Secret，可选 | 使用 Modelflare 时需要 |
 | `CONVERTER_HEDGE_AFTER` / `CONVERTER_HEDGE_BUDGET` | Variable，可选 | 补发阈值与预算，默认 `60` / `-1`，填 `0` 关闭 |
 
@@ -78,7 +84,7 @@ PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一�
 | `rpm_per_key` / `rpd_per_key` | `15` / `500` | 每个配额桶的 RPM 与单次任务请求上限 |
 | `start_page` / `end_page` | 整份 PDF | 1-based 页面范围 |
 | `retry_rounds` / `attempts_per_page` | `5` / `2` | 每页最大轮数和轮内即时尝试数 |
-| `images_per_request` | — | 已弃用，保留只为兼容旧调用方；现在固定每页一个请求 |
+| `adjacent_pages` | `false` | 附带相邻页边缘作为识别参考，每页保留自己的续接内容 |
 
 外部调用统一使用 `workflow_dispatch`：
 
@@ -101,7 +107,7 @@ export PADDLEOCR_TOKENS='AI Studio 令牌'
 python pdf2md.py --source-url 'https://example.com/document.pdf' --output-name '文档笔记'
 ```
 
-CLI 另有 `--ocr none`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget` 等参数，见 `python pdf2md.py --help`。
+CLI 另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget`、`--adjacent-pages` 等参数，见 `python pdf2md.py --help`。
 
 ## 耗时
 
@@ -112,7 +118,9 @@ CLI 另有 `--ocr none`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、
 | 文件 | 职责 |
 | --- | --- |
 | `pdf2md.py` | 命令行入口、请求构造、单页流程与兜底 |
-| `paddle_ocr.py` | PaddleOCR 异步任务：切段、提交、轮询、解析、下载图表 |
+| `prompts.py` | 版本化默认提示词、OCR 审校规则和跨页归属约束 |
+| `downloads.py` | 原子下载、下载中断恢复和 PDF 格式检查 |
+| `paddle_ocr.py` | PaddleOCR 异步任务：按链接或上传提交分段、轮询、解析、下载图表 |
 | `key_pool.py` | 本地密钥轮询与 429 处理 |
 | `providers.py` | Gemini / OpenAI 兼容网关的协议适配 |
 | `pipeline.py` | 有界流式队列、独立重试、进度文件 |
@@ -127,4 +135,8 @@ pip install -r requirements.txt
 python -m unittest discover -s tests
 ```
 
-测试不访问外网：OCR 接口、模型网关和 PDF 下载都由本地假服务模拟。
+本地单元和端到端测试不访问外网：OCR 接口、模型网关和 PDF 下载都由本地假服务模拟。
+
+2026-10-23 的历史日志诊断、真实 API 对照、可重跑的性能评测及结果见 [架构与质量验证记录](docs/reliability-quality-2026-10-23.md)。公共保真约束在自定义 system_prompt/prompt 之外发送，因此已有保存提示词的任务也会采用新版的逐页归属、脚注和表格保留规则；两段自定义提示词仍按原顺序拼接。
+
+普通 HTTP 下载与 Google Drive 的连接中断最多尝试 3 次，完整下载并通过 PDF 头检查后才替换目标文件。未共享、404 和非 PDF 等不可恢复错误不会盲目重试。配置了中继时，已实测百度拉取超时的 raw.githubusercontent.com 来源直接通过中继提交，省去重复的 60 秒链接探测。

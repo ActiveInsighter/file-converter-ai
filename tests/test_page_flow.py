@@ -84,6 +84,28 @@ class RequestPartsTests(unittest.TestCase):
     def test_an_empty_draft_is_announced(self):
         self.assertIn("OCR 未识别到内容", self.build("")[0]["text"])
 
+    def test_neighbouring_strips_follow_the_page_with_their_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("006.bottom.png", "007.png", "008.top.png"):
+                (root / name).write_bytes(b"png")
+            previous = Page(6, root / "006.png", "006", bottom_path=root / "006.bottom.png")
+            following = Page(8, root / "008.png", "008", top_path=root / "008.top.png")
+            current = Page(7, root / "007.png", "007")
+            both, _ = make_request_parts(current, "要求", "high", "# 草稿", previous, following)
+            only_next, _ = make_request_parts(current, "要求", "high", None, None, following)
+        self.assertEqual([("text" in part, "inlineData" in part) for part in both],
+                         [(True, False), (False, True)] * 3)
+        self.assertIn("第一张图片是 PDF 第 7 页", both[0]["text"])
+        self.assertIn("上一页（第 6 页）底部", both[2]["text"])
+        self.assertIn("下一页（第 8 页）顶部", both[4]["text"])
+        self.assertIn("不把相邻页正文搬到本页", both[0]["text"])
+        self.assertIn("本页开头的续句、续公式、续表行属于本页，必须保留", both[0]["text"])
+        self.assertTrue(both[0]["text"].rstrip().endswith("</ocr_draft>"), "the draft stays last")
+        self.assertIn("本页末尾被截断", only_next[0]["text"])
+        self.assertNotIn("本页开头的续句", only_next[0]["text"], "no rule for a strip that is not attached")
+        self.assertEqual(len(only_next), 4)
+
     def test_only_figures_that_exist_survive(self):
         text = "a ![](images/p001-1.jpg) b ![x](images/made-up.png) c"
         kept = keep_known_figures(text, {"images/p001-1.jpg": Path("x")})
@@ -106,6 +128,27 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["source"], "ocr+model")
         self.assertEqual(results[0]["figures"], ["images/p001-1.jpg"])
         self.assertEqual(written, "# Refined ![](images/p001-1.jpg)\n")
+
+    async def test_adjacent_pages_attach_rendered_non_blank_neighbours(self):
+        seen = {}
+
+        async def model(_c, _p, _prov, _m, parts, name, *_rest):
+            seen[name] = parts[0]["text"]
+            return "# text"
+
+        async def stream():
+            for item in (page(1), page(2), page(3, blank=True), page(4)):
+                yield item
+
+        with tempfile.TemporaryDirectory() as directory:
+            results = await run_process_pages(stream(), directory, model, ocr=FakeOcr({}),
+                                              total_pages=4, adjacent_pages=True)
+        self.assertEqual([r["status"] for r in results], ["ok", "ok", "blank", "ok"])
+        self.assertEqual(seen, {
+            "001": "page=1 draft=None previous=None following=2",
+            "002": "page=2 draft=None previous=1 following=None",
+            "004": "page=4 draft=None",
+        })
 
     async def test_page_without_ocr_is_transcribed_from_the_image(self):
         async def model(_c, _p, _prov, _m, parts, *_rest):
@@ -158,14 +201,14 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["status"], "failed")
         self.assertFalse(results[0]["retryable"])
 
-    async def test_empty_answer_without_a_draft_is_a_blank_page(self):
+    async def test_empty_answer_on_nonblank_page_is_reported_missing(self):
         async def model(*_args):
             raise EmptyAnswerError("STOP")
 
         with tempfile.TemporaryDirectory() as directory:
-            results = await run_process_pages([page(6)], directory, model, ocr=FakeOcr({6: "  "}))
-        self.assertEqual(results[0]["status"], "blank")
-        self.assertEqual(results[0]["reason"], "no_transcribable_text")
+            results = await run_process_pages([page(6)], directory, model, ocr=FakeOcr({6: "  "}), retry_rounds=1)
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertIn("EmptyAnswerError", results[0]["error"])
 
     async def test_blank_page_is_skipped_without_any_request(self):
         async def model(*_args):
@@ -241,7 +284,7 @@ class ErrorClassificationTests(unittest.TestCase):
 
     def test_content_errors_never_enter_the_backoff_rounds(self):
         self.assertFalse(is_retryable_error(ContentBlockedError("RECITATION")))
-        self.assertFalse(is_retryable_error(EmptyAnswerError("STOP")))
+        self.assertTrue(is_retryable_error(EmptyAnswerError("STOP")))
         self.assertFalse(is_retryable_error(PermanentProviderError("HTTP 400")))
         self.assertFalse(is_retryable_error(QuotaPoolExhaustedError("daily")))
         self.assertFalse(is_retryable_error(ValueError("bad page")))
@@ -250,6 +293,8 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class StubPool:
+    def retire_key(self, key_index, reason):
+        self.retired.append((key_index, reason))
     def __init__(self):
         self.retired = []
 
@@ -300,9 +345,10 @@ class HttpLayerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status), self.assertRaises(ModelUnavailableError):
                 await self.call(httpx.Response(status, text="busy"))
 
-    async def test_client_statuses_are_permanent(self):
-        for status in (400, 401, 403):
-            with self.subTest(status=status), self.assertRaises(PermanentProviderError):
+    async def test_bad_request_is_permanent_but_bad_credentials_allow_failover(self):
+        from pdf2md import CredentialRejectedError
+        for status, error in ((400, PermanentProviderError), (401, CredentialRejectedError), (403, CredentialRejectedError)):
+            with self.subTest(status=status), self.assertRaises(error):
                 await self.call(httpx.Response(status, text="bad"))
 
     async def test_refusal_keeps_its_error_type(self):

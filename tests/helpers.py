@@ -11,9 +11,13 @@ def page(number: int, blank: bool = False) -> Page:
     return Page(number, Path(f"{number:03d}.png"), f"{number:03d}", blank)
 
 
-def fake_parts(page, prompt, media_resolution, draft=None):
-    """Request parts that expose the OCR draft to a fake model call."""
-    return [{"text": f"page={page.number} draft={draft}"}], 64
+def fake_parts(page, prompt, media_resolution, draft=None, previous=None, following=None):
+    """Request parts that expose the OCR draft and attached neighbours to a fake model call."""
+    neighbours = ""
+    if previous or following:
+        neighbours = (f" previous={previous.number if previous else None}"
+                      f" following={following.number if following else None}")
+    return [{"text": f"page={page.number} draft={draft}{neighbours}"}], 64
 
 
 class FakeOcr:

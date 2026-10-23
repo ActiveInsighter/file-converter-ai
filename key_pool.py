@@ -154,6 +154,7 @@ class Bucket:
     disabled: bool = False
     turn: int = 0
     rate_limited: int = 0
+    pace_factor: float = 1.0
 
 
 class KeyPool:
@@ -195,11 +196,13 @@ class KeyPool:
         self.successes = [0 for _ in keys]
         self.errors = [0 for _ in keys]
         self.cancelled = [0 for _ in keys]
+        self.disabled_keys: dict[int, str] = {}
         self.rate_limited_counts = [0 for _ in keys]
         self.http_counts = {"success": 0, "429": 0, "503": 0, "other_error": 0}
         self.request_latencies: list[float] = []
         self.success_latencies: list[float] = []
         self.recent_statuses: list[int] = []
+        self.quota_wait_seconds = 0.0
 
     @classmethod
     async def create(cls, keys, groups=None, *, rpm_per_key, rpd_per_key, client=None):
@@ -217,12 +220,14 @@ class KeyPool:
         return max(bucket.next_allowed, bucket.cooldown_until)
 
     async def acquire(self) -> tuple[int, str, str]:
+        waiting_since = self.clock()
         while True:
             async with self.lock:
                 now = self.clock()
                 live = [
                     bucket for bucket in self.buckets
                     if not bucket.disabled and bucket.used < self.rpd_per_key
+                    and any(index not in self.disabled_keys for index in bucket.keys)
                 ]
                 if not live:
                     raise QuotaPoolExhaustedError(
@@ -232,14 +237,16 @@ class KeyPool:
                 ready = [bucket for bucket in live if self._ready_at(bucket) <= now]
                 if ready and self.next_global <= now:
                     bucket = min(ready, key=lambda b: (b.used, b.last_used, random.random()))
-                    index = bucket.keys[bucket.turn % len(bucket.keys)]
+                    available = [i for i in bucket.keys if i not in self.disabled_keys]
+                    index = available[bucket.turn % len(available)]
                     bucket.turn += 1
                     bucket.used += 1
                     bucket.last_used = now
                     # Small jitter keeps buckets from lining up on the same tick.
-                    bucket.next_allowed = now + self.interval * random.uniform(1.0, 1.05)
+                    bucket.next_allowed = now + self.interval * bucket.pace_factor * random.uniform(1.0, 1.05)
                     self.next_global = now + self.global_gap
                     self.used[index] += 1
+                    self.quota_wait_seconds += max(0, now - waiting_since)
                     return index, self.keys[index], f"{bucket.name}-{bucket.used}"
                 earliest = min(self._ready_at(bucket) for bucket in live)
                 wait_for = max(0.01, max(earliest, self.next_global) - now)
@@ -248,6 +255,8 @@ class KeyPool:
     async def mark_success(self, key_index: int, lease_id: str) -> None:
         self.successes[key_index] += 1
         self.bucket_of[key_index].strikes = 0
+        bucket = self.bucket_of[key_index]
+        bucket.pace_factor = max(1.0, bucket.pace_factor * 0.95)
 
     async def mark_cancelled(self, key_index: int, lease_id: str) -> None:
         self.cancelled[key_index] += 1
@@ -273,7 +282,8 @@ class KeyPool:
                 print(f"[quota] {bucket.name} daily quota exhausted; retired for this run", flush=True)
                 return
             bucket.strikes += 1
-            backoff = min(MAX_COOLDOWN_SECONDS, BASE_COOLDOWN_SECONDS * 2 ** (bucket.strikes - 1))
+            bucket.pace_factor = min(8.0, bucket.pace_factor * 1.5)
+            backoff = min(MAX_COOLDOWN_SECONDS, BASE_COOLDOWN_SECONDS * 2 ** min(4, bucket.strikes - 1))
             wait = max(cooldown_seconds or 0.0, backoff) * random.uniform(1.0, 1.2)
             bucket.cooldown_until = max(bucket.cooldown_until, self.clock() + wait)
             print(
@@ -288,6 +298,12 @@ class KeyPool:
         if not bucket.disabled:
             bucket.disabled = True
             print(f"[quota] {bucket.name} retired for this run: {reason}", flush=True)
+
+    def retire_key(self, key_index: int, reason: str) -> None:
+        """An invalid credential does not invalidate its project's other keys."""
+        if key_index not in self.disabled_keys:
+            self.disabled_keys[key_index] = reason
+            print(f"[quota] key#{key_index + 1} retired for this run: {reason}", flush=True)
 
     def record_http_result(self, status: int, elapsed_seconds: float) -> None:
         if status == 200:
@@ -310,6 +326,7 @@ class KeyPool:
             **self.http_counts,
             **latency_summary(self.request_latencies),
             "success_p95_seconds": latency_summary(self.success_latencies)["p95_seconds"],
+            "quota_wait_seconds": round(self.quota_wait_seconds, 2),
         }
 
     async def close(self) -> None:
@@ -333,7 +350,8 @@ class KeyPool:
                     "http_429": self.rate_limited_counts[index],
                     "errors": self.errors[index],
                     "cancelled": self.cancelled[index],
-                    "disabled": self.bucket_of[index].disabled,
+                    "disabled": self.bucket_of[index].disabled or index in self.disabled_keys,
+                    "disabled_reason": self.disabled_keys.get(index),
                 }
                 for index in range(len(self.keys))
             },

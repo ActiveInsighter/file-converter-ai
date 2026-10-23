@@ -1,6 +1,7 @@
 """PDF -> Markdown: PaddleOCR drafts every page, a vision model finalises it.
 
-1. The PDF is downloaded and handed to PaddleOCR-VL in small segments.
+1. The PDF is downloaded; PaddleOCR-VL fetches the same link itself, one page
+   range per job (segments are uploaded only when it cannot fetch the link).
 2. Pages are rendered to images in a background thread at the same time.
 3. Each page goes to the model as soon as both its image and its OCR draft are
    ready. The model checks the draft against the image and writes the final
@@ -31,10 +32,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import fitz
-import gdown
 import httpx
 
 from artifacts import prepare_directories, validate_output_name, write_result
+from downloads import download_pdf, is_google_drive_url
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
 from paddle_ocr import JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
@@ -51,46 +52,8 @@ from providers import (
 from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
-DEFAULT_PROMPT = """请按图片原始顺序逐页、忠实地把这些 PDF 页面转写为 Markdown。这是高精度文档转录任务，不是总结、改写或解题任务。
-
-要求：
-1. 不要遗漏正文、标题、列表、表格、公式、题目、选项、注释、评分等有效内容，并严格保持原始顺序。
-2. 数学内容必须逐字符核对图片：重点检查正负号、等号/不等号、上下标、根号、分数、积分/求和上下限、导数阶数、矩阵元素、向量转置、希腊字母和括号。不要仅凭上下文猜公式。
-3. 不要自行修正原文、补全推导或加入解释。看不清时写 [无法辨认]，不要编造。
-4. 数学公式使用标准 LaTeX。行内公式只用成对的 $...$；多行公式、aligned、cases、matrix 等必须使用成对的 $$...$$，禁止用单个 $ 跨多行包裹。
-5. 不要输出处理备注、模型解释、占位说明或类似“此行视具体排版”的元信息。
-6. 忽略页眉、页脚、纯页码、扫描水印、装饰性字符和无意义的重复数字/编码；除非它们明显属于正文。
-7. 表格尽量转换为 Markdown 表格；无法可靠转换时按原有阅读顺序保留文本，不要虚构表格结构。
-8. 输出前自行复核一遍图片与 Markdown，尤其复核所有数学公式和数字。
-9. 直接输出 Markdown，不要使用 Markdown 代码围栏。"""
-# The prompt that actually runs is the DB-backed system prompt plus this
-# conversion's own prompt, joined by a blank line. Both are optional and
-# independent, and each is capped so the pair stays well inside the inline
-# request budget (the same bound the PocketBase config enforces).
-MAX_PROMPT_CHARS = 12000
-
-#: How the model is asked to use the OCR draft. The transcription rules
-#: (``DEFAULT_PROMPT`` or the configured prompts) follow it.
-REFINE_INSTRUCTIONS = """下方 <ocr_draft> 是 OCR 模型（PaddleOCR-VL）对这一页的识别草稿。请以图片为准、以草稿为底稿，输出这一页最终的 Markdown：
-1. 草稿的文字识别通常可靠：逐段对照图片，保留正确内容，只修正与图片不符之处（错字、漏字、多字、数字、公式符号、上下标）。
-2. 草稿漏掉的正文、公式、表格或题目，按图片补全；草稿里的页眉、页脚、页码和水印删除。
-3. 按图片整理结构：标题层级、段落拆分与合并、列表、阅读顺序（多栏页面按栏阅读）。
-4. 表格输出为 Markdown 表格；存在合并单元格等 Markdown 无法表达的结构时，保留 HTML <table>。
-5. 草稿中的图片引用 ![...](images/...) 原样保留在它在页面中的位置，不改路径，不新增图片引用。"""
-
-
-def compose_prompt(system_prompt: str, user_prompt: str) -> str:
-    """Join the shared system prompt with this conversion's own prompt.
-
-    ``system_prompt`` is read from the saved file-conversion config and applies
-    to every conversion; ``user_prompt`` is the per-task instruction. Either may
-    be empty and neither overrides the other. When both are empty the built-in
-    faithful Markdown prompt is used, so a manual workflow dispatch still
-    produces a faithful transcription.
-    """
-    parts = [part.strip() for part in (system_prompt, user_prompt)]
-    composed = "\n\n".join(part for part in parts if part)
-    return composed or DEFAULT_PROMPT
+from prompts import (DEFAULT_PROMPT, MAX_PROMPT_CHARS, REFINE_INSTRUCTIONS,
+                     PROMPT_VERSION, TRANSCRIPTION_GUARD, adjacent_instructions, compose_prompt)
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -118,6 +81,10 @@ class Page:
     image_path: Path
     stem: str
     blank: bool = False
+    #: Top and bottom strips of the page, rendered only when neighbouring
+    #: pages are sent along (``--adjacent-pages``).
+    top_path: Path | None = None
+    bottom_path: Path | None = None
 
     @property
     def start_page(self) -> int:
@@ -164,41 +131,19 @@ def resolve_fallback_models(provider: Provider, model: str, raw: str | None) -> 
     return provider.default_model_fallbacks if model == provider.default_model else ()
 
 
-def is_google_drive_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host == "drive.google.com" or host.endswith(".drive.google.com")
-
-
-def download_pdf(source_url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if is_google_drive_url(source_url):
-        result = gdown.download(url=source_url, output=str(destination), quiet=False, fuzzy=True)
-        if not result or not destination.exists():
-            raise RuntimeError(
-                "Google Drive download failed. Make sure the file is shared as Anyone with the link."
-            )
-        return
-
-    with httpx.stream("GET", source_url, follow_redirects=True, timeout=120.0) as response:
-        response.raise_for_status()
-        with destination.open("wb") as handle:
-            for data in response.iter_bytes(chunk_size=1024 * 1024):
-                handle.write(data)
-
-
-async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format):
+async def stream_pages(pdf_path, image_dir, plan, dpi, jpeg_quality, image_format, edges=False):
     """Render pages one by one on a dedicated thread and yield them in order."""
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
     iterator = render_pages(pdf_path, image_dir, plan, dpi, jpeg_quality,
-                            image_format, is_blank_page)
+                            image_format, is_blank_page, edges)
     loop = asyncio.get_running_loop()
     try:
         while True:
             item = await loop.run_in_executor(executor, next, iterator, None)
             if item is None:
                 return
-            path, blank = item
-            yield Page(int(path.stem), path, path.stem, blank)
+            path, blank, (top, bottom) = item
+            yield Page(int(path.stem), path, path.stem, blank, top, bottom)
     finally:
         # close is queued behind any in-progress render on the same thread.
         await loop.run_in_executor(executor, iterator.close)
@@ -259,23 +204,41 @@ def _check_request_size(name: str, raw_bytes: int, text: str) -> int:
 
 
 def make_request_parts(
-    page: Page, prompt: str, media_resolution: str, draft: str | None = None
+    page: Page, prompt: str, media_resolution: str, draft: str | None = None,
+    previous: Page | None = None, following: Page | None = None,
 ) -> tuple[list[dict], int]:
-    """The page image plus, when OCR produced one, the draft to refine."""
-    text = f"以下图片是 PDF 第 {page.number} 页。\n"
+    """The page image plus, when OCR produced one, the draft to refine.
+
+    ``previous``/``following`` attach the bottom of the page before and the top
+    of the page after, so text cut by the page break can be checked.
+    """
+    strips = [
+        (f"上一页（第 {previous.number} 页）底部", previous.bottom_path) if previous and previous.bottom_path else None,
+        (f"下一页（第 {following.number} 页）顶部", following.top_path) if following and following.top_path else None,
+    ]
+    text = f"以下第一张图片是 PDF 第 {page.number} 页。\n" if any(strips) else f"以下图片是 PDF 第 {page.number} 页。\n"
+    text += TRANSCRIPTION_GUARD + "\n\n"
     if draft is None:
         text += f"请严格按图片内容处理。\n\n{prompt.strip()}"
     else:
-        text += (
-            f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}\n\n"
-            f"<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
-        )
+        text += f"{REFINE_INSTRUCTIONS}\n\n转录要求：\n{prompt.strip()}"
+    if any(strips):
+        text += "\n\n跨页内容：\n" + adjacent_instructions(bool(strips[0]), bool(strips[1]))
+    if draft is not None:
+        text += f"\n\n<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
     image, raw_bytes = image_part(page.image_path, media_resolution)
-    return [{"text": text}, image], _check_request_size(page.stem, raw_bytes, text)
+    parts = [{"text": text}, image]
+    for strip in filter(None, strips):
+        label, path = strip
+        strip_image, strip_bytes = image_part(path, media_resolution)
+        parts += [{"text": f"参考截图：{label}"}, strip_image]
+        raw_bytes += strip_bytes
+    return parts, _check_request_size(page.stem, raw_bytes, text)
 
 
 def make_verification_parts(
-    page: Page, prompt: str, draft: str, media_resolution: str
+    page: Page, prompt: str, draft: str, media_resolution: str,
+    previous: Page | None = None, following: Page | None = None,
 ) -> tuple[list[dict], int]:
     verify_prompt = f"""请对照图片，审校下面这份 Markdown 草稿并直接返回修正后的完整 Markdown。
 
@@ -295,8 +258,7 @@ def make_verification_parts(
 {draft}
 ---END DRAFT---
 """
-    image, raw_bytes = image_part(page.image_path, media_resolution)
-    return [{"text": verify_prompt}, image], _check_request_size(page.stem, raw_bytes, verify_prompt)
+    return make_request_parts(page, verify_prompt, media_resolution, None, previous, following)
 
 
 def keep_known_figures(text: str, figures: dict[str, Path]) -> str:
@@ -438,12 +400,13 @@ class ContentBlockedError(RuntimeError):
     """
 
 
-class EmptyAnswerError(ContentBlockedError):
+class EmptyAnswerError(RuntimeError):
     """The model stopped without emitting any text for a page image.
 
     Seen on blank scan pages (nothing to transcribe), on figure-only pages and
     on responses whose whole output landed in thinking parts. Retrying the same
-    image does not change it.
+    image may succeed later. A rendered nonblank page must not become blank
+    merely because an upstream generation returned no text.
     """
 
 
@@ -470,6 +433,10 @@ class ModelUnavailableError(RuntimeError):
     """
 
 
+class CredentialRejectedError(RuntimeError):
+    """The credential was retired; the same page can use another one."""
+
+
 async def call_model_once(
     client: httpx.AsyncClient,
     key_pool,
@@ -484,10 +451,18 @@ async def call_model_once(
 ) -> str:
     policy = CURRENT_POLICY.get()
     async def attempt(on_started=lambda: None):
-        return await _call_model_attempt(
-            client, key_pool, provider, model, parts, chunk_name, thinking_level,
-            reasoning_effort, api_base, max_output_tokens, on_started,
-        )
+        # Credential failover does not consume page retries or add a sleep.
+        # Each rejected credential is retired, so this loop is bounded.
+        for _ in range(max(1, len(getattr(key_pool, "keys", [None])))):
+            try:
+                return await _call_model_attempt(
+                    client, key_pool, provider, model, parts, chunk_name, thinking_level,
+                    reasoning_effort, api_base, max_output_tokens, on_started,
+                )
+            except CredentialRejectedError:
+                if not hasattr(key_pool, "keys"):
+                    raise
+        raise QuotaPoolExhaustedError("All available credentials rejected this request")
     if policy is None:
         return await attempt()
     return await policy.run(attempt, chunk_name, max_duration=provider.request_timeout_seconds)
@@ -582,12 +557,24 @@ async def _call_model_attempt(
         return text
 
     message = response.text[:800]
+    for secret in getattr(key_pool, "keys", [api_key]):
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
     try:
         error_payload: object = response.json()
     except ValueError:
         error_payload = {"message": message}
 
     kind = provider.status_error_kind(response.status_code, error_payload)
+    scope = provider.credential_error_scope(response.status_code, error_payload)
+    if scope:
+        await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
+        reason = f"HTTP {response.status_code}: {message[:200]}"
+        if scope == "bucket":
+            key_pool.retire(key_index, reason)
+        else:
+            key_pool.retire_key(key_index, reason)
+        raise CredentialRejectedError(f"{provider.label} credential retired: {reason}")
     if kind == "rate_limited":
         quota_type = provider.quota_kind(error_payload)
         retry_after = provider.retry_after(response.headers, error_payload)
@@ -604,11 +591,6 @@ async def _call_model_attempt(
         )
 
     await finish_report(key_pool.mark_error(key_index, lease_id, http_status=response.status_code))
-    if response.status_code == 402:
-        # Credits of this key's project are used up. That says nothing about
-        # the page or the other keys: retire the key and let the page retry.
-        key_pool.retire(key_index, f"HTTP 402: {message[:200]}")
-        raise RuntimeError(f"{provider.label} HTTP 402 (key retired): {message}")
     error = f"{provider.label} HTTP {response.status_code}: {message}"
     if kind == "permanent":
         raise PermanentProviderError(error)
@@ -689,6 +671,7 @@ async def process_pages(
     hedge_budget: int | None = None,
     publish_progress=None,
     ocr: PaddleOcr | None = None,
+    adjacent_pages: bool = False,
 ) -> list[dict]:
     """Finalise every page with the model, using its OCR draft when there is one."""
     provider = provider or resolve_provider(None)
@@ -735,15 +718,35 @@ async def process_pages(
         tracker.request_summary = policy.summary
         policy_token = CURRENT_POLICY.set(policy)
 
-        async def source():
+        rendered: dict[int, Page] = {}
+
+        async def each_page():
             if isinstance(pages, list):
                 for page in pages:
-                    started_at.setdefault(page.stem, time.monotonic())
                     yield page
             else:
                 async for page in pages:
-                    started_at.setdefault(page.stem, time.monotonic())
                     yield page
+
+        async def source():
+            # With neighbours attached a page waits until the next one is
+            # rendered, so its request can carry the top of that page.
+            held: Page | None = None
+            async for page in each_page():
+                rendered[page.number] = page
+                if adjacent_pages:
+                    page, held = held, page
+                    if page is None:
+                        continue
+                started_at.setdefault(page.stem, time.monotonic())
+                yield page
+            if held is not None:
+                started_at.setdefault(held.stem, time.monotonic())
+                yield held
+
+        def neighbour(number: int) -> Page | None:
+            page = rendered.get(number) if adjacent_pages else None
+            return None if page is None or page.blank else page
 
         def record_success(page: Page, text: str, estimated: int, source: str, **extra) -> dict:
             md_path = pages_dir / f"{page.stem}.md"
@@ -791,19 +794,27 @@ async def process_pages(
                     f"{BLANK_PAGE_DARK_LEVEL})",
                 )
 
+            ocr_started = time.monotonic()
             ocr_page: OcrPage | None = await ocr.page(page.number) if ocr else None
+            ocr_wait = time.monotonic() - ocr_started
+            model_started = time.monotonic()
             draft = ocr_page.markdown if ocr_page else None
             figures = ocr_page.figures if ocr_page else {}
             attempts = max(1, attempts_per_page)
 
             async def transcribe() -> tuple[str, int]:
-                parts, estimated = make_request_parts(page, prompt, media_resolution, draft)
+                parts, estimated = make_request_parts(
+                    page, prompt, media_resolution, draft,
+                    previous=neighbour(page.number - 1), following=neighbour(page.number + 1),
+                )
                 text = await call_model(
                     client, key_pool, provider, model, parts, page.stem, thinking_level,
                     fallback_models, reasoning_effort, api_base, max_output_tokens,
                 )
                 for verify_index in range(verification_passes):
-                    verify_parts, _ = make_verification_parts(page, prompt, text, media_resolution)
+                    verify_parts, _ = make_verification_parts(
+                        page, prompt, text, media_resolution,
+                        neighbour(page.number - 1), neighbour(page.number + 1))
                     text = await call_model(
                         client, key_pool, provider, model, verify_parts,
                         f"{page.stem}-verify-{verify_index + 1}", thinking_level,
@@ -832,7 +843,9 @@ async def process_pages(
                     continue
                 text = keep_known_figures(text, figures)
                 return record_success(
-                    page, text, estimated, "ocr+model" if draft is not None else "model"
+                    page, text, estimated, "ocr+model" if draft is not None else "model",
+                    stage_seconds={"ocr_wait": round(ocr_wait, 3),
+                                   "model_including_quota_wait": round(time.monotonic() - model_started, 3)},
                 )
 
             exc = last_error or RuntimeError("transcription failed without an exception")
@@ -847,10 +860,6 @@ async def process_pages(
                 return record_success(
                     page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
                 )
-            if isinstance(exc, EmptyAnswerError):
-                # No OCR text and no model text: nothing to transcribe here.
-                return record_blank(page, "no_transcribable_text", str(exc))
-
             error = {
                 "chunk": page.stem,
                 "page": page.number,
@@ -925,6 +934,7 @@ async def process_pages(
             f"sources={json.dumps(usage['page_sources'])}",
             flush=True,
         )
+        print(f"[performance] {json.dumps(usage['performance'])}", flush=True)
         return results
 
 
@@ -966,8 +976,26 @@ def parser() -> argparse.ArgumentParser:
             "and let the model refine it. 'none' sends only the page image."
         ),
     )
+    p.add_argument(
+        "--ocr-source",
+        choices=["link", "upload"],
+        default="link",
+        help=(
+            "link: PaddleOCR downloads source_url itself, one page range per job "
+            "(falls back to upload if it cannot); upload: send PDF segments from here."
+        ),
+    )
     p.add_argument("--ocr-model", default=DEFAULT_OCR_MODEL)
     p.add_argument("--ocr-url", default=JOB_URL, help="PaddleOCR async job endpoint.")
+    p.add_argument(
+        "--ocr-relay-url",
+        default=os.getenv("PDF_RELAY_URL", ""),
+        help=(
+            "Upload relay for OCR segments (token in PDF_RELAY_TOKEN). Large or "
+            "unfetchable sources are cut into segments, stored there and fetched "
+            "by PaddleOCR from the relay. Empty uploads segments directly."
+        ),
+    )
     p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
                    help="Pages per PaddleOCR job.")
     p.add_argument("--ocr-parallel-jobs", type=int, default=PARALLEL_JOBS,
@@ -1057,6 +1085,15 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--jpeg-quality", type=int, default=95)
     p.add_argument(
+        "--adjacent-pages",
+        action="store_true",
+        help=(
+            "Also send the bottom of the previous page and the top of the next "
+            "page as reference for edge characters and reading order. Each "
+            "page retains only its own visible content, including continuations."
+        ),
+    )
+    p.add_argument(
         "--verification-passes",
         type=int,
         default=0,
@@ -1113,6 +1150,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
     if not 1 <= args.concurrency <= 100:
         raise ValueError("concurrency must be between 1 and 100")
+    if args.ocr_relay_url:
+        relay = urlparse(args.ocr_relay_url)
+        if relay.scheme != "https" or not relay.hostname:
+            raise ValueError("ocr_relay_url must be an absolute https URL")
     ocr_url = urlparse(args.ocr_url)
     if ocr_url.scheme not in {"http", "https"} or not ocr_url.hostname:
         raise ValueError("ocr_url must be an absolute http(s) URL")
@@ -1195,11 +1236,14 @@ async def async_main(args: argparse.Namespace) -> int:
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
+        f"ocr_source={args.ocr_source} "
+        f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
         f"concurrency={args.concurrency} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
         f"media_resolution={args.media_resolution} "
+        f"adjacent_pages={'on' if args.adjacent_pages else 'off'} "
         f"rpm_per_key={args.rpm_per_key:g} rpd_per_key={args.rpd_per_key} "
         f"model_fallbacks={','.join(fallback_models) or 'none'} "
         f"retry_rounds={args.retry_rounds} "
@@ -1216,7 +1260,7 @@ async def async_main(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        f"[prompt] system_chars={len(system_prompt)} task_chars={len(user_prompt)} "
+        f"[prompt] version={PROMPT_VERSION} system_chars={len(system_prompt)} task_chars={len(user_prompt)} "
         f"effective_chars={len(prompt)} "
         f"sha256={hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:12]}",
         flush=True,
@@ -1239,7 +1283,7 @@ async def async_main(args: argparse.Namespace) -> int:
     print(f"[plan] pages={plan.page_count} streaming=true", flush=True)
     pages: list[Page] = []
     rendered = stream_pages(source_pdf, images_dir, plan, args.dpi,
-                            args.jpeg_quality, args.image_format)
+                            args.jpeg_quality, args.image_format, args.adjacent_pages)
 
     async def page_source():
         async with contextlib.aclosing(rendered):
@@ -1261,10 +1305,15 @@ async def async_main(args: argparse.Namespace) -> int:
     # Always keep a compact partial package, including during cancellation.
     publish([])
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as ocr_client:
+        # Baidu cannot fetch a Drive share page; those segments are uploaded.
+        fetchable = args.ocr_source == "link" and not is_google_drive_url(args.source_url)
         ocr = PaddleOcr(ocr_tokens, client=ocr_client, work_dir=state_dir,
                         model=args.ocr_model, job_url=args.ocr_url,
                         segment_pages=args.ocr_segment_pages,
-                        parallel_jobs=args.ocr_parallel_jobs)
+                        parallel_jobs=args.ocr_parallel_jobs,
+                        source_url=args.source_url if fetchable else None,
+                        relay_url=args.ocr_relay_url or None,
+                        relay_token=os.getenv("PDF_RELAY_TOKEN"))
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(
@@ -1291,6 +1340,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 hedge_budget=None if args.hedge_budget < 0 else args.hedge_budget,
                 publish_progress=publish,
                 ocr=ocr,
+                adjacent_pages=args.adjacent_pages,
             )
         except (Exception, asyncio.CancelledError) as exc:
             cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
