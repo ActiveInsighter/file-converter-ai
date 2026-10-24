@@ -53,6 +53,7 @@ from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
 from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt
+from markdown_quality import clean_layout_markup
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -821,7 +822,7 @@ async def process_pages(
                     )
                     await asyncio.sleep(pause)
                     continue
-                text = keep_known_figures(text, figures)
+                text = clean_layout_markup(keep_known_figures(text, figures))
                 return record_success(
                     page, text, estimated, "ocr+model" if draft is not None else "model",
                     stage_seconds={"ocr_wait": round(ocr_wait, 3),
@@ -838,7 +839,7 @@ async def process_pages(
                     flush=True,
                 )
                 return record_success(
-                    page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
+                    page, clean_layout_markup(draft), 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
                 )
             error = {
                 "chunk": page.stem,
