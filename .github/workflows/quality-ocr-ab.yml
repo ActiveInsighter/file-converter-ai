@@ -1,15 +1,6 @@
 name: OCR quality 2-page A/B (experimental)
 on:
-  push:
-    branches:
-      - codex/ocr-text-first-markdown-quality-20261024
-    paths:
-      - .github/workflows/quality-ocr-ab.yml
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/quality-ocr-ab.yml
 
 permissions:
   contents: read
