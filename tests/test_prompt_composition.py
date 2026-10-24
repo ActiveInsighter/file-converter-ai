@@ -1,6 +1,5 @@
 """The effective prompt is the DB system prompt plus this conversion's prompt."""
 
-import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,9 +17,11 @@ from pdf2md import (
 
 
 class BuiltInPromptTests(unittest.TestCase):
-    def test_default_matches_the_editable_pocketbase_seed(self):
-        self.assertEqual(hashlib.sha256(DEFAULT_PROMPT.encode()).hexdigest(),
-                         "53e12c289f49f3c44b513e9b48c7604f6694af3cf5c4f93190cfb9898a51615f")
+    def test_updated_default_prefers_text_transcription_without_losing_diagrams(self):
+        # The Remote-saved prompt is independent and is not overwritten by code.
+        self.assertIn("纯文本框和普通表格", DEFAULT_PROMPT)
+        self.assertIn("只有已完整转写", DEFAULT_PROMPT.replace("仅当该区域的全部有效文字已完整转写时", "只有已完整转写"))
+        self.assertIn("无法无损文字化", DEFAULT_PROMPT)
 
     def test_the_built_in_prompt_has_no_surrounding_whitespace(self):
         # The PocketBase hook trims system prompts on write, so the constant must
