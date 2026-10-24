@@ -83,6 +83,12 @@ STAGING_LOOKAHEAD = 2
 #: segment: that segment (not the whole run) is uploaded instead.
 RELAY_FETCH_STRIKES = 2
 RELAY_FETCH_RETRY_PAUSE = 5.0
+#: A relay job that is not done by then is submitted again on the same link,
+#: which takes seconds; the slowest legitimate job in a 400-page run needed 141 s
+#: and one stalled for more than 300 s. After this many stalled or failed jobs
+#: the segment (not the relay) is uploaded instead.
+RELAY_JOB_TIMEOUT = 200.0
+RELAY_JOB_STRIKES = 3
 #: Re-encoding scans is CPU work that holds the GIL; it runs in worker processes.
 CUT_WORKERS = max(1, min(3, (os.cpu_count() or 2) - 1))
 #: A link job that is not done by then is abandoned for an upload, which
@@ -459,6 +465,7 @@ class PaddleOcr:
                                   name: str) -> list[dict]:
         upload: bytes | None = None
         fetch_strikes = 0
+        job_strikes = 0
         for attempt in range(1, SEGMENT_ATTEMPTS + 1):
             if self.fatal:
                 raise OcrFatalError(self.fatal)
@@ -478,7 +485,12 @@ class PaddleOcr:
                             print(f"[ocr] {name}: {len(upload) >> 10} KiB, splitting", flush=True)
                             raise _SplitSegment
                     job = await self._submit_upload(upload, name)
-                timeout = self.job_timeout if kind == "upload" else min(self.job_timeout, REMOTE_JOB_TIMEOUT)
+                if kind == "upload":
+                    timeout = self.job_timeout
+                elif kind == "relay":
+                    timeout = min(self.job_timeout, RELAY_JOB_TIMEOUT)
+                else:
+                    timeout = min(self.job_timeout, REMOTE_JOB_TIMEOUT)
                 return await self._collect(job, name, last - first + 1, timeout)
             except OcrTokenRetired:
                 if attempt == SEGMENT_ATTEMPTS:
@@ -497,13 +509,24 @@ class PaddleOcr:
                         print(f"[ocr] {name}: the service could not fetch the relay link "
                               f"{fetch_strikes} times; uploading this segment", flush=True)
                 if kind != "upload" and isinstance(exc, (OcrJobFailed, ValueError, TimeoutError)):
-                    # A link job that failed, came back wrong or stalled will
-                    # not get better; upload this and every later segment.
                     reason = f"{name}: {type(exc).__name__}: {exc}"
                     if kind == "link":
+                        # A link job that failed, came back wrong or stalled will
+                        # not get better; upload this and every later segment.
                         self._abandon_link(reason)
                     else:
-                        self._abandon_relay(reason)
+                        # The segment is already on the relay, so submitting it
+                        # again costs seconds while an upload costs minutes.
+                        # Only this segment gives up on the relay, and only
+                        # after several tries.
+                        job_strikes += 1
+                        if job_strikes >= RELAY_JOB_STRIKES:
+                            self.relay_skipped.add(name)
+                            print(f"[ocr] {name}: {job_strikes} relay jobs stalled or failed "
+                                  f"({type(exc).__name__}); uploading this segment", flush=True)
+                        else:
+                            print(f"[ocr] {name}: relay job {type(exc).__name__}; "
+                                  "submitting the same link again", flush=True)
                 if attempt == SEGMENT_ATTEMPTS:
                     raise
                 pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))

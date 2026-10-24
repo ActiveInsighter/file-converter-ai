@@ -384,6 +384,52 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([page.markdown.split()[-2] for page in results.values()],
                          ["1", "2", "3", "4"])
 
+    def stalling(self, service, stalls):
+        """The first ``stalls`` jobs never finish."""
+        respond, submitted = service.handler, []
+
+        def handler(request):
+            url = str(request.url)
+            if request.method == "POST" and request.headers["Content-Type"] == "application/json":
+                response = respond(request)
+                submitted.append(response.json()["data"]["jobId"])
+                return response
+            if url.startswith(JOBS + "/") and url.rsplit("/", 1)[1] in submitted[:stalls]:
+                return httpx.Response(200, json={"code": 0, "data": {"state": "running"}})
+            return respond(request)
+
+        service.handler = handler
+
+    async def test_a_stalled_relay_job_is_submitted_again_on_the_same_link(self):
+        # Run 133: one OCR job did not answer for 5 minutes, the relay was dropped
+        # for the whole run and 8 small uploads at ~15 KB/s cost 4 more minutes.
+        from unittest.mock import patch
+        service = FakeService()
+        self.stalling(service, 1)
+        with patch("paddle_ocr.RELAY_JOB_TIMEOUT", 0.2):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual(len(service.relayed), 1, "the segment is not uploaded to the relay again")
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (2, 0))
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_failed_relay_job_does_not_drop_the_relay(self):
+        service = FakeService({"Page 1": ["fail"]})
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, relay=True)
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertEqual(ocr.stats["uploaded_jobs"], 0)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_segment_whose_relay_jobs_keep_stalling_is_uploaded_alone(self):
+        from unittest.mock import patch
+        service = FakeService()
+        self.stalling(service, 3)
+        with patch("paddle_ocr.RELAY_JOB_TIMEOUT", 0.1):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (3, 1))
+        self.assertIsNotNone(ocr.relay_url, "later segments keep using the relay")
+        self.assertTrue(all(page is not None for page in results.values()))
+
     async def test_the_next_segment_is_on_the_relay_before_the_running_job_finishes(self):
         service = FakeService()
         respond, events = service.handler, []
