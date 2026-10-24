@@ -55,6 +55,7 @@ from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
 from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt
+from markdown_quality import clean_layout_markup
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -852,9 +853,23 @@ async def process_pages(
                     )
                     await asyncio.sleep(pause)
                     continue
-                text = keep_known_figures(text, figures)
+                text = clean_layout_markup(keep_known_figures(text, figures))
+                original_links = set(figures_used(draft or ""))
+                retained_links = set(figures_used(text))
+                missing_links = original_links - retained_links
+                if missing_links:
+                    print(
+                        f"[figure-audit] {page.stem}: final Markdown retained "
+                        f"{len(original_links) - len(missing_links)}/"
+                        f"{len(original_links)} OCR figure links; "
+                        "verify removed crops were fully transcribed as text",
+                        flush=True,
+                    )
                 return record_success(
                     page, text, estimated, "ocr+model" if draft is not None else "model",
+                    figure_audit={"ocr_links": len(original_links),
+                                  "retained": len(original_links) - len(missing_links),
+                                  "dropped": len(missing_links)},
                     stage_seconds={"ocr_wait": round(ocr_wait, 3),
                                    "model_including_quota_wait": round(time.monotonic() - model_started, 3)},
                 )
@@ -869,7 +884,7 @@ async def process_pages(
                     flush=True,
                 )
                 return record_success(
-                    page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
+                    page, clean_layout_markup(draft), 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
                 )
             error = {
                 "chunk": page.stem,
