@@ -21,8 +21,11 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import multiprocessing
+import os
 import re
 import time
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
@@ -41,6 +44,10 @@ OPTIONAL_PAYLOAD = {
 }
 #: Pages per job. Small jobs finish quickly and let the model stage start early.
 SEGMENT_PAGES = 25
+#: The first jobs are smaller so the model stage gets its first drafts after
+#: seconds, not after a full 25-page job. They also finish at staggered times,
+#: which keeps drafts arriving steadily instead of in bursts of three segments.
+RAMP_SEGMENT_PAGES = (5, 10, 15)
 #: Segments are halved until an upload is at most this big. From GitHub's
 #: runners a 375 KiB upload takes ~3 s while 1.8 MB stalls for ~90 s, so many
 #: small parallel uploads beat one large one.
@@ -68,6 +75,16 @@ RELAY_PREFERRED_ABOVE_BYTES = 40 * 1000 * 1000
 RELAY_PREFERRED_HOSTS = {"raw.githubusercontent.com"}
 #: The relay accepts one request of at most 90 MiB; bigger segments are halved.
 RELAY_MAX_BYTES = 80 * 1024 * 1024
+#: Segments that may be cut and put on the relay ahead of their job slot, so a
+#: freed slot finds the next segment already fetchable instead of paying for the
+#: cut and the upload first.
+STAGING_LOOKAHEAD = 2
+#: The service could not fetch a relay link in time this many times for one
+#: segment: that segment (not the whole run) is uploaded instead.
+RELAY_FETCH_STRIKES = 2
+RELAY_FETCH_RETRY_PAUSE = 5.0
+#: Re-encoding scans is CPU work that holds the GIL; it runs in worker processes.
+CUT_WORKERS = max(1, min(3, (os.cpu_count() or 2) - 1))
 #: A link job that is not done by then is abandoned for an upload, which
 #: finishes within about three minutes even at 20-25 KB/s.
 REMOTE_JOB_TIMEOUT = 300.0
@@ -117,6 +134,10 @@ class OcrTokenRetired(OcrRetryableError):
     """Retry with another token, without treating the source as broken."""
 
 
+class OcrFetchTimeout(OcrRetryableError):
+    """The service could not fetch the linked file in time (HTTP 408/504 or no answer)."""
+
+
 class _SplitSegment(Exception):
     """The segment is too big to upload in one piece."""
 
@@ -143,23 +164,53 @@ def link_submit_timeout(size_bytes: int) -> float:
     return min(REMOTE_SUBMIT_TIMEOUT_MAX, max(REMOTE_SUBMIT_TIMEOUT, scaled))
 
 
-def extract_segment(pdf_path: Path, first: int, last: int, compact: bool = True) -> bytes:
-    """The pages as their own PDF; heavy scans are re-encoded unless ``compact`` is off."""
+def ramp_segments(first: int, last: int, size: int = SEGMENT_PAGES) -> list[tuple[int, int]]:
+    """``plan_segments`` with small leading segments (see ``RAMP_SEGMENT_PAGES``)."""
+    plan: list[tuple[int, int]] = []
+    start = first
+    for step in RAMP_SEGMENT_PAGES:
+        if step >= size or start > last:
+            break
+        end = min(last, start + step - 1)
+        plan.append((start, end))
+        start = end + 1
+    return plan + (plan_segments(start, last, size) if start <= last else [])
+
+
+def cut_segment(pdf_path: Path, first: int, last: int) -> bytes:
+    """The pages as their own PDF, with the original page content."""
     with fitz.open(pdf_path) as source, fitz.open() as target:
         target.insert_pdf(source, from_page=first - 1, to_page=last - 1)
-        data = target.tobytes(garbage=3, deflate=True)
-        if not compact or len(data) <= COMPACT_ABOVE_BYTES_PER_PAGE * (last - first + 1):
-            return data
-        compact = _rasterise(source, first, last)
-    return compact if len(compact) < len(data) else data
+        return target.tobytes(garbage=3, deflate=True)
 
 
-def _rasterise(source: fitz.Document, first: int, last: int) -> bytes:
+def is_heavy(size: int, first: int, last: int) -> bool:
+    """Scanned pages: big enough per page that re-encoding them pays off."""
+    return size > COMPACT_ABOVE_BYTES_PER_PAGE * (last - first + 1)
+
+
+def extract_segment(pdf_path: Path, first: int, last: int, compact: bool = True,
+                    dpi: int = COMPACT_DPI) -> bytes:
+    """The pages as their own PDF; heavy scans are re-encoded unless ``compact`` is off."""
+    data = cut_segment(pdf_path, first, last)
+    if not compact or not dpi or not is_heavy(len(data), first, last):
+        return data
+    small = rasterise_segment(pdf_path, first, last, dpi)
+    return small if len(small) < len(data) else data
+
+
+def rasterise_segment(pdf_path: Path, first: int, last: int, dpi: int = COMPACT_DPI) -> bytes:
+    """Module level so worker processes can run it."""
+    with fitz.open(pdf_path) as source:
+        return _rasterise(source, first, last, dpi)
+
+
+def _rasterise(source: fitz.Document, first: int, last: int, dpi: int = COMPACT_DPI) -> bytes:
     """The pages as JPEG images at the original page size: small enough to upload."""
     with fitz.open() as target:
         for number in range(first, last + 1):
             page = source[number - 1]
-            image = page.get_pixmap(dpi=COMPACT_DPI, alpha=False).tobytes(
+            image = page.get_pixmap(dpi=dpi, alpha=False).tobytes(
                 "jpeg", jpg_quality=COMPACT_JPEG_QUALITY)
             target.new_page(width=page.rect.width, height=page.rect.height).insert_image(
                 fitz.Rect(0, 0, page.rect.width, page.rect.height), stream=image)
@@ -244,6 +295,7 @@ class PaddleOcr:
         source_url: str | None = None,
         relay_url: str | None = None,
         relay_token: str | None = None,
+        relay_compact_dpi: int = COMPACT_DPI,
     ) -> None:
         self.tokens = tokens
         self.client = client
@@ -274,6 +326,16 @@ class PaddleOcr:
         #: fetched by link, avoiding the 20-25 KB/s upload to the service.
         self.relay_url = relay_url if relay_url and relay_token else None
         self.relay_token = relay_token
+        #: Heavy scans are re-encoded at this resolution before they go on the
+        #: relay (0 keeps the original page images).
+        self.relay_compact_dpi = relay_compact_dpi
+        #: Segments already on the relay: name -> (public link, size). A job
+        #: the service failed to start is retried on the same link.
+        self.staged: dict[str, tuple[str, int]] = {}
+        #: Segments the relay could not serve; they are uploaded instead.
+        self.relay_skipped: set[str] = set()
+        self.lookahead = asyncio.Semaphore(STAGING_LOOKAHEAD)
+        self.cutters: ProcessPoolExecutor | bool | None = None
         self.started = time.monotonic()
         self.stats = {"jobs": 0, "remote_jobs": 0, "relay_jobs": 0, "uploaded_jobs": 0,
                       "pages": 0, "failed_pages": 0, "figures": 0, "seconds": 0.0,
@@ -332,9 +394,11 @@ class PaddleOcr:
         try:
             await asyncio.gather(*(
                 self._segment(pdf_path, start, end, width)
-                for start, end in plan_segments(first, last, self.segment_pages)
+                for start, end in ramp_segments(first, last, self.segment_pages)
             ))
         finally:
+            if self.cutters:
+                self.cutters.shutdown(wait=False, cancel_futures=True)
             for number in self.pages:
                 self._resolve(number, None)
             self.stats["seconds"] = round(time.monotonic() - started, 1)
@@ -344,8 +408,11 @@ class PaddleOcr:
         name = f"{first}-{last}"
         try:
             try:
-                async with self.jobs:
+                await self._take_job_slot(pdf_path, first, last, name)
+                try:
                     pages = await self._parse_with_retries(pdf_path, first, last, name)
+                finally:
+                    self.jobs.release()
             except _SplitSegment:
                 middle = (first + last) // 2
                 await asyncio.gather(
@@ -366,9 +433,32 @@ class PaddleOcr:
             for number in range(first, last + 1):
                 self._resolve(number, None)
 
+    async def _take_job_slot(self, pdf_path: Path, first: int, last: int, name: str) -> None:
+        """Wait for a job slot; meanwhile cut the segment and put it on the relay.
+
+        The cut and the upload used to run inside the slot, so every job paid
+        for them before the service even started. Now they overlap the jobs in
+        flight and a freed slot only has to submit a link.
+        """
+        if not (self.relay_url and not self.remote_url and name not in self.relay_skipped):
+            await self.jobs.acquire()
+            return
+        await self.lookahead.acquire()
+        try:
+            try:
+                await self._stage_relay(pdf_path, first, last, name)
+            except _SplitSegment:
+                raise
+            except Exception:  # noqa: BLE001 - the job attempt repeats it with the retry rules
+                pass
+            await self.jobs.acquire()
+        finally:
+            self.lookahead.release()
+
     async def _parse_with_retries(self, pdf_path: Path, first: int, last: int,
                                   name: str) -> list[dict]:
         upload: bytes | None = None
+        fetch_strikes = 0
         for attempt in range(1, SEGMENT_ATTEMPTS + 1):
             if self.fatal:
                 raise OcrFatalError(self.fatal)
@@ -383,7 +473,7 @@ class PaddleOcr:
                         kind = "relay"
                 if job is None:
                     if upload is None:
-                        upload = await asyncio.to_thread(extract_segment, pdf_path, first, last)
+                        upload = await self._cut(pdf_path, first, last, COMPACT_DPI)
                         if len(upload) > TARGET_UPLOAD_BYTES and last > first:
                             print(f"[ocr] {name}: {len(upload) >> 10} KiB, splitting", flush=True)
                             raise _SplitSegment
@@ -398,6 +488,14 @@ class PaddleOcr:
                 self.fatal = str(exc)
                 raise
             except (OcrRetryableError, httpx.TransportError, TimeoutError, ValueError) as exc:
+                if isinstance(exc, OcrFetchTimeout) and self.relay_url and name in self.staged:
+                    fetch_strikes += 1
+                    if fetch_strikes >= RELAY_FETCH_STRIKES:
+                        # The relay is fine for other segments: only this one
+                        # is uploaded, compacted, instead of retried for good.
+                        self.relay_skipped.add(name)
+                        print(f"[ocr] {name}: the service could not fetch the relay link "
+                              f"{fetch_strikes} times; uploading this segment", flush=True)
                 if kind != "upload" and isinstance(exc, (OcrJobFailed, ValueError, TimeoutError)):
                     # A link job that failed, came back wrong or stalled will
                     # not get better; upload this and every later segment.
@@ -410,6 +508,8 @@ class PaddleOcr:
                     raise
                 pause = min(MAX_RETRY_PAUSE, self.retry_pause * 2 ** (attempt - 1))
                 pause *= random.uniform(1.0, 1.2)
+                if isinstance(exc, OcrFetchTimeout):
+                    pause = min(pause, RELAY_FETCH_RETRY_PAUSE)
                 pause = max(pause, getattr(exc, "retry_after", None) or 0)
                 print(f"[ocr] {name} attempt {attempt}/{SEGMENT_ATTEMPTS} failed: "
                       f"{type(exc).__name__}: {exc}; retrying in {pause:.0f}s", flush=True)
@@ -430,6 +530,8 @@ class PaddleOcr:
             raise OcrFatalError(message)
         if code in REMOTE_REJECTED_CODES:
             raise OcrSourceRejected(message)
+        if response.status_code in (408, 504) or code in (408, 504):
+            raise OcrFetchTimeout(message, retry_after_seconds(response.headers, body))
         if code in RETRYABLE_CODES or response.status_code == 429 or response.status_code >= 500:
             raise OcrRetryableError(message, retry_after_seconds(response.headers, body))
         if response.status_code != 200 or code != 0:
@@ -465,37 +567,90 @@ class PaddleOcr:
                   "uploading segments instead", flush=True)
             self.relay_url = None
 
-    async def _submit_relay(self, pdf_path: Path, first: int, last: int,
-                            name: str) -> tuple[str, dict[str, str]] | None:
-        """Put the segment on the relay and let the service fetch it; ``None`` means upload."""
-        if not self.relay_url:
+    async def _stage_relay(self, pdf_path: Path, first: int, last: int,
+                           name: str) -> tuple[str, int] | None:
+        """Cut the segment and put it on the relay; ``None`` means upload instead."""
+        if not self.relay_url or name in self.relay_skipped:
             return None
-        data = await asyncio.to_thread(extract_segment, pdf_path, first, last, False)
+        if name in self.staged:
+            return self.staged[name]
+        started = time.monotonic()
+        data = await self._cut(pdf_path, first, last, self.relay_compact_dpi)
         if len(data) > RELAY_MAX_BYTES and last > first:
             print(f"[ocr] {name}: {len(data) >> 20} MiB, splitting for the relay", flush=True)
             raise _SplitSegment
+        if not self.relay_url:
+            return None
+        try:
+            url = await self._relay_upload(data, name)
+        except (OcrFatalError, OcrRetryableError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - refused upload, odd answer
+            self._abandon_relay(f"{name}: {type(exc).__name__}: {exc}")
+            return None
+        self.staged[name] = (url, len(data))
+        print(f"[ocr] {name}: {len(data) >> 10} KiB on the relay in "
+              f"{time.monotonic() - started:.1f}s", flush=True)
+        return self.staged[name]
+
+    async def _submit_relay(self, pdf_path: Path, first: int, last: int,
+                            name: str) -> tuple[str, dict[str, str]] | None:
+        """Let the service fetch the staged segment from the relay; ``None`` means upload."""
+        staged = await self._stage_relay(pdf_path, first, last, name)
+        if staged is None:
+            return None
+        url, size = staged
         started = time.monotonic()
         headers = self._next_token_headers()
         try:
-            url = await self._relay_upload(data, name)
             response = await self.client.post(
                 self.job_url,
                 headers=headers,
                 json={"fileUrl": url, "model": self.model,
                       "pageRanges": f"1-{last - first + 1}", "optionalPayload": OPTIONAL_PAYLOAD},
-                timeout=link_submit_timeout(len(data)),
+                timeout=link_submit_timeout(size),
             )
             job_id = self._check_owned(response, headers)["jobId"]
         except (OcrFatalError, OcrRetryableError):
             raise
-        except Exception as exc:  # noqa: BLE001 - refused upload, rejected link, odd answer
+        except httpx.TimeoutException as exc:
+            raise OcrFetchTimeout(f"no answer from the service: {type(exc).__name__}") from exc
+        except httpx.TransportError as exc:
+            raise OcrRetryableError(f"submission failed: {type(exc).__name__}") from exc
+        except Exception as exc:  # noqa: BLE001 - rejected link, odd answer
             self._abandon_relay(f"{name}: {type(exc).__name__}: {exc}")
             return None
         self.stats["jobs"] += 1
         self.stats["relay_jobs"] += 1
         print(f"[ocr] {name}: job {job_id} submitted through the relay "
-              f"({len(data) >> 10} KiB in {time.monotonic() - started:.1f}s)", flush=True)
+              f"({size >> 10} KiB in {time.monotonic() - started:.1f}s)", flush=True)
         return job_id, headers
+
+    async def _cut(self, pdf_path: Path, first: int, last: int, dpi: int) -> bytes:
+        """The pages as PDF bytes; heavy scans are re-encoded in a worker process."""
+        data = await asyncio.to_thread(cut_segment, pdf_path, first, last)
+        if not dpi or not is_heavy(len(data), first, last):
+            return data
+        small = await self._rasterise(pdf_path, first, last, dpi)
+        return small if len(small) < len(data) else data
+
+    async def _rasterise(self, pdf_path: Path, first: int, last: int, dpi: int) -> bytes:
+        """Threads cannot do this in parallel (it holds the GIL), processes can."""
+        if self.cutters is None:
+            try:
+                self.cutters = ProcessPoolExecutor(
+                    max_workers=CUT_WORKERS, mp_context=multiprocessing.get_context("spawn"))
+            except (OSError, ValueError, NotImplementedError):
+                self.cutters = False
+        if self.cutters:
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self.cutters, rasterise_segment, pdf_path, first, last, dpi)
+            except (BrokenExecutor, OSError) as exc:
+                print(f"[ocr] worker processes unavailable ({type(exc).__name__}); "
+                      "re-encoding in a thread", flush=True)
+                self.cutters = False
+        return await asyncio.to_thread(rasterise_segment, pdf_path, first, last, dpi)
 
     async def _relay_upload(self, data: bytes, name: str) -> str:
         """Store ``data`` on the relay and return its public link."""
@@ -552,6 +707,9 @@ class PaddleOcr:
                 timeout=self.submit_timeout,
             )
             return self._check_owned(response, headers)["jobId"]
+        except OcrFetchTimeout as exc:
+            self._abandon_link(f"{type(exc).__name__}: {exc}")
+            return None
         except (OcrFatalError, OcrRetryableError):
             # Bad token, used-up quota or a full queue: not the link's fault.
             raise

@@ -66,6 +66,61 @@ class Progress:
         return snapshot
 
 
+async def ready_first(source, wait_ready, lookahead):
+    """Yield the items of ``source`` in the order ``wait_ready(item)`` completes.
+
+    Pages are rendered in order, but their OCR drafts arrive in whatever order
+    the OCR jobs finish. Handing pages out in page order let a slow segment's
+    pages occupy every worker slot while later segments, already finished, sat
+    idle behind them. At most ``lookahead`` items are held back at once, which
+    also paces the producer. An item whose wait fails is released anyway.
+    """
+    ready = asyncio.Queue()
+    room = asyncio.Semaphore(max(1, lookahead))
+    finished = object()
+    waiters = set()
+    failure = []
+
+    async def release(item):
+        try:
+            await wait_ready(item)
+        except Exception:  # noqa: BLE001 - the consumer decides what a missing draft means
+            pass
+        ready.put_nowait(item)
+
+    async def feed():
+        try:
+            async for item in source:
+                await room.acquire()
+                task = asyncio.create_task(release(item))
+                waiters.add(task)
+                task.add_done_callback(waiters.discard)
+            while waiters:
+                await asyncio.wait(list(waiters))
+        except Exception as exc:  # noqa: BLE001 - reported to the consumer after the queue drains
+            failure.append(exc)
+            while waiters:
+                await asyncio.wait(list(waiters))
+        finally:
+            ready.put_nowait(finished)
+
+    feeder = asyncio.create_task(feed())
+    try:
+        while True:
+            item = await ready.get()
+            if item is finished:
+                break
+            room.release()
+            yield item
+        if failure:
+            raise failure[0]
+    finally:
+        feeder.cancel()
+        for task in list(waiters):
+            task.cancel()
+        await asyncio.gather(feeder, *waiters, return_exceptions=True)
+
+
 def retry_delay(round_number):
     # Delay belongs to this failed page; workers remain available for other pages.
     base = min(60.0, 5.0 * 2 ** (round_number - 2))

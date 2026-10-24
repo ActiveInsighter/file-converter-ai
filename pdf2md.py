@@ -38,8 +38,10 @@ from artifacts import prepare_directories, validate_output_name, write_result
 from downloads import download_pdf, is_google_drive_url
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
-from paddle_ocr import JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
-from pipeline import Progress, schedule_chunks
+from paddle_ocr import (
+    COMPACT_DPI, JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens,
+)
+from pipeline import Progress, ready_first, schedule_chunks
 from providers import (
     GEMINI,
     Provider,
@@ -708,7 +710,7 @@ async def process_pages(
                 async for page in pages:
                     yield page
 
-        async def source():
+        async def rendered_in_order():
             # With neighbours attached a page waits until the next one is
             # rendered, so its request can carry the top of that page.
             held: Page | None = None
@@ -723,6 +725,18 @@ async def process_pages(
             if held is not None:
                 started_at.setdefault(held.stem, time.monotonic())
                 yield held
+
+        async def draft_ready(page: Page) -> None:
+            if ocr is not None and not page.blank:
+                await ocr.page(page.number)
+
+        def source():
+            if ocr is None or not ocr.enabled:
+                return rendered_in_order()
+            # Worker slots go to pages whose OCR draft exists, whatever order
+            # the OCR jobs finished in; render ahead far enough to see the
+            # next finished segment behind a slow one.
+            return ready_first(rendered_in_order(), draft_ready, max(60, 3 * concurrency))
 
         def neighbour(number: int) -> Page | None:
             page = rendered.get(number) if adjacent_pages else None
@@ -976,6 +990,14 @@ def parser() -> argparse.ArgumentParser:
             "by PaddleOCR from the relay. Empty uploads segments directly."
         ),
     )
+    p.add_argument(
+        "--ocr-relay-dpi", type=int, default=COMPACT_DPI,
+        help=(
+            "Resolution of the JPEG page images that replace heavy scanned pages in the "
+            "segments put on the relay (4-8x smaller, so jobs start sooner). 0 sends the "
+            "original page images."
+        ),
+    )
     p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
                    help="Pages per PaddleOCR job.")
     p.add_argument("--ocr-parallel-jobs", type=int, default=PARALLEL_JOBS,
@@ -1139,6 +1161,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("ocr_url must be an absolute http(s) URL")
     if not 1 <= args.ocr_parallel_jobs <= 10:
         raise ValueError("ocr_parallel_jobs must be between 1 and 10")
+    if args.ocr_relay_dpi != 0 and not 72 <= args.ocr_relay_dpi <= 300:
+        raise ValueError("ocr_relay_dpi must be 0 or between 72 and 300")
     if not 1 <= args.ocr_segment_pages <= 100:
         raise ValueError("ocr_segment_pages must be between 1 and 100")
     if not 72 <= args.dpi <= 300:
@@ -1216,7 +1240,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
-        f"ocr_source={args.ocr_source} "
+        f"ocr_source={args.ocr_source} ocr_relay_dpi={args.ocr_relay_dpi} "
         f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
         f"concurrency={args.concurrency} "
         f"thinking_level={args.thinking_level} "
@@ -1293,7 +1317,8 @@ async def async_main(args: argparse.Namespace) -> int:
                         parallel_jobs=args.ocr_parallel_jobs,
                         source_url=args.source_url if fetchable else None,
                         relay_url=args.ocr_relay_url or None,
-                        relay_token=os.getenv("PDF_RELAY_TOKEN"))
+                        relay_token=os.getenv("PDF_RELAY_TOKEN"),
+                        relay_compact_dpi=args.ocr_relay_dpi)
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(
