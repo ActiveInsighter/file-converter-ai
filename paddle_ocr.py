@@ -54,7 +54,7 @@ RAMP_SEGMENT_PAGES = (5, 10, 15)
 TARGET_UPLOAD_BYTES = 1024 * 1024
 #: The service accepts only a few pending jobs per user and answers 10010
 #: (queue full) beyond that, after the upload has already been paid for.
-PARALLEL_JOBS = 3
+PARALLEL_JOBS = 5
 POLL_SECONDS = 3.0
 JOB_TIMEOUT_SECONDS = 900.0
 #: The service downloads the whole linked file while each submission is open:
