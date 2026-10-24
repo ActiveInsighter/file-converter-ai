@@ -338,10 +338,27 @@ def repair_multiline_math_delimiters(text: str) -> tuple[str, list[int]]:
     return result, remaining
 
 
+#: A page that is this long, or repeats one short unit this many times in a
+#: row, is the model looping (run 134: three pages of 36-105k characters of
+#: `&nbsp;` table padding where the same page had 2.6k). Indentation padding
+#: legitimately repeats up to ~120 times, and real pages stay far below this.
+RUNAWAY_PAGE_CHARS = 30_000
+RUNAWAY_REPEATS = 400
+_RUNAWAY_RUN = re.compile(r"(.{1,40}?)\1{%d,}" % (RUNAWAY_REPEATS - 1), re.S)
+
+
 def validate_markdown_output(text: str) -> None:
     """Reject clear formatting failures so the request can be retried."""
     if "\ufffd" in text:
         raise RuntimeError("Markdown contains Unicode replacement characters")
+
+    if len(text) > RUNAWAY_PAGE_CHARS:
+        raise RuntimeError(f"Markdown runs away: {len(text)} characters for one page")
+    run = _RUNAWAY_RUN.search(text)
+    if run:
+        raise RuntimeError(
+            f"Markdown repeats {run.group(1)[:20]!r} {len(run.group(0)) // len(run.group(1))} times in a row"
+        )
 
     if "此行视具体排版" in text:
         raise RuntimeError("Markdown contains model-side layout commentary")

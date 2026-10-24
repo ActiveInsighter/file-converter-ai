@@ -23,6 +23,7 @@ from pdf2md import (
     keep_known_figures,
     make_request_parts,
     page_ink_stats,
+    validate_markdown_output,
 )
 from providers import GEMINI
 
@@ -111,6 +112,22 @@ class RequestPartsTests(unittest.TestCase):
         text = "a ![](images/p001-1.jpg) b ![x](images/made-up.png) c"
         kept = keep_known_figures(text, {"images/p001-1.jpg": Path("x")})
         self.assertEqual(kept, "a ![](images/p001-1.jpg) b  c")
+
+
+class RunawayOutputTests(unittest.TestCase):
+    def test_table_indentation_and_ordinary_pages_are_accepted(self):
+        validate_markdown_output("| a | b |\n" + "&nbsp;" * 120 + "text\n" + "\u3000" * 80)
+        validate_markdown_output("".join(f"第 {number} 句：正文内容 $x_{number}$。\n" for number in range(800)))
+
+    def test_a_loop_of_one_unit_is_rejected_so_the_page_is_retried(self):
+        for padding in ("&nbsp;", "\u3000", "\\ ", "| 主 句 |"):
+            with self.assertRaisesRegex(RuntimeError, "repeats"):
+                validate_markdown_output("<table>" + padding * 1900 + "</table>")
+
+    def test_a_page_of_tens_of_thousands_of_characters_is_rejected(self):
+        rows = "".join(f"<tr><td>row {number}</td></tr>\n" for number in range(2500))
+        with self.assertRaisesRegex(RuntimeError, "runs away"):
+            validate_markdown_output(rows)
 
 
 class PageFlowTests(unittest.IsolatedAsyncioTestCase):
