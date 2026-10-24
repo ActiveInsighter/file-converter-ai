@@ -20,7 +20,7 @@ class BuiltInPromptTests(unittest.TestCase):
     def test_updated_default_prefers_text_transcription_without_losing_diagrams(self):
         # The Remote-saved prompt is independent and is not overwritten by code.
         self.assertIn("纯文本框和普通表格", DEFAULT_PROMPT)
-        self.assertIn("只有已完整转写", DEFAULT_PROMPT.replace("仅当该区域的全部有效文字已完整转写时", "只有已完整转写"))
+        self.assertIn("仅当该区域的全部有效文字已完整转写时", DEFAULT_PROMPT)
         self.assertIn("无法无损文字化", DEFAULT_PROMPT)
 
     def test_the_built_in_prompt_has_no_surrounding_whitespace(self):
