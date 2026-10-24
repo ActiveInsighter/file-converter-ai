@@ -38,8 +38,10 @@ from artifacts import prepare_directories, validate_output_name, write_result
 from downloads import download_pdf, is_google_drive_url
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from paddle_ocr import DEFAULT_MODEL as DEFAULT_OCR_MODEL
-from paddle_ocr import JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens
-from pipeline import Progress, schedule_chunks
+from paddle_ocr import (
+    COMPACT_DPI, JOB_URL, PARALLEL_JOBS, SEGMENT_PAGES, OcrPage, PaddleOcr, parse_tokens,
+)
+from pipeline import Progress, ready_first, schedule_chunks
 from providers import (
     GEMINI,
     Provider,
@@ -53,6 +55,7 @@ from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
 from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt
+from markdown_quality import clean_layout_markup
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -336,10 +339,27 @@ def repair_multiline_math_delimiters(text: str) -> tuple[str, list[int]]:
     return result, remaining
 
 
+#: A page that is this long, or repeats one short unit this many times in a
+#: row, is the model looping (run 134: three pages of 36-105k characters of
+#: `&nbsp;` table padding where the same page had 2.6k). Indentation padding
+#: legitimately repeats up to ~120 times, and real pages stay far below this.
+RUNAWAY_PAGE_CHARS = 30_000
+RUNAWAY_REPEATS = 400
+_RUNAWAY_RUN = re.compile(r"(.{1,40}?)\1{%d,}" % (RUNAWAY_REPEATS - 1), re.S)
+
+
 def validate_markdown_output(text: str) -> None:
     """Reject clear formatting failures so the request can be retried."""
     if "\ufffd" in text:
         raise RuntimeError("Markdown contains Unicode replacement characters")
+
+    if len(text) > RUNAWAY_PAGE_CHARS:
+        raise RuntimeError(f"Markdown runs away: {len(text)} characters for one page")
+    run = _RUNAWAY_RUN.search(text)
+    if run:
+        raise RuntimeError(
+            f"Markdown repeats {run.group(1)[:20]!r} {len(run.group(0)) // len(run.group(1))} times in a row"
+        )
 
     if "此行视具体排版" in text:
         raise RuntimeError("Markdown contains model-side layout commentary")
@@ -708,7 +728,7 @@ async def process_pages(
                 async for page in pages:
                     yield page
 
-        async def source():
+        async def rendered_in_order():
             # With neighbours attached a page waits until the next one is
             # rendered, so its request can carry the top of that page.
             held: Page | None = None
@@ -723,6 +743,18 @@ async def process_pages(
             if held is not None:
                 started_at.setdefault(held.stem, time.monotonic())
                 yield held
+
+        async def draft_ready(page: Page) -> None:
+            if ocr is not None and not page.blank:
+                await ocr.page(page.number)
+
+        def source():
+            if ocr is None or not ocr.enabled:
+                return rendered_in_order()
+            # Worker slots go to pages whose OCR draft exists, whatever order
+            # the OCR jobs finished in; render ahead far enough to see the
+            # next finished segment behind a slow one.
+            return ready_first(rendered_in_order(), draft_ready, max(60, 3 * concurrency))
 
         def neighbour(number: int) -> Page | None:
             page = rendered.get(number) if adjacent_pages else None
@@ -821,9 +853,23 @@ async def process_pages(
                     )
                     await asyncio.sleep(pause)
                     continue
-                text = keep_known_figures(text, figures)
+                text = clean_layout_markup(keep_known_figures(text, figures))
+                original_links = set(figures_used(draft or ""))
+                retained_links = set(figures_used(text))
+                missing_links = original_links - retained_links
+                if missing_links:
+                    print(
+                        f"[figure-audit] {page.stem}: final Markdown retained "
+                        f"{len(original_links) - len(missing_links)}/"
+                        f"{len(original_links)} OCR figure links; "
+                        "verify removed crops were fully transcribed as text",
+                        flush=True,
+                    )
                 return record_success(
                     page, text, estimated, "ocr+model" if draft is not None else "model",
+                    figure_audit={"ocr_links": len(original_links),
+                                  "retained": len(original_links) - len(missing_links),
+                                  "dropped": len(missing_links)},
                     stage_seconds={"ocr_wait": round(ocr_wait, 3),
                                    "model_including_quota_wait": round(time.monotonic() - model_started, 3)},
                 )
@@ -838,7 +884,7 @@ async def process_pages(
                     flush=True,
                 )
                 return record_success(
-                    page, draft, 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
+                    page, clean_layout_markup(draft), 0, "ocr", fallback_reason=f"{type(exc).__name__}: {exc}"[:500]
                 )
             error = {
                 "chunk": page.stem,
@@ -974,6 +1020,14 @@ def parser() -> argparse.ArgumentParser:
             "Upload relay for OCR segments (token in PDF_RELAY_TOKEN). Large or "
             "unfetchable sources are cut into segments, stored there and fetched "
             "by PaddleOCR from the relay. Empty uploads segments directly."
+        ),
+    )
+    p.add_argument(
+        "--ocr-relay-dpi", type=int, default=COMPACT_DPI,
+        help=(
+            "Resolution of the JPEG page images that replace heavy scanned pages in the "
+            "segments put on the relay (4-8x smaller, so jobs start sooner). 0 sends the "
+            "original page images."
         ),
     )
     p.add_argument("--ocr-segment-pages", type=int, default=SEGMENT_PAGES,
@@ -1139,6 +1193,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("ocr_url must be an absolute http(s) URL")
     if not 1 <= args.ocr_parallel_jobs <= 10:
         raise ValueError("ocr_parallel_jobs must be between 1 and 10")
+    if args.ocr_relay_dpi != 0 and not 72 <= args.ocr_relay_dpi <= 300:
+        raise ValueError("ocr_relay_dpi must be 0 or between 72 and 300")
     if not 1 <= args.ocr_segment_pages <= 100:
         raise ValueError("ocr_segment_pages must be between 1 and 100")
     if not 72 <= args.dpi <= 300:
@@ -1216,7 +1272,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
-        f"ocr_source={args.ocr_source} "
+        f"ocr_source={args.ocr_source} ocr_relay_dpi={args.ocr_relay_dpi} "
         f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
         f"concurrency={args.concurrency} "
         f"thinking_level={args.thinking_level} "
@@ -1293,7 +1349,8 @@ async def async_main(args: argparse.Namespace) -> int:
                         parallel_jobs=args.ocr_parallel_jobs,
                         source_url=args.source_url if fetchable else None,
                         relay_url=args.ocr_relay_url or None,
-                        relay_token=os.getenv("PDF_RELAY_TOKEN"))
+                        relay_token=os.getenv("PDF_RELAY_TOKEN"),
+                        relay_compact_dpi=args.ocr_relay_dpi)
         ocr_task = ocr.start(source_pdf, plan.first, plan.last, plan.width)
         try:
             results = await process_pages(

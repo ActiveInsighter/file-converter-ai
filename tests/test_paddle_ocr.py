@@ -16,6 +16,7 @@ from paddle_ocr import (
     normalize_markdown,
     parse_tokens,
     plan_segments,
+    ramp_segments,
     tidy_inline_math,
 )
 
@@ -147,18 +148,18 @@ class SegmentTests(unittest.TestCase):
 
 class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
     async def run_ocr(self, service, pages=5, segment=2, tokens=("t1", "t2"), source_url=None,
-                      relay=False):
+                      relay=False, make_pdf=write_pdf, **options):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        pdf = write_pdf(root / "source.pdf", pages)
+        pdf = make_pdf(root / "source.pdf", pages)
         service.source = pdf
         async with httpx.AsyncClient(transport=httpx.MockTransport(service.handler)) as client:
             ocr = PaddleOcr(list(tokens), client=client, work_dir=root / "state", job_url=JOBS,
                             segment_pages=segment, poll_seconds=0, retry_pause=0,
                             source_url=source_url,
                             relay_url=RELAY if relay else None,
-                            relay_token="relay-secret" if relay else None)
+                            relay_token="relay-secret" if relay else None, **options)
             task = ocr.start(pdf, 1, pages, 3)
             results = {number: await ocr.page(number) for number in range(1, pages + 1)}
             if task is not None:
@@ -323,6 +324,164 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (0, 2))
         self.assertTrue(all(page is not None for page in results.values()))
 
+    @staticmethod
+    def first_page_of(service, url):
+        with fitz.open(stream=service.relayed[url], filetype="pdf") as document:
+            return document[0].get_text().strip()
+
+    async def test_a_fetch_timeout_is_retried_on_the_link_already_on_the_relay(self):
+        # A single HTTP 408 used to drop the relay for the rest of the run and
+        # upload every remaining segment at 20-25 KB/s.
+        service = FakeService()
+        respond, refused = service.handler, []
+
+        def handler(request):
+            if (request.method == "POST" and request.headers["Content-Type"] == "application/json"
+                    and not refused):
+                refused.append(request)
+                return httpx.Response(408, json={"code": 408, "msg": "Request Timeout"})
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual(len(service.relayed), 1, "the segment is not uploaded to the relay twice")
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (1, 0))
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_silent_service_is_retried_on_the_relay_instead_of_dropping_it(self):
+        service = FakeService()
+        respond, silent = service.handler, []
+
+        def handler(request):
+            if (request.method == "POST" and request.headers["Content-Type"] == "application/json"
+                    and not silent):
+                silent.append(request)
+                raise httpx.ReadTimeout("no answer", request=request)
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (1, 0))
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_segment_the_service_cannot_fetch_is_uploaded_alone(self):
+        service = FakeService()
+        respond = service.handler
+
+        def handler(request):
+            if request.method == "POST" and request.headers["Content-Type"] == "application/json":
+                link = json.loads(request.read())["fileUrl"]
+                if self.first_page_of(service, link) == "Page 1":
+                    return httpx.Response(408, json={"code": 408, "msg": "Request Timeout"})
+            return respond(request)
+
+        service.handler = handler
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, relay=True)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (1, 1))
+        self.assertIsNotNone(ocr.relay_url, "the relay stays in use for the other segments")
+        self.assertEqual([page.markdown.split()[-2] for page in results.values()],
+                         ["1", "2", "3", "4"])
+
+    def stalling(self, service, stalls):
+        """The first ``stalls`` jobs never finish."""
+        respond, submitted = service.handler, []
+
+        def handler(request):
+            url = str(request.url)
+            if request.method == "POST" and request.headers["Content-Type"] == "application/json":
+                response = respond(request)
+                submitted.append(response.json()["data"]["jobId"])
+                return response
+            if url.startswith(JOBS + "/") and url.rsplit("/", 1)[1] in submitted[:stalls]:
+                return httpx.Response(200, json={"code": 0, "data": {"state": "running"}})
+            return respond(request)
+
+        service.handler = handler
+
+    async def test_a_stalled_relay_job_is_submitted_again_on_the_same_link(self):
+        # Run 133: one OCR job did not answer for 5 minutes, the relay was dropped
+        # for the whole run and 8 small uploads at ~15 KB/s cost 4 more minutes.
+        from unittest.mock import patch
+        service = FakeService()
+        self.stalling(service, 1)
+        with patch("paddle_ocr.RELAY_JOB_TIMEOUT", 0.2):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual(len(service.relayed), 1, "the segment is not uploaded to the relay again")
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (2, 0))
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_failed_relay_job_does_not_drop_the_relay(self):
+        service = FakeService({"Page 1": ["fail"]})
+        ocr, results, _ = await self.run_ocr(service, pages=4, segment=2, relay=True)
+        self.assertIsNotNone(ocr.relay_url)
+        self.assertEqual(ocr.stats["uploaded_jobs"], 0)
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_a_segment_whose_relay_jobs_keep_stalling_is_uploaded_alone(self):
+        from unittest.mock import patch
+        service = FakeService()
+        self.stalling(service, 3)
+        with patch("paddle_ocr.RELAY_JOB_TIMEOUT", 0.1):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertEqual((ocr.stats["relay_jobs"], ocr.stats["uploaded_jobs"]), (3, 1))
+        self.assertIsNotNone(ocr.relay_url, "later segments keep using the relay")
+        self.assertTrue(all(page is not None for page in results.values()))
+
+    async def test_the_next_segment_is_on_the_relay_before_the_running_job_finishes(self):
+        service = FakeService()
+        respond, events = service.handler, []
+
+        def handler(request):
+            url = str(request.url)
+            if request.method == "PUT":
+                events.append("put")
+            elif url.startswith(JOBS + "/"):
+                response = respond(request)
+                if response.json()["data"]["state"] == "done":
+                    events.append("done")
+                return response
+            return respond(request)
+
+        service.handler = handler
+        await self.run_ocr(service, pages=3, segment=1, relay=True, parallel_jobs=1)
+        self.assertEqual(events.count("put"), 3)
+        self.assertLess(events.index("put", events.index("put") + 1), events.index("done"),
+                        "segment 2 was staged while job 1 was still running")
+
+    async def test_heavy_scans_are_reencoded_before_they_go_on_the_relay(self):
+        def scanned(path, pages):
+            with fitz.open() as text, fitz.open() as document:
+                source = text.new_page()
+                for line in range(60):
+                    source.insert_text((40, 30 + line * 13), f"Line {line} " * 12, fontsize=9)
+                scan = source.get_pixmap(dpi=300).tobytes("jpeg", jpg_quality=95)
+                for _ in range(pages):
+                    document.new_page().insert_image(fitz.Rect(0, 0, 595, 842), stream=scan)
+                document.save(path)
+            return path
+
+        sizes = {}
+        for dpi in (150, 0):
+            service = FakeService()
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True,
+                                                 make_pdf=scanned, relay_compact_dpi=dpi)
+            self.assertTrue(all(page is not None for page in results.values()))
+            sizes[dpi] = len(next(iter(service.relayed.values())))
+        self.assertLess(sizes[150], sizes[0] / 2)
+
+    async def test_reencoding_still_works_when_worker_processes_are_unavailable(self):
+        from unittest.mock import patch
+        service = FakeService()
+        with patch("paddle_ocr.ProcessPoolExecutor", side_effect=OSError("no processes")), \
+                patch("paddle_ocr.COMPACT_ABOVE_BYTES_PER_PAGE", 1):
+            ocr, results, _ = await self.run_ocr(service, pages=2, segment=2, relay=True)
+        self.assertIs(ocr.cutters, False)
+        self.assertEqual(ocr.stats["relay_jobs"], 1)
+        self.assertTrue(all(page is not None for page in results.values()))
+
     async def test_a_full_queue_is_retried_on_the_same_link(self):
         link = "https://files.test/book.pdf"
         service = FakeService(accepted_links={link})
@@ -401,6 +560,14 @@ class MarkdownNormalizationTests(unittest.TestCase):
 class HelperTests(unittest.TestCase):
     def test_segments_cover_the_range(self):
         self.assertEqual(plan_segments(3, 9, 3), [(3, 5), (6, 8), (9, 9)])
+
+    def test_the_first_segments_are_small_so_the_model_starts_early(self):
+        self.assertEqual(ramp_segments(1, 100, 25),
+                         [(1, 5), (6, 15), (16, 30), (31, 55), (56, 80), (81, 100)])
+        self.assertEqual(ramp_segments(1, 8, 25), [(1, 5), (6, 8)])
+        self.assertEqual(ramp_segments(1, 3, 25), [(1, 3)])
+        self.assertEqual(ramp_segments(3, 9, 6), [(3, 7), (8, 9)])
+        self.assertEqual(ramp_segments(1, 40, 4), plan_segments(1, 40, 4), "no ramp for small segments")
 
     def test_tokens_are_split_and_deduplicated(self):
         self.assertEqual(parse_tokens(" a\nb, a ;\n"), ["a", "b"])

@@ -1,0 +1,66 @@
+name: OCR quality 2-page A/B (experimental)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SOURCE_URL: https://ocr-files.any1.tech/0af7d238-f02c-410f-89d5-0ec9c281590c.pdf
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      PADDLEOCR_TOKENS: ${{ secrets.BAIDU_AI_STUDIO }}
+      GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
+      PDF_RELAY_TOKEN: ${{ secrets.PDF_RELAY_TOKEN }}
+    steps:
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: baseline
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: codex/ocr-text-first-markdown-quality-20261024
+          path: candidate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r candidate/requirements.txt
+      - name: Baseline pages 7-8
+        shell: bash
+        run: |
+          set +e
+          python baseline/pdf2md.py --source-url "${SOURCE_URL}" --output-name sample --work-dir "${RUNNER_TEMP}/baseline-work" --output-dir "${RUNNER_TEMP}/baseline-out" --start-page 7 --end-page 8 --ocr paddle --ocr-segment-pages 2 --ocr-parallel-jobs 1 --model gemini-3.5-flash-lite --concurrency 2 --retry-rounds 2 --attempts-per-page 1 --hedge-budget 0 --dpi 240 --image-format png --media-resolution ultra_high --thinking-level high
+          echo "baseline_exit=$?" >> "${GITHUB_ENV}"
+          exit 0
+      - name: Candidate pages 7-8
+        shell: bash
+        run: |
+          set +e
+          python candidate/pdf2md.py --source-url "${SOURCE_URL}" --output-name sample --work-dir "${RUNNER_TEMP}/candidate-work" --output-dir "${RUNNER_TEMP}/candidate-out" --start-page 7 --end-page 8 --ocr paddle --ocr-segment-pages 2 --ocr-parallel-jobs 1 --model gemini-3.5-flash-lite --concurrency 2 --retry-rounds 2 --attempts-per-page 1 --hedge-budget 0 --dpi 240 --image-format png --media-resolution ultra_high --thinking-level high
+          echo "candidate_exit=$?" >> "${GITHUB_ENV}"
+          exit 0
+      - name: Compare structural output
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json,sys
+          sys.path.insert(0, str(Path("candidate").resolve()))
+          from markdown_quality import markdown_quality_metrics
+          for title in ("baseline", "candidate"):
+              target = Path(__import__('os').environ['RUNNER_TEMP']) / f"{title}-out" / "sample.md"
+              if not target.is_file():
+                  print(f"[ab-result] {title}: no Markdown (download/API may be unavailable)")
+                  continue
+              report = markdown_quality_metrics(target.read_text(encoding="utf-8"))
+              print("[ab-result]", title, json.dumps(
+                  {k:v for k,v in report.items() if k not in ("pages_by_number", "image_heavy_pages")},
+                  ensure_ascii=False))
+          PY
+          echo "baseline exit=${baseline_exit}; candidate exit=${candidate_exit}"

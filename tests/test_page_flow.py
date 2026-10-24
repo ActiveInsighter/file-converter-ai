@@ -1,4 +1,5 @@
 """One page: OCR draft -> model refinement, and every way it can fall back."""
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ from pdf2md import (
     keep_known_figures,
     make_request_parts,
     page_ink_stats,
+    validate_markdown_output,
 )
 from providers import GEMINI
 
@@ -112,6 +114,22 @@ class RequestPartsTests(unittest.TestCase):
         self.assertEqual(kept, "a ![](images/p001-1.jpg) b  c")
 
 
+class RunawayOutputTests(unittest.TestCase):
+    def test_table_indentation_and_ordinary_pages_are_accepted(self):
+        validate_markdown_output("| a | b |\n" + "&nbsp;" * 120 + "text\n" + "\u3000" * 80)
+        validate_markdown_output("".join(f"第 {number} 句：正文内容 $x_{number}$。\n" for number in range(800)))
+
+    def test_a_loop_of_one_unit_is_rejected_so_the_page_is_retried(self):
+        for padding in ("&nbsp;", "\u3000", "\\ ", "| 主 句 |"):
+            with self.assertRaisesRegex(RuntimeError, "repeats"):
+                validate_markdown_output("<table>" + padding * 1900 + "</table>")
+
+    def test_a_page_of_tens_of_thousands_of_characters_is_rejected(self):
+        rows = "".join(f"<tr><td>row {number}</td></tr>\n" for number in range(2500))
+        with self.assertRaisesRegex(RuntimeError, "runs away"):
+            validate_markdown_output(rows)
+
+
 class PageFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_refines_the_ocr_draft(self):
         seen = []
@@ -128,6 +146,30 @@ class PageFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["source"], "ocr+model")
         self.assertEqual(results[0]["figures"], ["images/p001-1.jpg"])
         self.assertEqual(written, "# Refined ![](images/p001-1.jpg)\n")
+
+    async def test_a_slow_ocr_segment_does_not_hold_back_pages_that_are_ready(self):
+        gate = asyncio.Event()
+        calls = []
+
+        class GatedOcr(FakeOcr):
+            async def page(self, number):
+                if number == 1:
+                    await gate.wait()
+                return await super().page(number)
+
+        async def model(_c, _p, _prov, _m, parts, name, *_rest):
+            calls.append(name)
+            if name == "003":
+                gate.set()
+            return "# text"
+
+        ocr = GatedOcr({number: f"draft {number}" for number in (1, 2, 3)})
+        with tempfile.TemporaryDirectory() as directory:
+            results = await asyncio.wait_for(
+                run_process_pages([page(1), page(2), page(3)], directory, model, ocr=ocr), 5)
+        self.assertEqual(calls, ["002", "003", "001"])
+        self.assertEqual(sorted(r["chunk"] for r in results), ["001", "002", "003"])
+        self.assertTrue(all(r["status"] == "ok" for r in results))
 
     async def test_adjacent_pages_attach_rendered_non_blank_neighbours(self):
         seen = {}

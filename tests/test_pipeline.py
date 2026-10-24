@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline import Progress, schedule_chunks
+from pipeline import Progress, ready_first, schedule_chunks
 from request_policy import RequestPolicy
 
 
@@ -66,6 +66,90 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await schedule_chunks(source(), run, 1, 1, progress)
             self.assertEqual(progress.snapshot()['state'], 'failed')
             self.assertTrue((Path(root) / 'progress.json').exists())
+
+
+class ReadyFirstTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    async def numbers(count, pulled=None):
+        for number in range(1, count + 1):
+            if pulled is not None:
+                pulled.append(number)
+            yield number
+
+    async def test_items_come_out_in_the_order_they_become_ready(self):
+        gates = {number: asyncio.Event() for number in (1, 2, 3)}
+        order = []
+
+        async def wait_ready(item):
+            await gates[item].wait()
+
+        async def consume():
+            async for item in ready_first(self.numbers(3), wait_ready, 10):
+                order.append(item)
+                if len(order) == 1:
+                    gates[1].set()
+                if len(order) == 2:
+                    gates[2].set()
+
+        gates[3].set()
+        await asyncio.wait_for(consume(), 1)
+        self.assertEqual(order, [3, 1, 2])
+
+    async def test_only_the_lookahead_is_rendered_ahead_of_the_consumer(self):
+        pulled = []
+        release = asyncio.Event()
+
+        async def wait_ready(_item):
+            await release.wait()
+
+        stream = ready_first(self.numbers(10, pulled), wait_ready, 3)
+        first = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(pulled), 4, "three held back plus the one waiting for room")
+        release.set()
+        await asyncio.wait_for(first, 1)
+        await stream.aclose()
+
+    async def test_an_item_whose_wait_fails_is_still_released(self):
+        async def wait_ready(item):
+            if item == 2:
+                raise RuntimeError("draft lost")
+
+        items = [item async for item in ready_first(self.numbers(3), wait_ready, 5)]
+        self.assertEqual(sorted(items), [1, 2, 3])
+
+    async def test_a_failing_source_delivers_what_it_produced_then_raises(self):
+        async def broken():
+            yield 1
+            yield 2
+            raise ValueError("broken render")
+
+        async def wait_ready(_item):
+            return None
+
+        seen = []
+        with self.assertRaisesRegex(ValueError, "broken render"):
+            async for item in ready_first(broken(), wait_ready, 5):
+                seen.append(item)
+        self.assertEqual(sorted(seen), [1, 2])
+
+    async def test_closing_early_cancels_every_waiter(self):
+        started = []
+
+        async def wait_ready(item):
+            started.append(item)
+            await asyncio.Event().wait()
+
+        stream = ready_first(self.numbers(4), wait_ready, 4)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await stream.aclose()
+        await asyncio.sleep(0)
+        leftovers = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        self.assertEqual(len(started), 4)
+        self.assertEqual(leftovers, [])
 
 
 class HedgeTests(unittest.IsolatedAsyncioTestCase):
