@@ -703,12 +703,18 @@ class PaddleOcr:
         if not self.remote_url:
             return None
         headers = self._next_token_headers()
-        if self.remote_proven:
-            job_id = await self._post_link(first, last, headers)
-        else:
+        job_id: str | None = None
+        submitted = False
+        if not self.remote_proven:
             async with self.remote_lock:
-                job_id = await self._post_link(first, last, headers)
-                self.remote_proven = job_id is not None
+                # Segments that queued on the lock while the probe was running
+                # must not be serialised behind it once the link is proven.
+                if not self.remote_proven:
+                    job_id = await self._post_link(first, last, headers)
+                    self.remote_proven = job_id is not None
+                    submitted = True
+        if not submitted:
+            job_id = await self._post_link(first, last, headers)
         if job_id is None:
             return None
         self.stats["jobs"] += 1
