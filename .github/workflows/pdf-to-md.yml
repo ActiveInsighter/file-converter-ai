@@ -181,7 +181,7 @@ jobs:
       OCR: ${{ vars.CONVERTER_OCR || 'paddle' }}
       OCR_PARALLEL_JOBS: ${{ vars.CONVERTER_OCR_JOBS || '5' }}
       OCR_SOURCE: ${{ vars.CONVERTER_OCR_SOURCE || 'link' }}
-      OCR_RELAY_DPI: ${{ vars.CONVERTER_OCR_RELAY_DPI || '150' }}
+      OCR_RELAY_DPI: ${{ vars.CONVERTER_OCR_RELAY_DPI || '0' }}
       PDF_RELAY_URL: ${{ vars.CONVERTER_PDF_RELAY_URL || 'https://awremote.any1.tech/api/file-conversion/relay' }}
       PDF_RELAY_TOKEN: ${{ secrets.PDF_RELAY_TOKEN }}
       RPM_PER_KEY: ${{ github.event.inputs.rpm_per_key || '15' }}
