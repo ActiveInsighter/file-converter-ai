@@ -29,6 +29,18 @@ class RangesUnsupported(RuntimeError):
     """The origin answered a Range request with something other than that range."""
 
 
+class LibrarySourceUnavailable(RuntimeError):
+    """A reusable source was deleted; another upload/selection is required."""
+
+
+def check_source_response(response: httpx.Response) -> None:
+    if (response.status_code in {404, 410}
+            and urlparse(str(response.url)).path.startswith("/api/library/sources/")):
+        raise LibrarySourceUnavailable(
+            "资料库源文件已删除或不存在，请在资料库重新上传并创建转换任务。")
+    response.raise_for_status()
+
+
 def range_plan(response: httpx.Response) -> tuple[int, dict[str, str]] | None:
     """Size and validator headers when the response promises byte ranges worth using."""
     if not hasattr(os, "pwrite"):
@@ -75,6 +87,8 @@ def download_ranges(url: str, destination: Path, total: int, extra_headers: dict
                     try:
                         with client.stream("GET", url, headers={
                                 "Range": f"bytes={start}-{end}", **extra_headers}) as response:
+                            if response.status_code in {404, 410}:
+                                check_source_response(response)
                             if response.status_code != 206:
                                 if response.status_code in {408, 429} or response.status_code >= 500:
                                     response.raise_for_status()
@@ -117,7 +131,7 @@ def download_pdf(source_url: str, destination: Path) -> None:
                         raise RuntimeError("Google Drive download failed. Share the file as Anyone with the link.")
                 else:
                     with httpx.stream("GET", source_url, follow_redirects=True, timeout=120.0) as response:
-                        response.raise_for_status()
+                        check_source_response(response)
                         plan = range_plan(response)
                         if plan is None:
                             with temporary.open("wb") as handle:
@@ -134,7 +148,7 @@ def download_pdf(source_url: str, destination: Path) -> None:
                                   "streaming the whole file instead", flush=True)
                             temporary.unlink(missing_ok=True)
                             with httpx.stream("GET", source_url, follow_redirects=True, timeout=120.0) as whole:
-                                whole.raise_for_status()
+                                check_source_response(whole)
                                 with temporary.open("wb") as handle:
                                     for data in whole.iter_bytes(chunk_size=1024 * 1024):
                                         handle.write(data)

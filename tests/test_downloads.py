@@ -162,3 +162,41 @@ class RangedDownloadTests(unittest.TestCase):
                         {"Content-Length": str(big), "Accept-Ranges": "bytes", "Content-Encoding": "gzip"},
                         {"Accept-Ranges": "bytes"}):
             self.assertIsNone(range_plan(httpx.Response(200, headers=headers, request=request)), headers)
+
+    def test_library_source_can_be_reused_by_independent_jobs(self):
+        url = 'https://preview.example/api/library/sources/fixture.pdf'
+        with tempfile.TemporaryDirectory() as tmp:
+            destinations = [Path(tmp) / 'job-1/source.pdf', Path(tmp) / 'job-2/source.pdf']
+            @contextmanager
+            def stream(*args, **kwargs):
+                yield httpx.Response(200, content=b'%PDF-reusable source', request=httpx.Request('GET', url))
+            with patch('downloads.httpx.stream', stream):
+                for destination in destinations:
+                    download_pdf(url, destination)
+            self.assertEqual([p.read_bytes() for p in destinations], [b'%PDF-reusable source'] * 2)
+
+    def test_deleted_library_source_is_actionable_and_never_retried(self):
+        from downloads import LibrarySourceUnavailable
+        for status in (404, 410):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                destination = Path(tmp) / 'source.pdf'
+                destination.write_bytes(b'previous task source')
+                url = 'https://preview.example/api/library/sources/private-capability.pdf'
+                response = httpx.Response(status, request=httpx.Request('GET', url))
+                with patch('downloads.httpx.stream', return_value=response_context(response)) as request:
+                    with self.assertRaisesRegex(LibrarySourceUnavailable, '资料库源文件已删除') as failure:
+                        download_pdf(url, destination)
+                self.assertNotIn('private-capability', str(failure.exception))
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(destination.read_bytes(), b'previous task source')
+                self.assertFalse(destination.with_suffix('.pdf.part').exists())
+
+    def test_deleted_library_during_range_download_stops_without_fallback(self):
+        from downloads import LibrarySourceUnavailable, download_ranges
+        url = 'https://preview.example/api/library/sources/fixture.pdf'
+        def deleted(request):
+            return httpx.Response(410, request=request)
+        client = httpx.Client(transport=httpx.MockTransport(deleted))
+        with tempfile.TemporaryDirectory() as tmp, patch('downloads.range_client', return_value=client):
+            with self.assertRaises(LibrarySourceUnavailable):
+                download_ranges(url, Path(tmp) / 'source.pdf.part', 100, {})
