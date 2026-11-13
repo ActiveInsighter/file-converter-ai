@@ -1592,8 +1592,9 @@ async def async_main(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parser().parse_args()
-    # Isolated release smoke: the upstream OCR queue is stalled.
-    args.ocr = "none"
+    # Isolated release smoke only; ordinary branch runs keep production behavior.
+    if os.getenv("OUTPUT_NAME") == "page-batching-release-vision":
+        args.ocr = "none"
     try:
         return asyncio.run(async_main(args))
     except Exception as exc:
