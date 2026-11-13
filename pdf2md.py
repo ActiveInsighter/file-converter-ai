@@ -1138,7 +1138,7 @@ async def process_pages(
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--images-per-request", "--pages-per-request", type=int, default=3,
+    p.add_argument("--images-per-request", "--pages-per-request", type=int, default=5,
                    help="Consecutive PDF pages per model request (1-20; default 1).")
     p.add_argument(
         "--conversion-type",
