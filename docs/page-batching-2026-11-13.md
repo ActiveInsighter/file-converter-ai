@@ -1,6 +1,6 @@
 # 每次整理页数：实现与 Gemini 4 Hydrogen 实测
 
-2026-11-13。默认仍为 1 页；Remote「转换配置 → 吞吐与配额 → 每次整理页数」可填写 1–20 的整数。设置 5 时，连续 5 页的原尺寸完整图片和各自 OCR 草稿进入同一模型请求；末组不足 5 页也会发送。没有缩成一张长图。结果严格按 PDF 页码拆回单页文件，再按原顺序合并。
+2026-11-13 已合并并部署到 [生产 Remote](https://awremote.any1.tech/file-converter)，[生产发布工作流成功](https://github.com/ActiveInsighter/Anyworkflow-remote/actions/runs/43351795871)。默认仍为 1 页；Remote「转换配置 → 吞吐与配额 → 每次整理页数」可填写 1–20 的整数。设置 5 时，连续 5 页的原尺寸完整图片和各自 OCR 草稿进入同一模型请求；末组不足 5 页也会发送。没有缩成一张长图。结果严格按 PDF 页码拆回单页文件，再按原顺序合并。
 
 本样本中 **3 页较均衡**：密集公式 15 个抽检细节保留 14 个，模型请求 2 次；1 页与 5 页各保留 12 个。这是人工对照原图选择的局部保真检查，不能当作全文准确率或普遍排名。三档都有同一处负号遗漏，复杂扫描公式仍需要核对。
 
@@ -66,8 +66,10 @@ python benchmarks/score_page_batches.py work/batch-benchmark > work/batch-benchm
 
 已修改 Remote 展示、配置读写链路、配置快照与 Cloudflare / Node 共用的工作流参数白名单。沿用已存在的 `images_per_request` 数据字段，无需数据库迁移；旧任务快照不会被新配置覆盖。
 
-完整转换器改动保存在 `/home/dev/Documents/Project/file-converter-ai/.worktrees/page-batching` 的 `feat/page-batching`。可推送的代码交付分支 `feat/page-batching-code` 附带 `deploy/page-batching-workflow.patch`，包含 workflow 与配套契约测试的补丁。授权 workflow 写入后在代码分支应用补丁，重新验证并发布转换器、Remote 与 converter coordinator。尚未合并主线或部署生产。
+转换器 #34、Remote #47、Workers #26 已合并并部署。完整 workflow 通过 GitHub 连接器原子提交，生产代码已移除临时补丁文件。当前用户配置保持每次 1 页、原 Gemini 4 Hydrogen 模型与 707 字提示词；验证期间创建的任务保留每次 5 页快照。
 
 GitHub workflow 输入已有 25 个，新增批大小输入后，把仅供手动调用的 `model_fallbacks` 移到仓库变量 `CONVERTER_MODEL_FALLBACKS`；CLI `--model-fallbacks` 保留，显式模型仍默认不回退。这是 workflow 手动调用契约的唯一调整。
 
-草稿 PR：[转换器 #34](https://github.com/ActiveInsighter/file-converter-ai/pull/34)、[Remote #47](https://github.com/ActiveInsighter/Anyworkflow-remote/pull/47)、[Workers #26](https://github.com/ActiveInsighter/AnyWorkflow-workers/pull/26)。三者均保留草稿状态，等待配套 workflow 变更后再合并发布。代码交付分支 CI 亦已通过。
+已合并 PR：[转换器 #34](https://github.com/ActiveInsighter/file-converter-ai/pull/34)、[Remote #47](https://github.com/ActiveInsighter/Anyworkflow-remote/pull/47)、[Workers #26](https://github.com/ActiveInsighter/AnyWorkflow-workers/pull/26)。三个项目主线 CI 与生产部署均通过。
+
+生产复验补记：公开扫描讲义的百度 OCR 任务反复超时，尚未进入模型请求；该上游问题未解决，相关验证任务已取消。随后在隔离分支仅关闭 OCR，以生产相同的转换实现运行 [五页纯图片测试](https://github.com/ActiveInsighter/file-converter-ai/actions/runs/43354011280)：`gemini-4-hydrogen` 一次请求成功返回全部 5 页，模型请求约 6.97 秒，页面文件与合并页码顺序核验通过。隔离分支的 OCR 开关没有进入生产，用户设置未改变；此结果不代表 OCR 全链路已恢复。
