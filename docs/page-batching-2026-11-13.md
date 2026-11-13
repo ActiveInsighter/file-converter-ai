@@ -69,3 +69,5 @@ python benchmarks/score_page_batches.py work/batch-benchmark > work/batch-benchm
 完整转换器改动保存在 `/home/dev/Documents/Project/file-converter-ai/.worktrees/page-batching` 的 `feat/page-batching`。可推送的代码交付分支 `feat/page-batching-code` 附带 `deploy/page-batching-workflow.patch`，包含 workflow 与配套契约测试的补丁。授权 workflow 写入后在代码分支应用补丁，重新验证并发布转换器、Remote 与 converter coordinator。尚未合并主线或部署生产。
 
 GitHub workflow 输入已有 25 个，新增批大小输入后，把仅供手动调用的 `model_fallbacks` 移到仓库变量 `CONVERTER_MODEL_FALLBACKS`；CLI `--model-fallbacks` 保留，显式模型仍默认不回退。这是 workflow 手动调用契约的唯一调整。
+
+草稿 PR：[转换器 #34](https://github.com/ActiveInsighter/file-converter-ai/pull/34)、[Remote #47](https://github.com/ActiveInsighter/Anyworkflow-remote/pull/47)、[Workers #26](https://github.com/ActiveInsighter/AnyWorkflow-workers/pull/26)。三者均保留草稿状态，等待配套 workflow 变更后再合并发布。代码交付分支 CI 亦已通过。
