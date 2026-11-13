@@ -29,16 +29,26 @@ class Progress:
         failed = sum(r['status'] == 'failed' and name not in self.retrying
                      and name not in self.active for name, r in self.results.items())
         completed = ok + blank + failed
+        page_counts = {'ok': 0, 'blank': 0, 'failed': 0}
+        for name, result in self.results.items():
+            pending_retry = name in self.retrying or name in self.active
+            for page in result.get('page_results', [result]):
+                status = page['status']
+                if status in page_counts and (status != 'failed' or not pending_retry):
+                    page_counts[status] += 1
+        completed_pages = sum(page_counts.values())
         elapsed = time.monotonic() - self.started
         pending = max(0, self.total_chunks - completed)
         return {
             'state': self.state, 'total_pages': self.total_pages,
             'rendered_pages': self.rendered_pages, 'total_chunks': self.total_chunks,
+            'completed_pages': completed_pages, 'success_pages': page_counts['ok'],
+            'blank_pages': page_counts['blank'], 'failed_pages': page_counts['failed'],
             'completed_chunks': completed, 'success_chunks': ok, 'blank_chunks': blank,
             'failed_chunks': failed, 'pending_chunks': pending,
             'active_chunks': len(self.active), 'queued_chunks': self.queued,
             'retrying_chunks': len(self.retrying),
-            'percent': round(100 * completed / self.total_chunks, 1) if self.total_chunks else 100,
+            'percent': round(100 * completed_pages / self.total_pages, 1) if self.total_pages else 100,
             'elapsed_seconds': round(elapsed, 2),
             'eta_seconds': round(elapsed / completed * pending, 1) if completed else None,
             'active': [{'chunk': name, 'elapsed_seconds': round(time.monotonic() - started, 1)}
@@ -55,7 +65,9 @@ class Progress:
         # Keep an incremental result index even if rendering or the process fails.
         result_path = self.output_dir / 'results.json'
         temporary = result_path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(list(self.results.values()), ensure_ascii=False, indent=2) + '\n')
+        temporary.write_text(json.dumps([page for result in self.results.values()
+                                         for page in result.get("page_results", [result])],
+                                        ensure_ascii=False, indent=2) + '\n')
         temporary.replace(result_path)
         if log:
             print(f"[progress] {snapshot['percent']}% "

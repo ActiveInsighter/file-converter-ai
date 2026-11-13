@@ -1,0 +1,95 @@
+diff --git a/.github/workflows/pdf-to-md.yml b/.github/workflows/pdf-to-md.yml
+index 6d5c036..2268383 100644
+--- a/.github/workflows/pdf-to-md.yml
++++ b/.github/workflows/pdf-to-md.yml
+@@ -37,6 +37,11 @@ on:
+         required: false
+         default: false
+         type: boolean
++      images_per_request:
++        description: "Consecutive PDF pages per model request (1-20)"
++        required: false
++        default: "1"
++        type: string
+       concurrency:
+         description: "Concurrent page requests, including speculative copies"
+         required: true
+@@ -57,11 +62,6 @@ on:
+         required: false
+         default: ""
+         type: string
+-      model_fallbacks:
+-        description: "Comma-separated fallback models. Empty only falls back for the default model; custom models stay exact. Use none to disable."
+-        required: false
+-        default: ""
+-        type: string
+       reasoning_effort:
+         description: "Optional Modelflare reasoning effort; leave empty if the selected model does not support it"
+         required: false
+@@ -160,11 +160,12 @@ jobs:
+       PROVIDER: ${{ github.event.inputs.provider || 'gemini' }}
+       OUTPUT_NAME: ${{ github.event.inputs.output_name || 'merged' }}
+       SOURCE_URL: ${{ github.event.inputs.source_url }}
++      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}
+       CONCURRENCY: ${{ github.event.inputs.concurrency || '50' }}
+       SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || '' }}
+       USER_PROMPT: ${{ github.event.inputs.prompt || '' }}
+       MODEL: ${{ github.event.inputs.model || '' }}
+-      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}
++      MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}
+       REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || '' }}
+       MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || '0' }}
+       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || '5' }}
+@@ -254,6 +255,7 @@ jobs:
+             --ocr-source "${OCR_SOURCE}"
+             --ocr-relay-dpi "${OCR_RELAY_DPI}"
+             --concurrency "${CONCURRENCY}"
++            --images-per-request "${IMAGES_PER_REQUEST}"
+             --model "${MODEL}"
+             --model-fallbacks "${MODEL_FALLBACKS}"
+             --reasoning-effort "${REASONING_EFFORT}"
+@@ -302,3 +304,17 @@ jobs:
+           path: output/
+           if-no-files-found: warn
+           retention-days: 3
++
++      - name: Upload benchmark evidence
++        if: always() && startsWith(inputs.request_id, 'batch-benchmark-')
++        uses: actions/upload-artifact@v4
++        with:
++          name: batch-benchmark-${{ github.run_id }}
++          path: |
++            work/conversion/quota-usage.json
++            work/conversion/progress.json
++            work/conversion/results.json
++            work/conversion/errors/
++            work/conversion/ocr/
++          if-no-files-found: warn
++          retention-days: 7
+diff --git a/tests/test_workflow_provider_contract.py b/tests/test_workflow_provider_contract.py
+index 90e516e..1aec85c 100644
+--- a/tests/test_workflow_provider_contract.py
++++ b/tests/test_workflow_provider_contract.py
+@@ -19,7 +19,7 @@ class WorkflowProviderContractTests(unittest.TestCase):
+     def test_model_and_fallback_defaults_do_not_force_gemini_on_modelflare(self):
+         workflow = WORKFLOW.read_text()
+         self.assertIn("MODEL: ${{ github.event.inputs.model || '' }}", workflow)
+-        self.assertIn("MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}", workflow)
++        self.assertIn("MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}", workflow)
+ 
+ 
+     def test_ocr_token_comes_from_the_baidu_secret_and_the_whole_package_is_uploaded(self):
+@@ -42,6 +42,13 @@ class WorkflowProviderContractTests(unittest.TestCase):
+         self.assertIn("ADJACENT_PAGES: ${{ github.event.inputs.adjacent_pages || 'false' }}", workflow)
+         self.assertIn('if [[ "${ADJACENT_PAGES}" == "true" ]]; then\n            args+=(--adjacent-pages)', workflow)
+ 
++    def test_saved_batch_size_reaches_the_cli_without_changing_single_page_default(self):
++        workflow = WORKFLOW.read_text()
++        self.assertIn("      images_per_request:\n", workflow)
++        self.assertIn("IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}", workflow)
++        self.assertIn('--images-per-request "${IMAGES_PER_REQUEST}"', workflow)
++        self.assertIn("MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}", workflow)
++
+     def test_dispatch_stays_within_githubs_input_limit(self):
+         inputs = WORKFLOW.read_text().split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+         names = [line for line in inputs.splitlines() if line.startswith("      ") and not line.startswith("       ")]

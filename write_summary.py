@@ -18,8 +18,8 @@ def write_summary(state_dir: Path, destination: Path):
     ocr = usage.get('ocr') or {}
     rows = [
         ('State', progress['state']),
-        ('Completed pages', f"{progress['completed_chunks']}/{progress['total_chunks']} ({progress['percent']}%)"),
-        ('Successful / blank / failed', f"{progress['success_chunks']} / {progress['blank_chunks']} / {progress['failed_chunks']}"),
+        ('Completed pages', f"{progress.get('completed_pages', progress['completed_chunks'])}/{progress['total_pages']} ({progress['percent']}%)"),
+        ('Successful / blank / failed', f"{progress.get('success_pages', progress['success_chunks'])} / {progress.get('blank_pages', progress['blank_chunks'])} / {progress.get('failed_pages', progress['failed_chunks'])}"),
         ('OCR + model / model only / OCR only',
          f"{sources.get('ocr+model', 0)} / {sources.get('model', 0)} / {sources.get('ocr', 0)}"),
         ('OCR pages / failed / seconds',
