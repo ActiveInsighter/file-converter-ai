@@ -15,7 +15,9 @@ PDF → Markdown 转换执行器。百度 PaddleOCR-VL 直接从原始链接下�
    - 实测：原图分段（约 43 MB）被百度反复回 408，OCR 692 秒；150 DPI 分段（5–7 MB）OCR 303 秒、零次 408。
    - 以下情况改为旧方式：链接被拒绝；提交在上述时间内没有响应（源站对百度很慢时会这样，如 gnu.org）；链接任务失败或 5 分钟未完成；文件超过百度链接上限 200 MB；来源是 Google Drive 分享页。只有“队列已满/限流”会继续用链接重试。旧方式是：从本地 PDF 切段上传，单段超过 1 MiB 时继续对半拆分（Runner 到百度上传约 20–25 KB/s）。平均每页超过 256 KiB 的分段（扫描件）先转成 150 DPI JPEG 页面再上传，体积通常缩小 4–8 倍。
 3. **渲染**：同时在独立线程中逐页渲染图片（默认 240 DPI PNG）。空白扫描页直接跳过，不发请求。
-4. **校对**：某页的图片和 OCR 草稿都就绪后，一起发送给模型。模型以图片为准、以草稿为底稿：保留正确文字，修正错字、公式与上下标，补全遗漏，删除页眉页脚，整理标题、段落、表格结构，保留草稿中的图片引用。
+4. **校对**：默认每页的图片和 OCR 草稿都就绪后，一起发送给模型。`images_per_request` 可设为 1–20（默认 1）：连续 N 页的完整图片与带页码 OCR 草稿合并为一次请求，不缩小、拼成长图；末批不足 N 页照常发送。返回按页码标记严格拆分，仍逐页保存；漏页、重页、乱序或空页回答会重试，最终失败时逐页回退到各自 OCR 草稿。空白页占原始分组位置但不发送图片；相邻页参考仅附在整个分组外侧。每次额外审校同样发送整组页面。
+
+   默认单页时，模型以图片为准、以草稿为底稿：保留正确文字，修正错字、公式与上下标，补全遗漏，删除页眉页脚，整理标题、段落、表格结构，保留草稿中的图片引用。
    - 开启 `adjacent_pages` 后，每页请求还附带上一页底部和下一页顶部（各占页高 40%）的截图。相邻截图用于辨认边缘字符与阅读顺序，每页只转写本页可见内容，保留本页开头的续句、续公式和续表行，避免依赖另一页是否成功而删除内容。不会自动跨页拼接正文。相邻页为空白或不在转换范围内时不附带。每个请求多两张截图，耗时和 Token 略增。
 5. **兜底**：
    - 模型拒答（RECITATION/SAFETY 等）、回答被输出长度截断，或重试轮次用尽时，该页直接使用 OCR 草稿。空回答及 MALFORMED_RESPONSE 按暂时故障重试；非空白扫描页不会因为模型空答而被标成空白。
@@ -82,6 +84,7 @@ PaddleOCR 支持多个 Token（每行一个），按任务轮流使用；同一�
 | `provider` | `gemini` | `gemini` 或 `modelflare` |
 | `model` | `gemini-3.5-flash-lite` | Modelflare 必须指定视觉模型 ID |
 | `output_name` | `merged` | 合并 Markdown 的文件名，不含扩展名 |
+| `images_per_request` | `1` | 每次整理的连续 PDF 页数，1–20 |
 | `concurrency` | `50` | 同时进行的页面请求数，含补发 |
 | `system_prompt` / `prompt` | 空 | 转录要求，按顺序拼接，各限 12000 字符；都为空时使用内置要求 |
 | `dpi` / `image_format` | `240` / `png` | 发给模型的页面图片质量 |
@@ -113,7 +116,9 @@ export PADDLEOCR_TOKENS='AI Studio 令牌'
 python pdf2md.py --source-url 'https://example.com/document.pdf' --output-name '文档笔记'
 ```
 
-CLI 另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget`、`--adjacent-pages` 等参数，见 `python pdf2md.py --help`。
+GitHub workflow 的输入已达 25 个；模型回退链改由仓库变量 `CONVERTER_MODEL_FALLBACKS` 设置（不再接收手动 dispatch 的 `model_fallbacks` 输入）。指定自定义模型时仍默认不回退；CLI `--model-fallbacks` 保留。
+
+CLI 支持 `--images-per-request N`（别名 `--pages-per-request N`）；另有 `--ocr none`、`--ocr-source`、`--ocr-model`、`--ocr-segment-pages`、`--ocr-url`、`--hedge-after`、`--hedge-budget`、`--adjacent-pages` 等参数，见 `python pdf2md.py --help`。
 
 ## 耗时
 

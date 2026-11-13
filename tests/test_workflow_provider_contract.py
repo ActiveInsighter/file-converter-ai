@@ -19,7 +19,7 @@ class WorkflowProviderContractTests(unittest.TestCase):
     def test_model_and_fallback_defaults_do_not_force_gemini_on_modelflare(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("MODEL: ${{ github.event.inputs.model || '' }}", workflow)
-        self.assertIn("MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}", workflow)
+        self.assertIn("MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}", workflow)
 
 
     def test_ocr_token_comes_from_the_baidu_secret_and_the_whole_package_is_uploaded(self):
@@ -41,6 +41,13 @@ class WorkflowProviderContractTests(unittest.TestCase):
         self.assertIn("      adjacent_pages:\n", workflow)
         self.assertIn("ADJACENT_PAGES: ${{ github.event.inputs.adjacent_pages || 'false' }}", workflow)
         self.assertIn('if [[ "${ADJACENT_PAGES}" == "true" ]]; then\n            args+=(--adjacent-pages)', workflow)
+
+    def test_saved_batch_size_reaches_the_cli_without_changing_single_page_default(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("      images_per_request:\n", workflow)
+        self.assertIn("IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}", workflow)
+        self.assertIn('--images-per-request "${IMAGES_PER_REQUEST}"', workflow)
+        self.assertIn("MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}", workflow)
 
     def test_dispatch_stays_within_githubs_input_limit(self):
         inputs = WORKFLOW.read_text().split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]

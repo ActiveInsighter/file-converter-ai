@@ -1,0 +1,537 @@
+{
+  "intro": [
+    {
+      "conversion_wall_seconds": 133.25,
+      "pages_per_request": 1,
+      "page_files": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "logical_batches": 5,
+      "actual_requests_including_hedges": 5,
+      "hedge_events": 0,
+      "model_p50_seconds": 32.31,
+      "model_p95_seconds": 39.36,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 1,
+        "relay_jobs": 0,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 16,
+        "seconds": 92.7,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0,
+      "spot_checks": [],
+      "sha256": {
+        "001.md": "21c01cea06afc378a554eacbceb773d03d772f1b14ed27b0ce24b4465f478e46",
+        "002.md": "25f4d5acf66cd83148fca1c41e1eeefa540ce05403ee1e561521c53e74492cd0",
+        "003.md": "e947f19d5452bff5bac8405b40b3c698963248bbe535979f578dc1d526aa1e3b",
+        "004.md": "0911a6bc65910e1d166615e362a6459ff449d9de889f9042c6850283adfd170d",
+        "005.md": "bef6fbb4e750ab46c308bd01d4c79726962992d18208216e047f1a6df0bc9319"
+      }
+    },
+    {
+      "conversion_wall_seconds": 92.66,
+      "pages_per_request": 3,
+      "page_files": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "logical_batches": 2,
+      "actual_requests_including_hedges": 2,
+      "hedge_events": 0,
+      "model_p50_seconds": 37.0,
+      "model_p95_seconds": 39.07,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 1,
+        "relay_jobs": 0,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 16,
+        "seconds": 49.6,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0,
+      "spot_checks": [],
+      "sha256": {
+        "001.md": "0ea5c455f0f9d96630bb4e0a19b76dcc8ffb9ece5aa4f9fdce7979f913113563",
+        "002.md": "cb59c30ab5f9e088f852813ab699828e17e6589d721c314908edca0b14a6abbe",
+        "003.md": "2fea154d6d18c9c0ec3fff69037f8661e9019cefe00afd404d314ac431a9d58c",
+        "004.md": "e6908c7c0d300b2d8d0923630ea36ed90caf9b667e93380bd5cbe68201198e08",
+        "005.md": "26bd07c26c4baf211da1ffe160197da77fb4bbe146a9d2ff4805201aa3b5264b"
+      }
+    },
+    {
+      "conversion_wall_seconds": 126.9,
+      "pages_per_request": 5,
+      "page_files": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "logical_batches": 1,
+      "actual_requests_including_hedges": 1,
+      "hedge_events": 0,
+      "model_p50_seconds": 52.15,
+      "model_p95_seconds": 52.15,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 1,
+        "relay_jobs": 0,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 16,
+        "seconds": 60.7,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 0,
+      "spot_checks_total": 0,
+      "spot_checks": [],
+      "sha256": {
+        "001.md": "bcd50ab8aa4b0b8995d8418c9e41c1001248a174caf086cc72e7310a1558f5ac",
+        "002.md": "cf2acbdb36c4d1d37c2bb2892dde21b8f84d755e36bb29bedd705898ed0dc59c",
+        "003.md": "cd14f015eb67842c5c5ab415aa11d878abeb33721512d3e2961dc897ee6abb54",
+        "004.md": "43bfda1cc9055ec848733fa61c1366e2bb9828a2dd849d82971fd1f2e1b22f9b",
+        "005.md": "bd857a45ee44856ef94a313e436558d3abe135b4596ca6a252b382df71b6465c"
+      }
+    }
+  ],
+  "formulas": [
+    {
+      "conversion_wall_seconds": 150.21,
+      "pages_per_request": 1,
+      "page_files": [
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "logical_batches": 5,
+      "actual_requests_including_hedges": 5,
+      "hedge_events": 0,
+      "model_p50_seconds": 32.81,
+      "model_p95_seconds": 52.63,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 2,
+        "remote_jobs": 1,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 3,
+        "seconds": 94.5,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 12,
+      "spot_checks_total": 15,
+      "spot_checks": [
+        {
+          "id": "p31-inner-kernel-sign",
+          "page": 31,
+          "label": "内圈几何级数前的负号",
+          "pass": false
+        },
+        {
+          "id": "p31-annulus-upper-bound",
+          "page": 31,
+          "label": "A3 定义中的 |z-1|<1 上界",
+          "pass": false
+        },
+        {
+          "id": "p31-cosecant-coefficient",
+          "page": 31,
+          "label": "1/sin(z) 展开系数 7z^3/360",
+          "pass": true
+        },
+        {
+          "id": "p32-essential-series",
+          "page": 32,
+          "label": "sin(1/z) 展开中的三阶、五阶阶乘",
+          "pass": true
+        },
+        {
+          "id": "p32-pole-order",
+          "page": 32,
+          "label": "k+1 阶极限等于 0",
+          "pass": true
+        },
+        {
+          "id": "p32-factorization",
+          "page": 32,
+          "label": "g 的 k 阶因子和 h(z0) 非零",
+          "pass": true
+        },
+        {
+          "id": "p33-residue-definition",
+          "page": 33,
+          "label": "留数定义为 a_{-1}",
+          "pass": true
+        },
+        {
+          "id": "p33-winding-weight",
+          "page": 33,
+          "label": "留数定理中的绕数权重",
+          "pass": true
+        },
+        {
+          "id": "p33-principal-part",
+          "page": 33,
+          "label": "主部求和从 -m_j 到 -1",
+          "pass": true
+        },
+        {
+          "id": "p34-cauchy-derivatives",
+          "page": 34,
+          "label": "高阶 Cauchy 公式中的 n! 和绕数分母",
+          "pass": true
+        },
+        {
+          "id": "p34-logarithmic-derivative",
+          "page": 34,
+          "label": "Remark 段积分的 f'(z)/f(z)",
+          "pass": false
+        },
+        {
+          "id": "p34-imaginary-polynomial",
+          "page": 34,
+          "label": "f(iy) 的负号、五次幂与系数 17",
+          "pass": true
+        },
+        {
+          "id": "p35-rouche-strict",
+          "page": 35,
+          "label": "Rouche 不等式保留严格小于",
+          "pass": true
+        },
+        {
+          "id": "p35-radius-example",
+          "page": 35,
+          "label": "半径例题的 49<64、96=48|z| 和 r=2",
+          "pass": true
+        },
+        {
+          "id": "p35-blaschke-conjugate",
+          "page": 35,
+          "label": "Blaschke 乘积的共轭分母",
+          "pass": true
+        }
+      ],
+      "sha256": {
+        "031.md": "65e87a2efd083237074c456bec831f0591cfca4b57edd29f35530dd13cb4ca5f",
+        "032.md": "609d28d8f44048ae1e2144e5b7531b936d11599e96d6bbd98ee05cd53030a9fb",
+        "033.md": "ae46d606e41df971b121667c815d308dae10967f125116ad969885dc026466eb",
+        "034.md": "b53441dea70f862fdb21ed47ad5f71366092c902c0e7620037f525395481dad3",
+        "035.md": "fc3ee3832485c5c255b09c55f8422fd3d0d8be595bc4be13f560f74ae3f6a66d"
+      }
+    },
+    {
+      "conversion_wall_seconds": 148.77,
+      "pages_per_request": 3,
+      "page_files": [
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "logical_batches": 2,
+      "actual_requests_including_hedges": 2,
+      "hedge_events": 0,
+      "model_p50_seconds": 42.66,
+      "model_p95_seconds": 44.68,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 2,
+        "remote_jobs": 1,
+        "relay_jobs": 1,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 3,
+        "seconds": 99.9,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 14,
+      "spot_checks_total": 15,
+      "spot_checks": [
+        {
+          "id": "p31-inner-kernel-sign",
+          "page": 31,
+          "label": "内圈几何级数前的负号",
+          "pass": false
+        },
+        {
+          "id": "p31-annulus-upper-bound",
+          "page": 31,
+          "label": "A3 定义中的 |z-1|<1 上界",
+          "pass": true
+        },
+        {
+          "id": "p31-cosecant-coefficient",
+          "page": 31,
+          "label": "1/sin(z) 展开系数 7z^3/360",
+          "pass": true
+        },
+        {
+          "id": "p32-essential-series",
+          "page": 32,
+          "label": "sin(1/z) 展开中的三阶、五阶阶乘",
+          "pass": true
+        },
+        {
+          "id": "p32-pole-order",
+          "page": 32,
+          "label": "k+1 阶极限等于 0",
+          "pass": true
+        },
+        {
+          "id": "p32-factorization",
+          "page": 32,
+          "label": "g 的 k 阶因子和 h(z0) 非零",
+          "pass": true
+        },
+        {
+          "id": "p33-residue-definition",
+          "page": 33,
+          "label": "留数定义为 a_{-1}",
+          "pass": true
+        },
+        {
+          "id": "p33-winding-weight",
+          "page": 33,
+          "label": "留数定理中的绕数权重",
+          "pass": true
+        },
+        {
+          "id": "p33-principal-part",
+          "page": 33,
+          "label": "主部求和从 -m_j 到 -1",
+          "pass": true
+        },
+        {
+          "id": "p34-cauchy-derivatives",
+          "page": 34,
+          "label": "高阶 Cauchy 公式中的 n! 和绕数分母",
+          "pass": true
+        },
+        {
+          "id": "p34-logarithmic-derivative",
+          "page": 34,
+          "label": "Remark 段积分的 f'(z)/f(z)",
+          "pass": true
+        },
+        {
+          "id": "p34-imaginary-polynomial",
+          "page": 34,
+          "label": "f(iy) 的负号、五次幂与系数 17",
+          "pass": true
+        },
+        {
+          "id": "p35-rouche-strict",
+          "page": 35,
+          "label": "Rouche 不等式保留严格小于",
+          "pass": true
+        },
+        {
+          "id": "p35-radius-example",
+          "page": 35,
+          "label": "半径例题的 49<64、96=48|z| 和 r=2",
+          "pass": true
+        },
+        {
+          "id": "p35-blaschke-conjugate",
+          "page": 35,
+          "label": "Blaschke 乘积的共轭分母",
+          "pass": true
+        }
+      ],
+      "sha256": {
+        "031.md": "48e34c7a6ffeeb221121beb6d3cb41fb95824324595dbb9a5e8dd9b9c7ee5662",
+        "032.md": "a4ebd99b6e8d59775fcf350dae01e5ec11406bdcafd02b1cc30295b30fa35355",
+        "033.md": "bb0930a217390c15bfb0bbb7700139de0ff8e4ab5700337152db40fb38d85968",
+        "034.md": "18dceabd543426c8d59227b3388db234524b0de92419c894737562180751cb24",
+        "035.md": "4e338095c15d897870f3689d64bf07d4f05044c2767fe84b36e5b6f1e3fa55e5"
+      }
+    },
+    {
+      "conversion_wall_seconds": 306.51,
+      "pages_per_request": 5,
+      "page_files": [
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "logical_batches": 1,
+      "actual_requests_including_hedges": 3,
+      "hedge_events": 1,
+      "model_p50_seconds": 85.21,
+      "model_p95_seconds": 85.21,
+      "http_429": 0,
+      "http_503": 0,
+      "ocr": {
+        "jobs": 1,
+        "remote_jobs": 1,
+        "relay_jobs": 0,
+        "uploaded_jobs": 0,
+        "pages": 5,
+        "failed_pages": 0,
+        "figures": 3,
+        "seconds": 218.0,
+        "retired_tokens": 0,
+        "poll_retries": 0
+      },
+      "source_counts": {
+        "ocr+model": 5
+      },
+      "spot_checks_passed": 12,
+      "spot_checks_total": 15,
+      "spot_checks": [
+        {
+          "id": "p31-inner-kernel-sign",
+          "page": 31,
+          "label": "内圈几何级数前的负号",
+          "pass": false
+        },
+        {
+          "id": "p31-annulus-upper-bound",
+          "page": 31,
+          "label": "A3 定义中的 |z-1|<1 上界",
+          "pass": false
+        },
+        {
+          "id": "p31-cosecant-coefficient",
+          "page": 31,
+          "label": "1/sin(z) 展开系数 7z^3/360",
+          "pass": true
+        },
+        {
+          "id": "p32-essential-series",
+          "page": 32,
+          "label": "sin(1/z) 展开中的三阶、五阶阶乘",
+          "pass": true
+        },
+        {
+          "id": "p32-pole-order",
+          "page": 32,
+          "label": "k+1 阶极限等于 0",
+          "pass": true
+        },
+        {
+          "id": "p32-factorization",
+          "page": 32,
+          "label": "g 的 k 阶因子和 h(z0) 非零",
+          "pass": true
+        },
+        {
+          "id": "p33-residue-definition",
+          "page": 33,
+          "label": "留数定义为 a_{-1}",
+          "pass": true
+        },
+        {
+          "id": "p33-winding-weight",
+          "page": 33,
+          "label": "留数定理中的绕数权重",
+          "pass": true
+        },
+        {
+          "id": "p33-principal-part",
+          "page": 33,
+          "label": "主部求和从 -m_j 到 -1",
+          "pass": true
+        },
+        {
+          "id": "p34-cauchy-derivatives",
+          "page": 34,
+          "label": "高阶 Cauchy 公式中的 n! 和绕数分母",
+          "pass": true
+        },
+        {
+          "id": "p34-logarithmic-derivative",
+          "page": 34,
+          "label": "Remark 段积分的 f'(z)/f(z)",
+          "pass": false
+        },
+        {
+          "id": "p34-imaginary-polynomial",
+          "page": 34,
+          "label": "f(iy) 的负号、五次幂与系数 17",
+          "pass": true
+        },
+        {
+          "id": "p35-rouche-strict",
+          "page": 35,
+          "label": "Rouche 不等式保留严格小于",
+          "pass": true
+        },
+        {
+          "id": "p35-radius-example",
+          "page": 35,
+          "label": "半径例题的 49<64、96=48|z| 和 r=2",
+          "pass": true
+        },
+        {
+          "id": "p35-blaschke-conjugate",
+          "page": 35,
+          "label": "Blaschke 乘积的共轭分母",
+          "pass": true
+        }
+      ],
+      "sha256": {
+        "031.md": "ccf887099bbdf9255cd81acb383e2ec01c342947fb9a2c291d22d3b7dc28e947",
+        "032.md": "d0f96d9f943e4357d961662eb4c889fe4141101c8bf13487ca31a64249e88045",
+        "033.md": "46a564d6baefdf29830185892d0f8873465046801142661e484143f79512f83f",
+        "034.md": "1fc459a553d246992fe131a9403259e75370188c8d07f28db3fb817a5e5425bc",
+        "035.md": "e938011707d8402831cab147b90c608ef81ec865e9846e438ca09719a00d92c4"
+      }
+    }
+  ]
+}

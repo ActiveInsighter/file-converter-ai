@@ -37,6 +37,11 @@ on:
         required: false
         default: false
         type: boolean
+      images_per_request:
+        description: "Consecutive PDF pages per model request (1-20)"
+        required: false
+        default: "1"
+        type: string
       concurrency:
         description: "Concurrent page requests, including speculative copies"
         required: true
@@ -54,11 +59,6 @@ on:
         type: string
       model:
         description: "Exact model ID. Empty uses the Gemini default; Modelflare requires a vision-capable model ID"
-        required: false
-        default: ""
-        type: string
-      model_fallbacks:
-        description: "Comma-separated fallback models. Empty only falls back for the default model; custom models stay exact. Use none to disable."
         required: false
         default: ""
         type: string
@@ -160,11 +160,12 @@ jobs:
       PROVIDER: ${{ github.event.inputs.provider || 'gemini' }}
       OUTPUT_NAME: ${{ github.event.inputs.output_name || 'merged' }}
       SOURCE_URL: ${{ github.event.inputs.source_url }}
+      IMAGES_PER_REQUEST: ${{ github.event.inputs.images_per_request || '1' }}
       CONCURRENCY: ${{ github.event.inputs.concurrency || '50' }}
       SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt || '' }}
       USER_PROMPT: ${{ github.event.inputs.prompt || '' }}
       MODEL: ${{ github.event.inputs.model || '' }}
-      MODEL_FALLBACKS: ${{ github.event.inputs.model_fallbacks || '' }}
+      MODEL_FALLBACKS: ${{ vars.CONVERTER_MODEL_FALLBACKS || '' }}
       REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || '' }}
       MAX_OUTPUT_TOKENS: ${{ github.event.inputs.max_output_tokens || '0' }}
       RETRY_ROUNDS: ${{ github.event.inputs.retry_rounds || '5' }}
@@ -254,6 +255,7 @@ jobs:
             --ocr-source "${OCR_SOURCE}"
             --ocr-relay-dpi "${OCR_RELAY_DPI}"
             --concurrency "${CONCURRENCY}"
+            --images-per-request "${IMAGES_PER_REQUEST}"
             --model "${MODEL}"
             --model-fallbacks "${MODEL_FALLBACKS}"
             --reasoning-effort "${REASONING_EFFORT}"
@@ -302,3 +304,17 @@ jobs:
           path: output/
           if-no-files-found: warn
           retention-days: 3
+
+      - name: Upload benchmark evidence
+        if: always() && startsWith(inputs.request_id, 'batch-benchmark-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-benchmark-${{ github.run_id }}
+          path: |
+            work/conversion/quota-usage.json
+            work/conversion/progress.json
+            work/conversion/results.json
+            work/conversion/errors/
+            work/conversion/ocr/
+          if-no-files-found: warn
+          retention-days: 7

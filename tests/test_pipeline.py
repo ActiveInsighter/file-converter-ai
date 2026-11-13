@@ -319,3 +319,29 @@ class HedgeTests(unittest.IsolatedAsyncioTestCase):
                                can_hedge=lambda: False)
         self.assertEqual(await policy.run(attempt, '1'), 'done')
         self.assertEqual(len(calls), 1)
+
+
+class BatchProgressTests(unittest.TestCase):
+    def test_progress_counts_pdf_pages_and_persists_flat_results(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = Progress(root, total_chunks=2, total_pages=5)
+            progress.results['001-003'] = {
+                'status': 'ok', 'page_results': [
+                    {'chunk': str(n), 'page': n, 'status': 'ok'} for n in [1, 2, 3]]}
+            self.assertEqual(progress.snapshot()['percent'], 60)
+            progress.results['004-005'] = {
+                'status': 'failed', 'page_results': [
+                    {'chunk': '4', 'page': 4, 'status': 'blank'},
+                    {'chunk': '5', 'page': 5, 'status': 'failed'}]}
+            progress.retrying.add('004-005')
+            self.assertEqual(progress.snapshot()['percent'], 80)
+            self.assertEqual(progress.snapshot()['failed_pages'], 0)
+            progress.retrying.clear()
+            result = progress.write()
+            self.assertEqual(result['percent'], 100)
+            self.assertEqual(result['failed_pages'], 1)
+            self.assertEqual(result['blank_pages'], 1)
+            saved = json.loads((root / 'results.json').read_text())
+            self.assertEqual([page['page'] for page in saved], [1, 2, 3, 4, 5])
