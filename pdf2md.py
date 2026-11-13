@@ -97,6 +97,85 @@ class Page:
         return self.number
 
 
+@dataclass(frozen=True)
+class PageBatch:
+    """Consecutive PDF pages sharing one model request, including blank slots."""
+
+    pages: tuple[Page, ...]
+
+    @property
+    def stem(self):
+        return f"{self.pages[0].stem}-{self.pages[-1].stem}"
+
+    @property
+    def start_page(self):
+        return self.pages[0].number
+
+    @property
+    def end_page(self):
+        return self.pages[-1].number
+
+
+def flatten_results(results):
+    return [page for result in results for page in result.get("page_results", [result])]
+
+
+class BatchResponseError(RuntimeError):
+    """A missing, repeated or reordered page boundary must be retried."""
+
+
+def split_batch_answer(text: str, pages: list[Page]) -> dict[int, str]:
+    markers = list(re.finditer(r"<!--\s*第\s*(\d+)\s*页\s*-->", text))
+    expected = [page.number for page in pages]
+    if [int(match[1]) for match in markers] != expected:
+        raise BatchResponseError(f"Expected page markers {expected}, got {[int(m[1]) for m in markers]}")
+    if text[:markers[0].start()].strip():
+        raise BatchResponseError("Unexpected content before the first page marker")
+    result = {}
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        body = text[marker.end():end].strip()
+        if not body:
+            raise BatchResponseError(f"Empty answer for nonblank page {expected[index]}")
+        validate_markdown_output(body)
+        result[expected[index]] = body
+    return result
+
+
+def make_batch_request_parts(pages, prompt, media_resolution, drafts,
+                             previous=None, following=None, verification=None):
+    # This is a response framing contract, not an additional transcription policy.
+    numbers = [page.number for page in pages]
+    text = (f"本次包含 PDF 第 {numbers} 页的完整图片，按下方页码顺序处理。\n"
+            + prompt.strip()
+            + "\n\n逐页返回完整 Markdown，每页前单独一行标记 <!-- 第 N 页 -->（N 为实际 PDF 页码）。"
+              "逐页要求中的‘当前页’分别指每张标注页码的完整图片。"
+              "每页内容只放在自己的标记之后，不能漏页、合并页码或重复输出；"
+              "参考截图不输出。只返回这些页码：" + ", ".join(map(str, numbers)))
+    parts = [{"text": text}]
+    raw_bytes = 0
+    for page in pages:
+        label = f"PDF 第 {page.number} 页（完整页面）"
+        draft = drafts.get(page.number)
+        if draft is not None:
+            label += f"\n<ocr_draft>\n{draft.strip() or '（OCR 未识别到内容）'}\n</ocr_draft>"
+        if verification is not None:
+            label += f"\n<verification_draft>\n{verification[page.number]}\n</verification_draft>"
+        image, size = image_part(page.image_path, media_resolution)
+        parts.extend([{"text": label}, image])
+        raw_bytes += size
+    for neighbour, path, side in (
+        (previous, previous.bottom_path if previous else None, "底部"),
+        (following, following.top_path if following else None, "顶部"),
+    ):
+        if path:
+            image, size = image_part(path, media_resolution)
+            parts.extend([{"text": f"参考截图：第 {neighbour.number} 页{side}"}, image])
+            raw_bytes += size
+    all_text = "\n".join(part["text"] for part in parts if "text" in part)
+    return parts, _check_request_size(f"{numbers[0]}-{numbers[-1]}", raw_bytes, all_text)
+
+
 def parse_api_keys(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -672,9 +751,12 @@ async def process_pages(
     publish_progress=None,
     ocr: PaddleOcr | None = None,
     adjacent_pages: bool = False,
+    images_per_request: int = 1,
 ) -> list[dict]:
     """Finalise every page with the model, using its OCR draft when there is one."""
     provider = provider or resolve_provider(None)
+    if not 1 <= images_per_request <= 20:
+        raise ValueError("images_per_request must be between 1 and 20")
 
     pages_dir = state_dir / "pages"
     errors_dir = state_dir / "errors"
@@ -701,7 +783,7 @@ async def process_pages(
             total_pages = len(pages)
         if total_pages is None:
             raise ValueError("Streaming input requires total_pages")
-        tracker = Progress(state_dir, total_chunks=total_pages, total_pages=total_pages)
+        tracker = Progress(state_dir, total_chunks=math.ceil(total_pages / images_per_request), total_pages=total_pages)
         started_at: dict[str, float] = {}
         stop_metrics = asyncio.Event()
 
@@ -744,17 +826,27 @@ async def process_pages(
                 started_at.setdefault(held.stem, time.monotonic())
                 yield held
 
-        async def draft_ready(page: Page) -> None:
-            if ocr is not None and not page.blank:
-                await ocr.page(page.number)
+        async def batches():
+            pending = []
+            async for page in rendered_in_order():
+                pending.append(page)
+                if len(pending) == images_per_request:
+                    yield pending[0] if len(pending) == 1 else PageBatch(tuple(pending))
+                    pending = []
+            if pending:
+                yield pending[0] if len(pending) == 1 else PageBatch(tuple(pending))
+
+        async def draft_ready(unit) -> None:
+            if ocr is not None:
+                if isinstance(unit, PageBatch):
+                    await asyncio.gather(*(ocr.page(page.number) for page in unit.pages if not page.blank))
+                elif not unit.blank:
+                    await ocr.page(unit.number)
 
         def source():
             if ocr is None or not ocr.enabled:
-                return rendered_in_order()
-            # Worker slots go to pages whose OCR draft exists, whatever order
-            # the OCR jobs finished in; render ahead far enough to see the
-            # next finished segment behind a slow one.
-            return ready_first(rendered_in_order(), draft_ready, max(60, 3 * concurrency))
+                return batches()
+            return ready_first(batches(), draft_ready, max(60, 3 * concurrency))
 
         def neighbour(number: int) -> Page | None:
             page = rendered.get(number) if adjacent_pages else None
@@ -904,6 +996,86 @@ async def process_pages(
                 **error,
             }
 
+        async def run_batch(batch: PageBatch, round_number: int) -> dict:
+            members = [page for page in batch.pages if not page.blank]
+            blanks = [record_blank(page, "blank_page", "no visible page content")
+                      for page in batch.pages if page.blank]
+            if len(members) <= 1:
+                children = blanks + ([await run_one(members[0], round_number)] if members else [])
+            else:
+                if round_number == 1:
+                    for page in members:
+                        (pages_dir / f"{page.stem}.md").unlink(missing_ok=True)
+                ocr_started = time.monotonic()
+                ocr_pages = await asyncio.gather(*(ocr.page(page.number) for page in members)) if ocr else [None] * len(members)
+                ocr_wait = time.monotonic() - ocr_started
+                drafts = {page.number: draft.markdown for page, draft in zip(members, ocr_pages) if draft is not None}
+                figures = {page.number: draft.figures if draft else {} for page, draft in zip(members, ocr_pages)}
+                model_started = time.monotonic()
+                error = None
+                for attempt in range(1, max(1, attempts_per_page) + 1):
+                    try:
+                        parts, estimated = make_batch_request_parts(
+                            members, prompt, media_resolution, drafts,
+                            neighbour(batch.start_page - 1), neighbour(batch.end_page + 1))
+                        text = await call_model(
+                            client, key_pool, provider, model, parts, batch.stem, thinking_level,
+                            fallback_models, reasoning_effort, api_base, max_output_tokens)
+                        answers = split_batch_answer(text, members)
+                        for verify_index in range(verification_passes):
+                            parts, _ = make_batch_request_parts(
+                                members, prompt, media_resolution, {},
+                                neighbour(batch.start_page - 1), neighbour(batch.end_page + 1),
+                                verification=answers)
+                            text = await call_model(
+                                client, key_pool, provider, model, parts,
+                                f"{batch.stem}-verify-{verify_index + 1}", thinking_level,
+                                fallback_models, reasoning_effort, api_base, max_output_tokens)
+                            answers = split_batch_answer(text, members)
+                        error = None
+                        children = blanks + [record_success(
+                            page, clean_layout_markup(keep_known_figures(answers[page.number], figures[page.number])),
+                            estimated, "ocr+model" if page.number in drafts else "model",
+                            batch=batch.stem,
+                            stage_seconds={"ocr_wait": round(ocr_wait, 3),
+                                           "model_including_quota_wait": round(time.monotonic() - model_started, 3)},
+                        ) for page in members]
+                        break
+                    except Exception as exc:
+                        error = exc
+                        if not is_retryable_error(exc) or attempt >= max(1, attempts_per_page):
+                            break
+                        await asyncio.sleep(random.uniform(3.0, 8.0) * attempt)
+                else:
+                    error = RuntimeError("Batch produced no answer")
+                if error is not None:
+                    final = round_number >= retry_rounds or not is_retryable_error(error)
+                    children = blanks[:]
+                    for page in members:
+                        draft = drafts.get(page.number)
+                        if final and draft and draft.strip():
+                            children.append(record_success(
+                                page, clean_layout_markup(draft), 0, "ocr", batch=batch.stem,
+                                fallback_reason=f"{type(error).__name__}: {error}"[:500]))
+                        else:
+                            failure = {"chunk": page.stem, "page": page.number,
+                                       "start_page": page.number, "end_page": page.number,
+                                       "status": "failed", "retryable": is_retryable_error(error),
+                                       "error": f"{type(error).__name__}: {error}",
+                                       "round": round_number, "batch": batch.stem}
+                            (errors_dir / f"{page.stem}.json").write_text(
+                                json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8")
+                            children.append(failure)
+            failed = [result for result in children if result["status"] == "failed"]
+            return {"chunk": batch.stem, "status": "failed" if failed else "ok",
+                    "retryable": any(result.get("retryable") for result in failed),
+                    "error": failed[0]["error"] if failed else "",
+                    "page_results": sorted(children, key=lambda result: result["page"])}
+
+        async def run_unit(unit, round_number):
+            return await (run_batch(unit, round_number) if isinstance(unit, PageBatch)
+                          else run_one(unit, round_number))
+
         async def emit_metrics() -> None:
             while True:
                 try:
@@ -912,7 +1084,7 @@ async def process_pages(
                 except TimeoutError:
                     if publish_progress is not None:
                         try:
-                            publish_progress(list(tracker.results.values()))
+                            publish_progress(flatten_results(tracker.results.values()))
                         except Exception as exc:
                             print(f"[warn] Cannot refresh partial Markdown: {type(exc).__name__}: {exc}",
                                   file=sys.stderr, flush=True)
@@ -931,7 +1103,7 @@ async def process_pages(
 
         metrics_task = asyncio.create_task(emit_metrics())
         try:
-            results = await schedule_chunks(source(), run_one, concurrency, retry_rounds, tracker)
+            results = flatten_results(await schedule_chunks(source(), run_unit, concurrency, retry_rounds, tracker))
         finally:
             CURRENT_POLICY.reset(policy_token)
             stop_metrics.set()
@@ -966,6 +1138,8 @@ async def process_pages(
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+    p.add_argument("--images-per-request", "--pages-per-request", type=int, default=1,
+                   help="Consecutive PDF pages per model request (1-20; default 1).")
     p.add_argument(
         "--conversion-type",
         choices=["pdf_to_md"],
@@ -1182,6 +1356,8 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if len(args.prompt) > MAX_PROMPT_CHARS:
         raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
+    if not 1 <= args.images_per_request <= 20:
+        raise ValueError("images_per_request must be between 1 and 20")
     if not 1 <= args.concurrency <= 100:
         raise ValueError("concurrency must be between 1 and 100")
     if args.ocr_relay_url:
@@ -1274,7 +1450,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
         f"ocr_source={args.ocr_source} ocr_relay_dpi={args.ocr_relay_dpi} "
         f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
-        f"concurrency={args.concurrency} "
+        f"concurrency={args.concurrency} images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
@@ -1378,6 +1554,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 publish_progress=publish,
                 ocr=ocr,
                 adjacent_pages=args.adjacent_pages,
+                images_per_request=args.images_per_request,
             )
         except (Exception, asyncio.CancelledError) as exc:
             cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0
@@ -1385,7 +1562,7 @@ async def async_main(args: argparse.Namespace) -> int:
             print(f"[pipeline-error] {pipeline_error}; preserving completed pages", file=sys.stderr, flush=True)
             try:
                 result_index = state_dir / "results.json"
-                results = json.loads(result_index.read_text()) if result_index.exists() else []
+                results = flatten_results(json.loads(result_index.read_text())) if result_index.exists() else []
                 if not (state_dir / "progress.json").exists():
                     failed_progress = Progress(state_dir, total_chunks=plan.page_count,
                                                total_pages=plan.page_count)
