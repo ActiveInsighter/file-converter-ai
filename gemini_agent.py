@@ -21,7 +21,6 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
-DEFAULT_AGENT_TOKEN_BUDGET = 20000  # 0 previously permitted unlimited loops.
 GITHUB_TASK = re.compile(r'github|(?<![a-z])gh(?![a-z])|git(?:hub)?\b|repo(?:sitory)?\b|pull.request|'
                          r'仓库|代码库|项目源码|项目代码|拉取代码|提交代码|推送代码|克隆|分支', re.I)
 
@@ -68,8 +67,6 @@ def build_agent_payload(job, message):
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
         'agent_config': {'type': 'antigravity', 'model': options.get('model', DEFAULT_MODEL)},
     }
-    # Legacy 0 meant unlimited; bound it while preserving explicit positive budgets.
-    payload['agent_config']['max_total_tokens'] = str(options.get('maxTotalTokens') or DEFAULT_AGENT_TOKEN_BUDGET)
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
     # A configured GitHub PAT grants access to every repository permitted by
@@ -127,7 +124,7 @@ def parse_interaction(data):
     status = data.get('status', '')
     error = ''
     if status == 'incomplete':
-        error = 'Agent 执行未完成，已保留现有回复；请检查 Token 预算或服务端限制。'
+        error = 'Agent 执行未完成，已保留现有回复；请检查上游状态或服务端限制。'
     elif status in ['failed', 'requires_action']:
         detail = data.get('error') or {}
         message = detail.get('message', '') if isinstance(detail, dict) else str(detail)
@@ -191,7 +188,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     state = (await checkpoint()).get('state') or {}
     agent_telemetry('prepared',
         model=payload['agent_config']['model'],
-        budget_tokens=int(payload['agent_config']['max_total_tokens']),
         tools=[tool.get('type') for tool in payload['tools']],
         github_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
         input_chars=len(payload['input']),

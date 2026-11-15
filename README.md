@@ -172,21 +172,11 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 按任务并发数独立发送各段。请求只有系统提示词、用户提示词与该段文本，不经过 PDF/OCR 流程，
 不上传 Gemini Files API；回复逐段写回 PB，截断回复也会保留并标明错误。
 
-**普通聊天默认提供 Google 搜索：** 对 Gemini 2.0/2.5/3.x/4.x 的受支持文本生成模型
-（包含 `gemini-4-hydrogen`），`gemini_text.py` 在 generateContent 请求中附带
-`tools: [{"googleSearch": {}}]`。模型根据问题判断是否实际搜索，普通闲聊不会被强制联网。
-**模型支持搜索 ≠ 当前 API Key 的服务层级允许搜索。** Google AI Studio 网页中可测试搜索，
-但 Gemini Developer API 中部分模型的 Free tier 不提供 Google Search Grounding。
-若服务器明确快速拒绝搜索工具（400、带有搜索/grounding 说明的 403），执行器自动移除工具
-**仅重试一次**，回复标注「不联网回答」；密钥无效、限流、超时或可能已运行工具的请求
-不进行这项重试，避免重复计费。Actions 会记录上游 HTTP 状态及 Google 错误类别（不打印响应体），
-失败分段也会显示 HTTP 状态和错误类别，不再只剩「1 段失败」。搜索过的回复自动附带
-`groundingMetadata` 中的网页参考来源和 Google 搜索建议链接，并保留原始 Token 统计，
-另记录 `usage.googleSearchCount`（Google 返回的搜索查询数）。自定义、旧版、
-图像、语音或不支持搜索的模型不会被强制插入这个参数，避免工具不兼容引起 HTTP 400。
-**这项修改仅针对 Remote 的 Gemini 文本聊天；不改变 PDF/OCR 转换，也不改变 Antigravity
-Interactions API 的独立搜索工具。** Gemini 3 系列按实际执行的搜索查询计费，
-并受到 Google 项目搜索工具额度/计费规则的约束。详见官方 Google Search grounding 文档。
+**普通 Gemini 聊天不启用 Google Search Grounding**：免费 API 项目无法使用该搜索工具，
+因此 `gemini_text.py` 不再自动发送 `tools: [{"googleSearch": {}}]`，
+不会因为搜索工具权限导致普通聊天 HTTP 400/403。
+保留通用上游 HTTP 状态与错误类别日志，方便排查其他 API 问题。
+PDF/OCR 转换流程不变；Antigravity 的独立 Interactions API 工具配置也不变。
 
 不同 Gemini 对话使用各自的 GitHub Actions concurrency group（由 request_id 区分），
 与 PDF 转换独立调度；Cloudflare Gemini 任务并发上限为 4。
@@ -211,7 +201,8 @@ PB 写入失败的回复保留在三天有效的 `gemini-text-recovery-<runId>` 
 普通模型仍沿用 generateContent。别名解析为 `antigravity-preview-09-2026`，
 默认推理模型为 Gemini 4 Hydrogen，代码执行、Google 搜索和 URL Context 全部开启，
 远程沙盒自动提供文件系统；省略网络 allowlist，保留默认不限域名的出站网络。
-`agent_config.max_total_tokens` 默认使用 **20,000 Token** 安全预算（包括旧配置 0）；在 Remote 消息配置中填写正整数可按任务提高预算。此项控制 Agent 多轮循环的累计用量，不等同于普通回复的输出长度。
+Antigravity 请求**不发送** `agent_config.max_total_tokens`，也不再设置本地默认 Token 预算。
+历史任务中保存的预算字段会被忽略，Agent 仍受 Google API 的真实配额、服务端限制与执行时限约束。
 不发送 Agent 不支持的 generationConfig、thinkingLevel 或 max_output_tokens。
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
@@ -254,7 +245,7 @@ GitHub MCP 访问，不执行任何修改；确认成功后再要求它创建功
 
 Gemini 消息 workflow 的 `Send segments and save replies to PocketBase` 步骤输出 `[agent.telemetry]`
 JSON 行（`prepared` / `created` / `progress` / `completed`），只记录：
-使用模型、预算、是否挂载 GitHub、工具**类型**、输入/系统提示词**字符数**、轮询次数、耗时、
+使用模型、是否挂载 GitHub、工具**类型**、输入/系统提示词**字符数**、轮询次数、耗时、
 返回步骤的类型统计，以及 Google 原样返回的累计 `total_tokens`、
 `total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、
 `total_tool_use_tokens`、`total_cached_tokens`。不记录任何密钥、提示词正文、
