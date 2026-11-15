@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import httpx
@@ -44,13 +44,13 @@ def safe_search_link(url: object) -> str | None:
         return None
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
         return None
-    if any(char in url for char in '\\r\\n<>'):
+    if any(char in url for char in '\r\n<>'):
         return None
     return url.replace(')', '%29').replace('(', '%28')
 
 
 def link_label(text: object) -> str:
-    return re.sub(r'[\\[\\]\\r\\n]', ' ', str(text or '来源'))[:100].strip() or '来源'
+    return re.sub(r'[\[\]\r\n]', ' ', str(text or '来源'))[:100].strip() or '来源'
 
 
 def grounding_appendix(candidate: dict) -> str:
@@ -95,7 +95,7 @@ def grounding_appendix(candidate: dict) -> str:
         if lines:
             lines.append('')
         lines.extend(['**Google 搜索建议**', *[f'- [{title}]({url})' for title, url in suggestions]])
-    return '\\n'.join(lines)
+    return '\n'.join(lines)
 
 
 async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") -> KeyPool:
@@ -129,7 +129,7 @@ def parse_answer(payload: dict) -> dict:
     error = ""
     appendix = grounding_appendix(candidate)
     if appendix:
-        reply += "\\n\\n" + appendix
+        reply += "\n\n" + appendix
     if len(reply.encode("utf-8")) > MAX_REPLY_BYTES:
         raise RuntimeError("Gemini reply exceeds 2 MiB; reduce the output limit")
     if reason == "MAX_TOKENS":
