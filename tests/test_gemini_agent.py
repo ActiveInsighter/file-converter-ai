@@ -19,7 +19,7 @@ class AgentPayloadTests(unittest.TestCase):
         data = build_agent_payload(job(), {'inputText': 'document'})
         self.assertEqual(data['agent'], DEFAULT_AGENT)
         self.assertEqual(data['input'], 'question\n\ndocument')
-        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-carbon'})
+        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen'})
         self.assertEqual(data['environment'], {'type': 'remote'})
         self.assertEqual({tool['type'] for tool in data['tools']}, {'code_execution', 'google_search', 'url_context'})
         self.assertTrue(data['background']); self.assertTrue(data['store'])
@@ -121,3 +121,23 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, 'unsupported field') as error:
                 await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
         self.assertNotIn('fixture-secret', str(error.exception))
+
+    async def test_zero_free_tier_quota_explains_account_requirement(self):
+        async def checkpoint(update=None): return {'state': {}, 'canceled': False}
+        async def outbound(request):
+            return httpx.Response(429, json={'error': {'message':
+                'Rate limit exceeded for model gemini-4-carbon (limit: 0 input tokens per minute on Free Tier).'}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with self.assertRaisesRegex(RuntimeError, '免费额度为 0'):
+                await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
+
+    async def test_cancel_during_access_checks_does_not_try_another_key(self):
+        calls = []
+        async def checkpoint(update=None): return {'state': {}, 'canceled': bool(calls)}
+        async def outbound(request):
+            calls.append(request)
+            return httpx.Response(403, json={'error': {'message': 'Agent access denied'}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with self.assertRaises(AgentCanceled):
+                await generate_agent(client, KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
+        self.assertEqual(len(calls), 1)
