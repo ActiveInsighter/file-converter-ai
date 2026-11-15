@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -157,6 +158,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     path = f"jobs/{job_id}"
     identity = {"executionId": execution_id}
     job = await pb.post(f"{path}/claim", identity, retries=3)
+    print(f"[gemini] job claimed model={job['model']} segments={len(job['messages'])} "
+          f"concurrency={job['options']['concurrency']}", flush=True)
     pool = await pool_factory(job["options"])
     queue = asyncio.Queue()
     for message in job["messages"]:
@@ -170,10 +173,13 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
             message = queue.get_nowait()
             endpoint = f"{path}/messages/{message['id']}"
             try:
+                begun = time.monotonic()
                 # Not retried: a lost permit is not permission to send twice.
                 permit = await pb.post(f"{endpoint}/start", identity)
                 if not permit.get("send"):
+                    print(f"[gemini] segment={message['index']} skipped: no send permit", flush=True)
                     continue
+                print(f"[gemini] segment={message['index']} started agent={is_antigravity(job['model'])}", flush=True)
                 try:
                     if is_antigravity(job['model']):
                         async def checkpoint(state=None):
@@ -199,7 +205,16 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 # Retrying persistence cannot trigger another Gemini request.
                 await pb.post(f"{endpoint}/complete", saved, retries=5)
                 target.unlink()
-                print(f"[gemini] segment={message['index']} saved status={'failed' if result['error'] else 'succeeded'}", flush=True)
+                usage = result.get('usage') or {}
+                print(f"[gemini] segment={message['index']} saved "
+                      f"status={'failed' if result['error'] else 'succeeded'} "
+                      f"elapsed_seconds={time.monotonic() - begun:.2f} "
+                      f"total_tokens={usage.get('totalTokenCount', 'unknown')} "
+                      f"input_tokens={usage.get('promptTokenCount', 'unknown')} "
+                      f"output_tokens={usage.get('candidatesTokenCount', 'unknown')} "
+                      f"thought_tokens={usage.get('thoughtsTokenCount', 'unknown')} "
+                      f"tool_tokens={usage.get('toolUseTokenCount', 'unknown')} "
+                      f"steps={usage.get('agentStepCount', 'unknown')}", flush=True)
                 if result["error"]:
                     failures.append(message["id"])
             except Exception:
