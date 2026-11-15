@@ -171,8 +171,10 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 `gemini-text.yml` 和 `gemini_text.py` 从 PocketBase 领取文本任务，复用现有 Gemini KeyPool，
 按任务并发数独立发送各段。请求只有系统提示词、用户提示词与该段文本，不经过 PDF/OCR 流程，
 不上传 Gemini Files API；回复逐段写回 PB，截断回复也会保留并标明错误。
-该 workflow 与 PDF workflow 共用 `anyworkflow-gemini-quota` concurrency group，避免手动
-运行绕过 Cloudflare 队列后同时消耗同一池配额。
+不同 Gemini 对话使用各自的 GitHub Actions concurrency group（由 request_id 区分），
+与 PDF 转换独立调度；Cloudflare Gemini 任务并发上限为 4。
+每个 Actions Runner 的 KeyPool 仅管理当前任务，多个任务复用相同 API Key 时可能
+更早触发 Google 的项目级 RPM/RPD 或其他服务限制，请合理设置任务数量。
 
 仓库 Actions Secret `POCKETBASE_SERVER_TOKEN` 支持直接使用 PB 超级用户令牌，具有整个数据库的服务端读写权限。
 填入后优先使用它；未填写时回退到 `GEMINI_PB_EMAIL`、`GEMINI_PB_PASSWORD`（PB 专用
@@ -204,16 +206,18 @@ GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_a
 ### Antigravity GitHub 仓库集成（仅需 Actions Secret）
 
 在本仓库的 `Settings → Secrets and variables → Actions → Secrets` 中添加
-`ANTIGRAVITY_GITHUB_TOKEN`（GitHub Fine-grained PAT）。Token 仅授权
-`ActiveInsighter/file-converter-ai` 与 `ActiveInsighter/Anyworkflow-remote`，
-授予 Contents: Read/Write；需要创建 PR 时再授予 Pull requests: Read/Write。
+`ANTIGRAVITY_GITHUB_TOKEN`（GitHub Fine-grained PAT）。Token 根据实际需要授权目标仓库；若要让 Agent 访问你有权限的**所有仓库**，
+在 GitHub Token 配置中选择对应范围（例如所有个人仓库），授予 Contents: Read/Write；
+需要创建 PR 时再授予 Pull requests: Read/Write。仓库范围由 GitHub Token 权限决定，
+不再由本项目代码限制。
 
 **只需配置这一个 Secret**，无需 `ANTIGRAVITY_GITHUB_ALLOWED_OWNER`、
 PocketBase 用户 ID、额外后端迁移或 Google Credentials API。
 `gemini-text.yml` 将密钥仅传给服务端执行器；`gemini_agent.py` 在发起
-Antigravity Interactions API 请求时检测密钥，非空则挂载两个仓库到
-`/workspace/file-converter-ai` 和 `/workspace/Anyworkflow-remote`，
-并添加 GitHub MCP 和 GitHub Git/REST 请求认证；为空则保持原来的普通 Agent 模式。
+Antigravity Interactions API 请求时检测密钥，非空则允许通过 GitHub MCP
+查询 Token 可访问的仓库，并让 Agent 在需要时把指定仓库按需克隆到 `/workspace`；
+不会在每次请求中预先克隆所有仓库。还会配置 GitHub Git/REST 请求认证；
+为空则保持原来的普通 Agent 模式。
 普通 Gemini 模型和 PDF 转换流程不受影响。
 
 **安全边界：** 启用后，任何能够通过该执行器提交 Antigravity 任务的用户，

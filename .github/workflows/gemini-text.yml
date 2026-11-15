@@ -12,9 +12,10 @@ on:
 permissions:
   contents: read
 
-# The Python key pool is local to a runner; both workflows share repository keys.
+# A conversation is independent of every other conversation and PDF job.
+# Re-runs for the same request ID cannot evict each other.
 concurrency:
-  group: anyworkflow-gemini-quota
+  group: anyworkflow-gemini-text-${{ inputs.request_id }}
   cancel-in-progress: false
 
 jobs:
