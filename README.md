@@ -190,7 +190,7 @@ PB 写入失败的回复保留在三天有效的 `gemini-text-recovery-<runId>` 
 `gemini_text.py` 对 `Antigravity`（大小写不敏感）和 `antigravity-*` 使用
 `gemini_agent.py` 的官方 Interactions API：`POST /v1beta/interactions`。
 普通模型仍沿用 generateContent。别名解析为 `antigravity-preview-09-2026`，
-默认推理模型为 Gemini 4 Carbon，代码执行、Google 搜索和 URL Context 全部开启，
+默认推理模型为 Gemini 4 Hydrogen，代码执行、Google 搜索和 URL Context 全部开启，
 远程沙盒自动提供文件系统；省略网络 allowlist，保留默认不限域名的出站网络。
 `agent_config.max_total_tokens` 默认不发送，不增加 Token 预算上限。
 不发送 Agent 不支持的 generationConfig、thinkingLevel 或 max_output_tokens。

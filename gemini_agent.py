@@ -15,7 +15,7 @@ import httpx
 
 ROOT = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 DEFAULT_AGENT = 'antigravity-preview-09-2026'
-DEFAULT_MODEL = 'gemini-4-carbon'
+DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 
@@ -106,6 +106,9 @@ def upstream_error(status, data, key):
     error = data.get('error') or {}
     detail = error.get('message', '') if isinstance(error, dict) else str(error)
     detail = str(detail).replace(key, '[REDACTED]')[:1200]
+    if status == 429 and 'free tier' in detail.casefold() and 'limit: 0' in detail.casefold():
+        detail = ('当前 API 项目的所选模型免费额度为 0。请使用有该模型 Agent 额度的 API Key，'
+                  '或在 Google 项目中配置结算并确认可用额度。上游详情：' + detail)
     return RuntimeError(f'Antigravity 请求失败（HTTP {status}）：{detail or "请检查 Agent、参数及 API Key 权限"}')
 
 
@@ -117,6 +120,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     index = key = lease = None
     current = None
     for attempt in range(max(1, len(pool.keys))):
+        if not state.get('id') and (await checkpoint()).get('canceled'):
+            raise AgentCanceled('Agent 已取消，未创建远程执行。')
         index, key, lease = await pool.acquire()
         fingerprint = hashlib.sha256(key.encode()).hexdigest()
         if state.get('id'):
@@ -147,6 +152,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 raise
             break
         await pool.mark_error(index, lease, http_status=status)
+        print(f'[agent] create rejected attempt={attempt + 1}/{len(pool.keys)} HTTP={status}', flush=True)
         scope = provider.credential_error_scope(status, data)
         if scope:
             pool.retire_key(index, 'agent access unavailable')
