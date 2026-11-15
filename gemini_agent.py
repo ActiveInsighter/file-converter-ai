@@ -20,12 +20,6 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
-GITHUB_REPOSITORIES = (
-    ('ActiveInsighter/file-converter-ai', '/workspace/file-converter-ai'),
-    ('ActiveInsighter/Anyworkflow-remote', '/workspace/Anyworkflow-remote'),
-)
-
-
 class AgentCanceled(RuntimeError):
     pass
 
@@ -51,18 +45,14 @@ def build_agent_payload(job, message):
         payload['agent_config']['max_total_tokens'] = str(options['maxTotalTokens'])
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
-    # A configured GitHub PAT enables the fixed repository integration for
-    # every Antigravity job handled by this private executor. Prompts and user
-    # options cannot change the token, repository allowlist or MCP endpoint.
+    # A configured GitHub PAT grants access to every repository permitted by
+    # that PAT, not an application-defined list. Clone repositories on demand.
+    # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
     if github_token:
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         payload['environment'] = {
             'type': 'remote',
-            'sources': [
-                {'type': 'repository', 'source': f'https://github.com/{repo}', 'target': target}
-                for repo, target in GITHUB_REPOSITORIES
-            ],
             'network': {
                 'allowlist': [
                     {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
@@ -76,6 +66,18 @@ def build_agent_payload(job, message):
             'url': 'https://api.githubcopilot.com/mcp',
             'headers': {'Authorization': f'Bearer {github_token}'},
         })
+        github_guide = (
+            'GitHub is available through the github MCP and authenticated HTTPS Git '
+            'and REST APIs. Use the MCP to discover repositories accessible to the '
+            'configured token, then clone only the repository needed for the '
+            'requested task into /workspace. You may read or write any repository '
+            'that GitHub grants this token access to; do not assume a fixed two-repo '
+            'list. Before editing, read the repository AGENTS.md when present; '
+            'prefer a feature branch and pull request to pushing main.'
+        )
+        payload['system_instruction'] = '\\n\\n'.join(
+            part for part in [payload.get('system_instruction', ''), github_guide] if part
+        )
     return payload
 
 
