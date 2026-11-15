@@ -2,7 +2,7 @@ import unittest
 
 import httpx
 
-from github_context import git_write_access, prepare_github_context, repository_candidates
+from github_context import explicit_repositories, git_write_access, prepare_github_context, repository_candidates
 
 
 REPOS = [{'full_name': 'owner/Anyworkflow-remote', 'default_branch': 'main'},
@@ -12,6 +12,9 @@ REPOS = [{'full_name': 'owner/Anyworkflow-remote', 'default_branch': 'main'},
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_repository_references_do_not_consume_sentence_punctuation_or_filesystem_paths(self):
+        text = 'Check owner/remote. Read /workspace/.anyworkflow/github.py and src/components. See https://github.com/org/repo/tree/main.'
+        self.assertEqual(explicit_repositories(text, 'owner'), ['org/repo', 'owner/remote'])
     def test_user_project_names_resolve_without_global_search(self):
         for text, expected in [('重新推送部署下我的exam docs项目', 'owner/exam-docs'),
                                ('看看工作流remote项目，gemini消息界面重构后推送分支', 'owner/Anyworkflow-remote'),
@@ -37,10 +40,23 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, content=b'001f# service=git-receive-pack\n',
                 headers={'content-type': 'application/x-git-receive-pack-advertisement'})
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
-            context = await prepare_github_context(client, 'fixture', '重新推送部署下我的exam docs项目')
+            context = await prepare_github_context(client, 'fixture', '修改我的exam docs项目并推送')
         self.assertEqual(context['selected']['full_name'], 'owner/exam-docs')
         self.assertTrue(context['write_verified'])
         self.assertEqual(len(calls), 3)
+
+    async def test_deployment_only_does_not_require_git_contents_write(self):
+        async def outbound(request):
+            self.assertNotEqual(request.url.host, 'github.com')
+            return httpx.Response(200, json={'login': 'owner'} if request.url.path == '/user' else REPOS)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await prepare_github_context(client, 'fixture', '重新推送部署下我的exam docs项目')
+        self.assertTrue(result['deployment_only'])
+        self.assertFalse(result['requires_git_write'])
+
+    async def test_non_repository_project_explanation_does_not_require_a_token(self):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: self.fail('no network'))) as client:
+            self.assertIsNone(await prepare_github_context(client, '', '解释项目管理知识'))
 
     async def test_denied_push_fails_before_remote_agent_starts(self):
         async def outbound(request):

@@ -20,6 +20,9 @@ desktop/mobile. Never rerun an unchanged failing test or call a failed check pas
 Check Git write access before substantial edits; host preflight already verified it
 when a target could be resolved. Push a feature branch and verify its remote SHA.
 If push returns 403, stop and report the permission failure, retaining the commit.
+For a deployment-only task, inspect workflow configuration through GitHub REST,
+not a repository clone, npm install, or local build. The workflow performs the build.
+List available workflows with `python3 {HELPER} workflows --repo OWNER/REPO`.
 For workflow deployments use ONLY:
 python3 {HELPER} deploy --repo OWNER/REPO --workflow FILE.yml --ref BRANCH --inputs-json '{{}}'
 The helper normalizes inputs, journals BEFORE POST, binds the exact workflow run ID,

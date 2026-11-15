@@ -45,6 +45,16 @@ def repository_candidates(text, repositories):
     return [r for score, r in ranked if score == top]
 
 
+def explicit_repositories(text, login):
+    names = re.findall(r'https?://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)', text)
+    for match in re.finditer(r'(?<![A-Za-z0-9_./-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)(?![A-Za-z0-9_/-])', text):
+        name = match[1]
+        before = text[max(0, match.start() - 15):match.start()]
+        if name.split('/')[0].casefold() == login.casefold() or re.search(r'仓库\s*|repo(?:sitory)?\s*', before, re.I):
+            names.append(name)
+    return list(dict.fromkeys(name.rstrip('.').removesuffix('.git') for name in names))
+
+
 async def github_request(client, token, path, *, params=None):
     response = await client.get('https://api.github.com' + path, params=params,
         headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
@@ -77,13 +87,15 @@ async def prepare_github_context(client, token, text, *, require_write=None, tra
     if not is_project_task(text):
         return None
     if not token:
-        raise RuntimeError('当前项目任务未配置 Agent GitHub 密钥；请配置 ANTIGRAVITY_GITHUB_TOKEN 后再执行。')
+        if re.search(r'github|仓库|推送|分支', text, re.I) and WRITE_TASK.search(text):
+            raise RuntimeError('当前仓库写入任务未配置 Agent GitHub 密钥；请配置 ANTIGRAVITY_GITHUB_TOKEN 后再执行。')
+        return None
     identity = (await github_request(client, token, '/user')).json()
     login = identity.get('login', '')
     if not re.fullmatch(r'[A-Za-z0-9-]+', login):
         raise RuntimeError('GitHub 身份检查未返回有效账号。')
     # An explicit repository needs no inventory or global search.
-    explicit = re.findall(r'(?:github\.com/|(?<![A-Za-z0-9_.-]))([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?![A-Za-z0-9_.-])', text)
+    explicit = explicit_repositories(text, login)
     repositories = []
     for name in dict.fromkeys(explicit):
         name = name.removesuffix('.git')
@@ -104,10 +116,14 @@ async def prepare_github_context(client, token, text, *, require_write=None, tra
     candidates = repository_candidates(text, repositories)
     selected = candidates[0] if len(candidates) == 1 else None
     needs_write = bool(WRITE_TASK.search(text)) if require_write is None else require_write
+    deployment_only = bool(re.search(r'部署|\bdeploy\b|\bredeploy\b', text, re.I)) and not bool(
+        re.search(r'重构|修复|修改|改动|实现|\brefactor\b|\bimplement\b|\bfix\b|\bgit\s+push\b', text, re.I))
+    needs_git_write = needs_write and not deployment_only
     context = {'login': login, 'candidates': candidates[:10], 'selected': selected,
                'requires_write': needs_write, 'write_verified': None,
+               'requires_git_write': needs_git_write, 'deployment_only': deployment_only,
                'repository_count': len(repositories)}
-    if selected and needs_write:
+    if selected and needs_git_write:
         context['write_verified'] = await git_write_access(client, token, selected['full_name'])
     if trace:
         trace.emit('github_preflight', **context)

@@ -136,6 +136,8 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('identity')
     sub.add_parser('repos')
+    workflows = sub.add_parser('workflows')
+    workflows.add_argument('--repo', required=True)
     dispatch = sub.add_parser('deploy')
     dispatch.add_argument('--repo', required=True)
     dispatch.add_argument('--workflow', required=True)
@@ -157,6 +159,9 @@ def main():
                 print(row['full_name'])
             if len(rows) < 100:
                 break
+    elif args.command == 'workflows':
+        for workflow in api(f'/repos/{checked_repo(args.repo)}/actions/workflows')['workflows']:
+            print(json.dumps({k: workflow[k] for k in ('id', 'name', 'path', 'state')}))
     else:
         if not 0 <= args.wait_seconds <= 900:
             parser.error('--wait-seconds must be 0..900')
