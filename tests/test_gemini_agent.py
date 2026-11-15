@@ -42,8 +42,9 @@ class AgentPayloadTests(unittest.TestCase):
                 if owner:
                     task['owner'] = owner
                 payload = build_agent_payload(task, {})
-                self.assertEqual([source['target'] for source in payload['environment']['sources']],
-                                 ['/workspace/file-converter-ai', '/workspace/Anyworkflow-remote'])
+                self.assertNotIn('sources', payload['environment'])
+                self.assertIn('any repository', payload['system_instruction'])
+                self.assertIn('clone only the repository needed', payload['system_instruction'])
                 rules = payload['environment']['network']['allowlist']
                 self.assertEqual(rules[0]['domain'], 'github.com')
                 self.assertEqual(rules[1]['transform']['Authorization'], 'Bearer fixture-github-secret')
