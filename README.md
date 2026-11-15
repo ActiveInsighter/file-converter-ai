@@ -194,7 +194,7 @@ PB 写入失败的回复保留在三天有效的 `gemini-text-recovery-<runId>` 
 普通模型仍沿用 generateContent。别名解析为 `antigravity-preview-09-2026`，
 默认推理模型为 Gemini 4 Hydrogen，代码执行、Google 搜索和 URL Context 全部开启，
 远程沙盒自动提供文件系统；省略网络 allowlist，保留默认不限域名的出站网络。
-`agent_config.max_total_tokens` 默认不发送，不增加 Token 预算上限。
+`agent_config.max_total_tokens` 默认使用 **20,000 Token** 安全预算（包括旧配置 0）；在 Remote 消息配置中填写正整数可按任务提高预算。此项控制 Agent 多轮循环的累计用量，不等同于普通回复的输出长度。
 不发送 Agent 不支持的 generationConfig、thinkingLevel 或 max_output_tokens。
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
@@ -214,8 +214,9 @@ GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_a
 **只需配置这一个 Secret**，无需 `ANTIGRAVITY_GITHUB_ALLOWED_OWNER`、
 PocketBase 用户 ID、额外后端迁移或 Google Credentials API。
 `gemini-text.yml` 将密钥仅传给服务端执行器；`gemini_agent.py` 在发起
-Antigravity Interactions API 请求时检测密钥，非空则允许通过 GitHub MCP
-查询 Token 可访问的仓库，并让 Agent 在需要时把指定仓库按需克隆到 `/workspace`；
+Antigravity Interactions API 请求时检测密钥，并在本次任务涉及 GitHub、仓库、分支、提交等操作时按需启用 GitHub MCP。
+普通身份问答、闲聊不自动挂载 GitHub MCP，避免不必要的工具初始化与 Agent 循环。
+有仓库需求时可通过 MCP 查询 Token 可访问的仓库，并让 Agent 在需要时把指定仓库按需克隆到 `/workspace`；
 不会在每次请求中预先克隆所有仓库。还会配置 GitHub Git/REST 请求认证；
 为空则保持原来的普通 Agent 模式。
 普通 Gemini 模型和 PDF 转换流程不受影响。
@@ -227,10 +228,27 @@ Antigravity Interactions API 请求时检测密钥，非空则允许通过 GitHu
 但不应进入模型提示词、代码仓库文件、生成日志或用户可见消息。
 建议使用最小范围、短有效期的 PAT，定期轮换。
 
-配置后先在 Remote 的「Gemini 消息」选择 Antigravity，要求它只读取两个仓库并测试
+配置后先在 Remote 的「Gemini 消息」选择 Antigravity，要求它只读取目标仓库并测试
 GitHub MCP 访问，不执行任何修改；确认成功后再要求它创建功能分支、运行测试并提交 PR。
 **不要直接推送 `main`**：Anyworkflow-remote 的 `main` 推送会触发正式 Cloudflare 部署。
 目前只覆盖本地 mock / CI 测试，未执行真实 Antigravity GitHub 写入验证。
+
+### Actions Agent 诊断日志
+
+Gemini 消息 workflow 的 `Send segments and save replies to PocketBase` 步骤输出 `[agent.telemetry]`
+JSON 行（`prepared` / `created` / `progress` / `completed`），只记录：
+使用模型、预算、是否挂载 GitHub、工具**类型**、输入/系统提示词**字符数**、轮询次数、耗时、
+返回步骤的类型统计，以及 Google 原样返回的累计 `total_tokens`、
+`total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、
+`total_tool_use_tokens`、`total_cached_tokens`。不记录任何密钥、提示词正文、
+工具参数、工具返回内容或 Agent 私有思考。日志不会把轮询的累计用量重复求和。
+`[gemini]` 行还会记录任务领取、分段开始、分段保存与总耗时。
+
+**说明：** `total_cached_tokens` 通常是输入 Token 的子集，不能简单把所有字段相加当作总计；
+页面显示的 Total Token 直接来自 Google `usage.total_tokens`。更新前的任务没有这些明细日志，
+无法从旧日志反推为什么消耗了多少工具 Token 或思考 Token。
+有仓库权限的任务仍可使用 Github MCP，但仅在提示词明确涉及 GitHub/仓库时挂载；
+普通问题仍然经过 Antigravity Agent，因此耗时不会完全等同于简单模型的 generateContent。
 
 官方参考：https://aistudio.google.com/docs/antigravity-agent
 验证：`python -m unittest discover -s tests`。
