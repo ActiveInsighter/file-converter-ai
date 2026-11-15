@@ -1,0 +1,38 @@
+name: AnyWorkflow Gemini · Model catalog
+run-name: gemini-models-${{ inputs.request_id || 'scheduled' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Catalog refresh ID (leave empty for manual refresh)
+        required: false
+        type: string
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anyworkflow-gemini-model-catalog
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REQUEST_ID: ${{ inputs.request_id }}
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      GEMINI_PB_URL: ${{ vars.GEMINI_PB_URL || 'https://pb.any1.tech' }}
+      POCKETBASE_SERVER_TOKEN: ${{ secrets.POCKETBASE_SERVER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install 'httpx>=0.28,<1'
+      - name: Synchronize official model metadata
+        run: python -u gemini_models.py

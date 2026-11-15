@@ -61,8 +61,9 @@ def parse_answer(payload: dict) -> dict:
 
 
 class PocketBase:
-    def __init__(self, client: httpx.AsyncClient, root: str):
+    def __init__(self, client: httpx.AsyncClient, root: str, *, api_prefix="gemini"):
         self.client, self.root, self.token = client, root.rstrip("/"), ""
+        self.api_prefix = api_prefix
 
     async def authenticate(self, *, token="", email="", password=""):
         # A repository server token is server-side only. Dedicated executor
@@ -84,7 +85,7 @@ class PocketBase:
     async def post(self, path: str, data: dict, *, retries=0):
         for attempt in range(retries + 1):
             try:
-                response = await self.client.post(f"{self.root}/api/anyworkflow/gemini/{path}",
+                response = await self.client.post(f"{self.root}/api/anyworkflow/{self.api_prefix}/{path}",
                     headers={"Authorization": self.token}, json=data, timeout=60)
                 if response.is_success:
                     return response.json()
