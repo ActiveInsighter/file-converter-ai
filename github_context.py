@@ -23,7 +23,7 @@ def repository_candidates(text, repositories):
     for repo in repositories:
         name = repo['full_name']
         short = name.split('/')[1]
-        if re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', text, re.I):
+        if re.search(r'(?<![A-Za-z0-9_.-])' + re.escape(name) + r'(?![A-Za-z0-9_.-])', text, re.I):
             score = 1000 + len(name)
         elif len(re.sub(r'[^a-z0-9]', '', short.casefold())) >= 4 and re.sub(r'[^a-z0-9]', '', short.casefold()) in normalized:
             score = 100 + len(short)
@@ -68,7 +68,7 @@ async def git_write_access(client, token, repo):
 
 
 async def prepare_github_context(client, token, text, *, require_write=None, trace=None):
-    if not PROJECT_TASK.search(text):
+    if not PROJECT_TASK.search(text) and not re.search(r'(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', text):
         return None
     if not token:
         raise RuntimeError('当前项目任务未配置 Agent GitHub 密钥；请配置 ANTIGRAVITY_GITHUB_TOKEN 后再执行。')
@@ -77,7 +77,7 @@ async def prepare_github_context(client, token, text, *, require_write=None, tra
     if not re.fullmatch(r'[A-Za-z0-9-]+', login):
         raise RuntimeError('GitHub 身份检查未返回有效账号。')
     # An explicit repository needs no inventory or global search.
-    explicit = re.findall(r'(?:github\.com/|(?<![\w.-]))([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?![\w.-])', text)
+    explicit = re.findall(r'(?:github\.com/|(?<![A-Za-z0-9_.-]))([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?![A-Za-z0-9_.-])', text)
     repositories = []
     for name in dict.fromkeys(explicit):
         name = name.removesuffix('.git')
