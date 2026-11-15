@@ -27,13 +27,31 @@ MAX_REPLY_BYTES = 2 * 1024 * 1024
 
 # Current Gemini text models support Google Search grounding. Do not add the
 # tool to arbitrary user-saved model IDs (image/audio/legacy models may reject it).
-SEARCHABLE_CHAT_MODEL = re.compile(r'^gemini-(?:2\.(?:0|5)|3(?:\.\d+)?|4(?:\.\d+)?)-', re.I)
+# Use only Google-documented Search-compatible models. Do not infer support
+# from the "gemini-" prefix: e.g. gemini-4-hydrogen is not documented.
+SEARCHABLE_CHAT_MODEL = re.compile(
+    r'^gemini-(?:2\\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
+    r'3\\.(?:1-pro|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
+    r'3-(?:pro|flash))(?=$|-)', re.I)
 NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
 
 
 def supports_google_search(model: str) -> bool:
     value = str(model).lower().strip()
     return bool(SEARCHABLE_CHAT_MODEL.match(value)) and not NON_CHAT_MODEL.search(value)
+
+
+def safe_error_code(data: dict) -> str:
+    """Only expose machine-readable Google status, never provider message text."""
+    error = data.get('error') if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return 'UNKNOWN'
+    value = error.get('status') or error.get('code')
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value):
+        return value.upper()
+    return 'UNKNOWN'
 
 
 def safe_search_link(url: object) -> str | None:
