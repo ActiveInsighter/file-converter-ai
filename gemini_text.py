@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from key_pool import KeyPool, parse_key_groups
+from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
@@ -261,8 +261,16 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
     payload = build_payload(job, message)
     search_fallback_used = False
     search_error_code = ''
+    last_http_error = ''
     for attempt in range(4):
-        index, key, lease = await pool.acquire()
+        try:
+            index, key, lease = await pool.acquire()
+        except QuotaPoolExhaustedError:
+            # If every key was rejected, keep the actual HTTP code instead of
+            # replacing it with the generic exhausted-pool exception.
+            if last_http_error:
+                raise RuntimeError(last_http_error) from None
+            raise
         attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(180):
@@ -300,6 +308,8 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
                 result['usage']['googleSearchErrorCode'] = search_error_code
             return result
         error_code = safe_error_code(data)
+        last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
+                           "请检查模型、工具权限、密钥权限或项目额度")
         search_used = bool(payload.get('tools'))
         print(f'[gemini] upstream_http={status} error_code={error_code} '
               f'model={job["model"]} search_enabled={search_used}', flush=True)
@@ -326,8 +336,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             await pool.rate_limited(index, lease, provider.retry_after(headers, data),
                                     daily_exhausted=quota in {"rpd", "spend"}, quota_type=quota)
         elif status not in (500, 502, 503, 504):
-            raise RuntimeError(f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
-                               "请检查模型、搜索工具权限或项目额度")
+            raise RuntimeError(last_http_error)
         if attempt < 3 and not scope and status != 429:
             await sleep(min(30, max(2 ** (attempt + 1), provider.retry_after(headers, data) or 0)))
     raise RuntimeError("Gemini 暂时不可用或请求额度不足，请稍后重新提交")
