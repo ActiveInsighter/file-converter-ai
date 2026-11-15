@@ -64,7 +64,7 @@ class TextPayloadTests(unittest.TestCase):
         parsed = parse_answer(response)
         self.assertEqual(parsed['usage']['totalTokenCount'], 46)
         self.assertEqual(parsed['error'], '')
-        self.assertIn('Spain won.\\n\\n**Google 搜索参考来源**', parsed['reply'])
+        self.assertIn('Spain won.\n\n**Google 搜索参考来源**', parsed['reply'])
         self.assertIn('[UEFA](https://www.uefa.com/euro2024)', parsed['reply'])
         self.assertIn('[UEFA EURO winners](https://www.google.com/search?q=UEFA+EURO+winners)', parsed['reply'])
         self.assertEqual(parsed['reply'].count('https://www.uefa.com/euro2024'), 1)
