@@ -186,8 +186,10 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 except Exception as error:
                     # Never include provider bodies, credentials, or source text in logs.
                     detail = str(error)
-                    for secret in pool.keys:
-                        detail = detail.replace(secret, "[REDACTED]")
+                    secrets = [*pool.keys, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '')]
+                    for secret in secrets:
+                        if secret:
+                            detail = detail.replace(secret, "[REDACTED]")
                     result = {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
                 saved = {**identity, **result}
                 target = work_dir / f"{message['id']}.json"
