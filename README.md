@@ -184,3 +184,22 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 PB 写入失败的回复保留在三天有效的 `gemini-text-recovery-<runId>` artifact 中。
 解压后设置专用 PB 凭据及 URL，运行 `python gemini_text.py --recover-dir ./recovery`，
 只重试保存，不再次生成。传输超时、失去发送许可和新的 GitHub run attempt 不自动重复发送。
+
+## Antigravity Agent 消息
+
+`gemini_text.py` 对 `Antigravity`（大小写不敏感）和 `antigravity-*` 使用
+`gemini_agent.py` 的官方 Interactions API：`POST /v1beta/interactions`。
+普通模型仍沿用 generateContent。别名解析为 `antigravity-preview-09-2026`，
+默认推理模型为 Gemini 4 Carbon，代码执行、Google 搜索和 URL Context 全部开启，
+远程沙盒自动提供文件系统；省略网络 allowlist，保留默认不限域名的出站网络。
+`agent_config.max_total_tokens` 默认不发送，不增加 Token 预算上限。
+不发送 Agent 不支持的 generationConfig、thinkingLevel 或 max_output_tokens。
+
+Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
+和凭据的 SHA-256（不保存 API Key），之后只轮询同一 ID；中断的创建不盲目重发。
+取消会调用远程 `:cancel`；读取失败重试 GET。最大时限 175 分钟，为现有 180 分钟
+GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_agent_state.js`
+与 checkpoint 路由。使用现有 `GEMINI_API_KEYS`，无需把任何服务器凭据挂入沙盒。
+
+官方参考：https://aistudio.google.com/docs/antigravity-agent
+验证：`python -m unittest discover -s tests`。
