@@ -20,6 +20,8 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+
+
 class AgentCanceled(RuntimeError):
     pass
 
@@ -75,7 +77,7 @@ def build_agent_payload(job, message):
             'list. Before editing, read the repository AGENTS.md when present; '
             'prefer a feature branch and pull request to pushing main.'
         )
-        payload['system_instruction'] = '\\n\\n'.join(
+        payload['system_instruction'] = '\n\n'.join(
             part for part in [payload.get('system_instruction', ''), github_guide] if part
         )
     return payload
