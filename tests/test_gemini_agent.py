@@ -36,11 +36,13 @@ class AgentPayloadTests(unittest.TestCase):
     def test_response_only_reads_public_model_output_and_usage(self):
         result = parse_interaction({'status': 'completed', 'steps': [
             {'type': 'thought', 'content': [{'type': 'text', 'text': 'private'}]},
+            {'type': 'code_execution_call'},
             {'type': 'code_execution_result', 'content': [{'type': 'text', 'text': 'tool log'}]},
             {'type': 'model_output', 'content': [{'type': 'text', 'text': 'answer'}]},
         ], 'usage': {'total_tokens': 25, 'total_input_tokens': 10}})
         self.assertEqual(result['reply'], 'answer')
         self.assertEqual(result['usage']['totalTokenCount'], 25)
+        self.assertEqual(result['usage']['agentToolCalls']['code_execution_call'], 1)
         self.assertEqual(result['error'], '')
         partial = parse_interaction({'status': 'incomplete', 'output_text': 'partial'})
         self.assertEqual(partial['reply'], 'partial'); self.assertTrue(partial['error'])

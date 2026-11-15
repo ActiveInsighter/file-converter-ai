@@ -75,8 +75,16 @@ def parse_interaction(data):
     usage = data.get('usage') or {}
     mapping = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candidatesTokenCount',
                'total_thought_tokens': 'thoughtsTokenCount', 'total_cached_tokens': 'cachedContentTokenCount', 'total_tokens': 'totalTokenCount'}
-    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64],
-            'usage': {target: usage[source] for source, target in mapping.items() if isinstance(usage.get(source), int) and usage[source] >= 0}}
+    normalized = {target: usage[source] for source, target in mapping.items() if isinstance(usage.get(source), int) and usage[source] >= 0}
+    calls = {}
+    for step in data.get('steps', []):
+        kind = step.get('type', '')
+        if isinstance(kind, str) and kind.endswith('_call') and len(kind) <= 80:
+            calls[kind] = calls.get(kind, 0) + 1
+    if calls:
+        normalized['agentToolCalls'] = calls
+    normalized['agentStepCount'] = len(data.get('steps', []))
+    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized}
 
 
 async def request_json(client, method, url, key, payload=None):
