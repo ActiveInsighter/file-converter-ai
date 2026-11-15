@@ -9,7 +9,8 @@ from unittest.mock import patch
 import httpx
 
 from gemini_text import (PocketBase, build_payload, create_key_pool, generate, parse_answer,
-                         recover, run_job, supports_google_search)
+                         recover, run_job, safe_error_code, search_fallback_allowed,
+                         supports_google_search)
 from key_pool import KeyPool
 
 
@@ -29,7 +30,7 @@ class TextPayloadTests(unittest.TestCase):
 
     def test_default_google_search_for_supported_chat_models_only(self):
         for model in ('gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview',
-                      'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-4-hydrogen'):
+                      'gemini-2.5-pro', 'gemini-2.0-flash'):
             value = job()
             value['model'] = model
             self.assertTrue(supports_google_search(model), model)
@@ -38,11 +39,28 @@ class TextPayloadTests(unittest.TestCase):
             self.assertEqual(payload['contents'][0]['parts'][0]['text'], 'shared prompt')
             self.assertNotIn('inlineData', json.dumps(payload))
         for model in ('gemini-test', 'my-custom-model', 'gemini-1.5-pro',
-                      'gemini-3.1-flash-image-preview', 'gemini-3.5-live-audio'):
+                      'gemini-3.1-flash-image-preview', 'gemini-3.5-live-audio',
+                      'gemini-4-hydrogen', 'gemini-4-carbon'):
             value = job()
             value['model'] = model
             self.assertFalse(supports_google_search(model), model)
             self.assertNotIn('tools', build_payload(value, {'inputText': 'test'}))
+
+    def test_search_rejection_classifier_never_retries_auth_or_possible_paid_loops(self):
+        self.assertEqual(safe_error_code({'error': {'status': 'INVALID_ARGUMENT'}}), 'INVALID_ARGUMENT')
+        self.assertEqual(safe_error_code({'error': {'message': 'secret-token'}}), 'UNKNOWN')
+        self.assertTrue(search_fallback_allowed(400, {'error': {'status': 'INVALID_ARGUMENT',
+                          'message': 'googleSearch not available for model'}}, 0.5))
+        self.assertTrue(search_fallback_allowed(400, {'error': {'status': 'INVALID_ARGUMENT',
+                          'message': 'Unsupported input argument'}}, 0.5))
+        self.assertTrue(search_fallback_allowed(403, {'error': {'status': 'PERMISSION_DENIED',
+                          'message': 'Google Search grounding not enabled'}}, 1))
+        self.assertFalse(search_fallback_allowed(401, {'error': {'message': 'google search'}}, 1))
+        self.assertFalse(search_fallback_allowed(429, {'error': {'message': 'google search'}}, 1))
+        self.assertFalse(search_fallback_allowed(400, {'error': {'status': 'INVALID_ARGUMENT'}}, 30))
+        self.assertFalse(search_fallback_allowed(400, {'error': {'message': 'too many tool calls'}}, 1))
+        self.assertFalse(search_fallback_allowed(400, {
+            'error': {'status': 'INVALID_ARGUMENT'}, 'usageMetadata': {'totalTokenCount': 4000}}, 1))
 
     def test_grounding_response_includes_google_sources_and_search_suggestions(self):
         blob = base64.b64encode(json.dumps([
@@ -175,6 +193,45 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['usage']['totalTokenCount'], 12)
         self.assertEqual(len(captured), 1)
         self.assertEqual(json.loads(captured[0].content)['tools'], [{'googleSearch': {}}])
+
+    async def test_fast_google_search_400_falls_back_once_and_returns_answer(self):
+        requests = []
+        value = job(1)
+        value['model'] = 'gemini-3.5-flash-lite'
+        async def outbound(request):
+            requests.append(json.loads(request.content))
+            if len(requests) == 1:
+                return httpx.Response(400, json={'error': {
+                    'status': 'INVALID_ARGUMENT', 'message': 'Google Search grounding is not enabled'}})
+            return httpx.Response(200, json={
+                'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': 'Offline reply'}]}}],
+                'usageMetadata': {'totalTokenCount': 12}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                                    value, value['messages'][0])
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]['tools'], [{'googleSearch': {}}])
+        self.assertNotIn('tools', requests[1])
+        self.assertIn('不联网回答', result['reply'])
+        self.assertIn('Offline reply', result['reply'])
+        self.assertEqual(result['usage']['totalTokenCount'], 12)
+        self.assertTrue(result['usage']['googleSearchFallback'])
+        self.assertEqual(result['usage']['googleSearchErrorCode'], 'INVALID_ARGUMENT')
+
+    async def test_hydrogen_does_not_send_search_and_preserves_http_error(self):
+        requests = []
+        value = job(1)
+        value['model'] = 'gemini-4-hydrogen'
+        async def outbound(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(400, json={'error': {
+                'status': 'INVALID_ARGUMENT', 'message': 'fixture-error-secret'}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 400.*INVALID_ARGUMENT'):
+                await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                               value, value['messages'][0])
+        self.assertEqual(len(requests), 1)
+        self.assertNotIn('tools', requests[0])
 
     async def test_database_outage_keeps_recovery_artifact_and_no_model_resend(self):
         value = job(1)
