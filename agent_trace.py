@@ -54,7 +54,24 @@ class AgentTrace:
 
     def preview(self, value):
         raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-        clean = self.redact(raw)
+        def scrub(item, depth=0):
+            if depth > 8:
+                return '[nested value omitted]'
+            if isinstance(item, dict):
+                return {k: ('[REDACTED]' if re.search(r'(?i)authorization|password|secret|token|api[_-]?key', str(k))
+                            else scrub(v, depth + 1)) for k, v in item.items()}
+            if isinstance(item, list):
+                return [scrub(v, depth + 1) for v in item]
+            if isinstance(item, str):
+                if item.lstrip().startswith(('{', '[')):
+                    try:
+                        return scrub(json.loads(item), depth + 1)
+                    except ValueError:
+                        pass
+                return self.redact(item)
+            return item
+        safe = scrub(value)
+        clean = self.redact(safe if isinstance(safe, str) else json.dumps(safe, ensure_ascii=False, default=str))
         limit = min(MAX_PREVIEW, self.content_budget)
         self.content_budget -= min(limit, len(clean))
         return {'chars': len(raw), 'preview': clean[:limit], 'truncated': len(clean) > limit}
@@ -155,8 +172,10 @@ class AgentTrace:
                         step['summary'] += text[:max(0, MAX_CAPTURE - len(step['summary']))]
             elif step['type'].endswith(('_call', '_result')):
                 # Keep split secrets together and redact before logging at step.stop.
-                for key in ('arguments', 'text', 'code', 'output', 'result'):
+                for key in ('arguments', 'text', 'code', 'output', 'result', 'content'):
                     value = delta.get(key)
+                    if isinstance(value, (dict, list)):
+                        value = json.dumps(value, ensure_ascii=False)
                     if isinstance(value, str):
                         step['delta_chars'] += len(value)
                         if len(step['capture']) < MAX_CAPTURE:
@@ -174,7 +193,7 @@ class AgentTrace:
             self.emit('step_stop', index=index, type=step['type'],
                       observed_seconds=round(step['stopped'] - step['started'], 3), **details)
             if step['type'].endswith('_result'):
-                call_id = step['call_id'] or (final or {}).get('call_id')
+                call_id = step['call_id'] or (final.get('call_id') if isinstance(final, dict) else None)
                 candidates = [s for s in self.pending_tools if s['type'] == step['type'][:-7] + '_call']
                 matched = next((s for s in candidates if call_id and s['call_id'] == call_id), None)
                 association = 'call_id' if matched else 'type_fifo_estimate'

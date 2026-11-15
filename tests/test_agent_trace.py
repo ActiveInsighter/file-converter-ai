@@ -95,8 +95,48 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(finished['association'], 'call_id')
         self.assertEqual(trace.pending(), [])
 
+    def test_structured_tool_argument_delta_is_captured(self):
+        trace, rows, _ = self.make_trace()
+        trace.consume({'event_type': 'step.start', 'index': 0, 'step': {'type': 'code_execution_call'}})
+        trace.consume({'event_type': 'step.delta', 'index': 0,
+                       'delta': {'type': 'arguments_delta', 'arguments': {'language': 'bash', 'code': 'npm run build'}}})
+        trace.consume({'event_type': 'step.stop', 'index': 0})
+        self.assertIn('npm run build', json.dumps(rows))
+
+    def test_nested_json_tool_results_redact_unconfigured_credentials(self):
+        trace, _, _ = self.make_trace()
+        value = {'result': json.dumps({'content': [{'text': json.dumps({'password': 'unconfigured-nested-value',
+                                                                     'answer': 'public-output'})}]})}
+        preview = trace.preview(value)
+        self.assertNotIn('unconfigured-nested-value', preview['preview'])
+        self.assertIn('public-output', preview['preview'])
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_diagnostic_failure_cannot_change_generation_or_cancel_remote(self):
+        from gemini_agent import generate_agent
+        from key_pool import KeyPool
+        requests, state = [], {}
+        async def checkpoint(update=None):
+            if update:
+                state.update(update)
+            return {'state': state, 'canceled': False}
+        async def outbound(request):
+            requests.append((request.method, request.url.path))
+            if request.method == 'POST':
+                return httpx.Response(200, json={'id': 'saved', 'status': 'in_progress'})
+            return httpx.Response(200, json={'id': 'saved', 'status': 'completed', 'output_text': 'answer'})
+        async def broken_observer(*_):
+            raise RuntimeError('diagnostic failed')
+        async def sleep(_):
+            await asyncio.sleep(0.001)
+        with patch('gemini_agent.watch_interaction', broken_observer):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                    {'model': 'Antigravity', 'prompt': 'hi', 'options': {}}, {'index': 1}, checkpoint=checkpoint, sleep=sleep)
+        self.assertEqual(result['reply'], 'answer')
+        self.assertEqual(requests, [('POST', '/v1beta/interactions'), ('GET', '/v1beta/interactions/saved')])
+
     async def test_workflow_trace_prefix_routes_without_claiming_job(self):
         from gemini_text import main
         with patch.dict('os.environ', {'REQUEST_ID': 'trace-' + 'j' * 15}), \
