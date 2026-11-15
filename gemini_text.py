@@ -261,8 +261,8 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
     search_fallback_used = False
     search_error_code = ''
     for attempt in range(4):
-        attempt_started = time.monotonic()
         index, key, lease = await pool.acquire()
+        attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(180):
                 # Gemini responses are bounded too, even for a chunked HTTP response.
