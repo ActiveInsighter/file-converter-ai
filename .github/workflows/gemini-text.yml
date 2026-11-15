@@ -1,0 +1,49 @@
+name: AnyWorkflow Gemini · Text messages
+run-name: gemini-text-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: PocketBase Gemini job ID (inputs are read from PB)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# The Python key pool is local to a runner; both workflows share repository keys.
+concurrency:
+  group: anyworkflow-gemini-quota
+  cancel-in-progress: false
+
+jobs:
+  messages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      REQUEST_ID: ${{ inputs.request_id }}
+      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
+      GEMINI_PB_URL: ${{ vars.GEMINI_PB_URL || 'https://pb.any1.tech' }}
+      POCKETBASE_SERVER_TOKEN: ${{ secrets.POCKETBASE_SERVER_TOKEN }}
+      GEMINI_PB_EMAIL: ${{ secrets.GEMINI_PB_EMAIL }}
+      GEMINI_PB_PASSWORD: ${{ secrets.GEMINI_PB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install text executor dependencies
+        run: pip install 'httpx>=0.28,<1'
+      - name: Send segments and save replies to PocketBase
+        run: python -u gemini_text.py
+      - name: Preserve replies awaiting a database write
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-text-recovery-${{ github.run_id }}
+          path: work/gemini/recovery/*.json
+          if-no-files-found: ignore
+          retention-days: 3
