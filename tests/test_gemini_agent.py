@@ -22,7 +22,7 @@ class AgentPayloadTests(unittest.TestCase):
         data = build_agent_payload(job(), {'inputText': 'document'})
         self.assertEqual(data['agent'], DEFAULT_AGENT)
         self.assertEqual(data['input'], 'question\n\ndocument')
-        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen'})
+        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen', 'max_total_tokens': str(DEFAULT_AGENT_TOKEN_BUDGET)})
         self.assertEqual(data['environment'], {'type': 'remote'})
         self.assertEqual(data['agent_config']['max_total_tokens'], str(DEFAULT_AGENT_TOKEN_BUDGET))
         self.assertEqual({tool['type'] for tool in data['tools']}, {'code_execution', 'google_search', 'url_context'})
