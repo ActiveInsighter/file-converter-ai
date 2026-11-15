@@ -17,14 +17,14 @@ from urllib.parse import quote
 import httpx
 
 from agent_trace import AgentTrace, watch_interaction
+from agent_runtime import GUIDE, mount_runtime
+from github_context import is_project_task, prepare_github_context, task_text
 
 ROOT = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
-GITHUB_TASK = re.compile(r'github|(?<![a-z])gh(?![a-z])|git(?:hub)?\b|repo(?:sitory)?\b|pull.request|'
-                         r'仓库|代码库|项目源码|项目代码|拉取代码|提交代码|推送代码|克隆|分支', re.I)
 
 
 def agent_telemetry(event, **fields):
@@ -75,8 +75,7 @@ def build_agent_payload(job, message):
     # that PAT, not an application-defined list. Clone repositories on demand.
     # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
-    task_text = '\n'.join(str(x or '') for x in (job.get('prompt'), message.get('inputText')))
-    if github_token and GITHUB_TASK.search(task_text):
+    if github_token:
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         payload['environment'] = {
             'type': 'remote',
@@ -88,25 +87,18 @@ def build_agent_payload(job, message):
                 ],
             },
         }
-        payload['tools'].append({
-            'type': 'mcp_server', 'name': 'github',
-            'url': 'https://api.githubcopilot.com/mcp',
-            'headers': {'Authorization': f'Bearer {github_token}'},
-        })
-        github_guide = (
-            'GitHub is available through the github MCP and authenticated HTTPS Git '
-            'and REST APIs. Use the MCP to discover repositories accessible to the '
-            'configured token, then clone only the repository needed for the '
-            'requested task into /workspace. You may read or write any repository '
-            'that GitHub grants this token access to; do not assume a fixed two-repo '
-            'list. Before editing, read the repository AGENTS.md when present; '
-            'prefer a feature branch and pull request to pushing main. For read-only '
-            'permission checks, make only a few lightweight MCP requests. Do not '
-            'clone or scan all repositories or enumerate issues unless explicitly '
-            'asked. Stop as soon as you can answer the question.'
-        )
+        # REST/Git stay authenticated for every prompt; no keyword can hide access.
+        # Avoid loading the full GitHub MCP schema into every reasoning turn.
+        if options.get('githubMcpEnabled') is True:
+            payload['tools'].append({'type': 'mcp_server', 'name': 'github',
+                'url': 'https://api.githubcopilot.com/mcp',
+                'headers': {'Authorization': f'Bearer {github_token}'}})
+        project = is_project_task(task_text(job, message))
+        if project:
+            mount_runtime(payload['environment'])
         payload['system_instruction'] = '\n\n'.join(
-            part for part in [payload.get('system_instruction', ''), github_guide] if part
+            part for part in [payload.get('system_instruction', ''), GUIDE if project else
+                              'GitHub HTTPS Git and REST authentication is configured in the environment.'] if part
         )
     return payload
 
@@ -201,10 +193,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 trace.emit('checkpoint_timing', seconds=round(clock() - began, 3), writing=update is not None)
                 checkpoint_report = clock()
     state = (await checkpoint()).get('state') or {}
+    if not state.get('id'):
+        context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
+                                               task_text(job, message), trace=trace)
+        if context:
+            payload['system_instruction'] = payload.get('system_instruction', '') + '\n\nTrusted task context:\n' + json.dumps(context)
     agent_telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
-        github_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
+        github_enabled=bool(os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()),
+        github_mcp_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
         input_chars=len(payload['input']),
         system_chars=len(payload.get('system_instruction', '')),
         resumed=bool(state.get('id')))
