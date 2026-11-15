@@ -134,6 +134,27 @@ class AgentPayloadTests(unittest.TestCase):
 
 
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_push_permission_failure_prevents_any_google_request(self):
+        calls = []
+        async def checkpoint(update=None):
+            return {'state': {}, 'canceled': False}
+        async def outbound(request):
+            calls.append(request)
+            self.assertEqual(request.method, 'GET')
+            self.assertNotEqual(request.url.host, 'generativelanguage.googleapis.com')
+            if request.url.path == '/user':
+                return httpx.Response(200, json={'login': 'owner'})
+            if request.url.host == 'api.github.com':
+                return httpx.Response(200, json={'full_name': 'owner/remote', 'default_branch': 'main'})
+            return httpx.Response(403)
+        task = job(); task['prompt'] = '重构owner/remote项目并推送分支'
+        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-pat'}):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                with self.assertRaisesRegex(RuntimeError, '无法写入'):
+                    await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                                         task, {}, checkpoint=checkpoint)
+        self.assertEqual(len(calls), 3)
+
     async def test_background_poll_retry_never_reposts_and_persists_identity(self):
         requests = []; state = {}; gets = 0
         async def checkpoint(update=None):

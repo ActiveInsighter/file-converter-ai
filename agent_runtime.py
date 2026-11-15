@@ -8,7 +8,7 @@ GUIDE = f'''GitHub HTTPS Git and REST authentication is configured by the enviro
 Never request, print or store credentials. Access is determined by the configured token.
 Use the resolved repository from the trusted task context below. Do not search all of
 GitHub for generic words or enumerate issues/PRs unless the task needs them. If no
-repository is resolved, `{HELPER}` has `identity` and `repos` commands returning a
+repository is resolved, `python3 {HELPER}` has `identity` and `repos` commands returning a
 compact inventory. Clone only the target repository.
 Read its AGENTS.md and relevant project skills. Use `cd /workspace/<repo>` explicitly
 in shell commands. After one filesystem search timeout, switch to targeted rg/rg --files

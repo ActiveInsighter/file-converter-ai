@@ -201,8 +201,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     agent_telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
-        github_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
-        github_authenticated=bool(os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()),
+        github_enabled=bool(os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()),
+        github_mcp_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
         input_chars=len(payload['input']),
         system_chars=len(payload.get('system_instruction', '')),
         resumed=bool(state.get('id')))
