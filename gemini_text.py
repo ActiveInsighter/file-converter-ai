@@ -21,6 +21,11 @@ from providers import GeminiProvider
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 
 
+async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") -> KeyPool:
+    return await KeyPool.create(keys, parse_key_groups(len(keys), raw_groups),
+        rpm_per_key=options["rpmPerKey"], rpd_per_key=options["rpdPerKey"])
+
+
 def build_payload(job: dict, message: dict) -> dict:
     parts = [{"text": value} for value in (job.get("prompt", ""), message.get("inputText", "")) if value]
     options = job["options"]
@@ -230,8 +235,7 @@ async def main():
             return 0
 
         async def pool_factory(options):
-            return await KeyPool.create(keys, parse_key_groups(os.environ.get("GEMINI_KEY_GROUPS", ""), len(keys)),
-                rpm_per_key=options["rpmPerKey"], rpd_per_key=options["rpdPerKey"])
+            return await create_key_pool(keys, options, os.environ.get("GEMINI_KEY_GROUPS", ""))
 
         return await run_job(pb, client, job_id, execution_id, pool_factory, Path("work/gemini/recovery"))
 
