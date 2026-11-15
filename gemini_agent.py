@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -20,6 +21,31 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+DEFAULT_AGENT_TOKEN_BUDGET = 20000  # 0 previously permitted unlimited loops.
+GITHUB_TASK = re.compile(r'github|(?<![a-z])gh(?![a-z])|git(?:hub)?\b|repo(?:sitory)?\b|pull.request|'
+                         r'仓库|代码库|项目源码|项目代码|拉取代码|提交代码|推送代码|克隆|分支', re.I)
+
+
+def agent_telemetry(event, **fields):
+    """Metadata only: no prompts, interaction IDs, credentials, or tool payloads."""
+    print('[agent.telemetry] ' + json.dumps({'event': event, **fields}, ensure_ascii=False, separators=(',', ':')), flush=True)
+
+
+def agent_usage_diagnostics(data):
+    """Google's cumulative usage; never sum multiple polling responses."""
+    raw = data.get('usage') or {}
+    keys = ('total_tokens', 'total_input_tokens', 'total_output_tokens', 'total_thought_tokens',
+            'total_tool_use_tokens', 'total_cached_tokens')
+    usage = {k: raw[k] for k in keys if type(raw.get(k)) is int and raw[k] >= 0}
+    kinds = {}
+    for step in data.get('steps', []):
+        if not isinstance(step, dict):
+            continue
+        kind = step.get('type', '')
+        if not isinstance(kind, str) or not re.fullmatch(r'[a-z_]{1,48}', kind):
+            kind = 'other'
+        kinds[kind] = kinds.get(kind, 0) + 1
+    return {'usage': usage, 'step_count': sum(kinds.values()), 'step_types': kinds}
 
 
 class AgentCanceled(RuntimeError):
@@ -42,16 +68,16 @@ def build_agent_payload(job, message):
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
         'agent_config': {'type': 'antigravity', 'model': options.get('model', DEFAULT_MODEL)},
     }
-    # Omission means no additional token-budget cap. Never send generation_config.
-    if options.get('maxTotalTokens', 0):
-        payload['agent_config']['max_total_tokens'] = str(options['maxTotalTokens'])
+    # Legacy 0 meant unlimited; bound it while preserving explicit positive budgets.
+    payload['agent_config']['max_total_tokens'] = str(options.get('maxTotalTokens') or DEFAULT_AGENT_TOKEN_BUDGET)
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
     # A configured GitHub PAT grants access to every repository permitted by
     # that PAT, not an application-defined list. Clone repositories on demand.
     # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
-    if github_token:
+    task_text = '\n'.join(str(x or '') for x in (job.get('prompt'), message.get('inputText')))
+    if github_token and GITHUB_TASK.search(task_text):
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         payload['environment'] = {
             'type': 'remote',
@@ -75,7 +101,10 @@ def build_agent_payload(job, message):
             'requested task into /workspace. You may read or write any repository '
             'that GitHub grants this token access to; do not assume a fixed two-repo '
             'list. Before editing, read the repository AGENTS.md when present; '
-            'prefer a feature branch and pull request to pushing main.'
+            'prefer a feature branch and pull request to pushing main. For read-only '
+            'permission checks, make only a few lightweight MCP requests. Do not '
+            'clone or scan all repositories or enumerate issues unless explicitly '
+            'asked. Stop as soon as you can answer the question.'
         )
         payload['system_instruction'] = '\n\n'.join(
             part for part in [payload.get('system_instruction', ''), github_guide] if part
@@ -119,6 +148,8 @@ def parse_interaction(data):
     if calls:
         normalized['agentToolCalls'] = calls
     normalized['agentStepCount'] = len(data.get('steps', []))
+    if type(usage.get('total_tool_use_tokens')) is int and usage['total_tool_use_tokens'] >= 0:
+        normalized['toolUseTokenCount'] = usage['total_tool_use_tokens']
     return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized}
 
 
