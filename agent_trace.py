@@ -72,9 +72,9 @@ class AgentTrace:
             return item
         safe = scrub(value)
         clean = self.redact(safe if isinstance(safe, str) else json.dumps(safe, ensure_ascii=False, default=str))
-        limit = min(MAX_PREVIEW, self.content_budget)
-        self.content_budget -= min(limit, len(clean))
-        return {'chars': len(raw), 'preview': clean[:limit], 'truncated': len(clean) > limit}
+        preview = clean[:MAX_PREVIEW].encode('utf-8')[:self.content_budget].decode('utf-8', errors='ignore')
+        self.content_budget -= len(preview.encode('utf-8'))
+        return {'chars': len(raw), 'preview': preview, 'truncated': len(clean) > len(preview)}
 
     def emit(self, event, **fields):
         row = {'at': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
@@ -208,6 +208,8 @@ class AgentTrace:
         self.status = str(data.get('status', 'unknown'))
         steps = data.get('steps') or []
         self.emit('snapshot', status=self.status, step_count=len(steps),
+                  provider_created=data.get('created'), provider_updated=data.get('updated'),
+                  **{key: self.preview(data[key]) for key in ('error', 'incomplete_details') if data.get(key)},
                   usage={k: v for k, v in (data.get('usage') or {}).items() if type(v) is int})
         for index, step in enumerate(steps):
             if isinstance(step, dict):

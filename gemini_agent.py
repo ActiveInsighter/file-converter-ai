@@ -226,8 +226,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = {'id': state['id'], 'status': 'in_progress'}
             break
         try:
+            create_started = clock()
             status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
-        except (httpx.TransportError, TimeoutError):
+            trace.emit('create_http', http=status, seconds=round(clock() - create_started, 3),
+                       attempt=attempt + 1,
+                       **({'error': trace.preview(data['error'])} if data.get('error') else {}))
+        except (httpx.TransportError, TimeoutError) as error:
+            trace.emit('create_transport_error', error_type=type(error).__name__,
+                       seconds=round(clock() - create_started, 3), resent=False)
             await pool.mark_error(index, lease)
             raise RuntimeError('Agent 提交连接中断，无法确认是否已创建；为避免重复执行，未自动重发。') from None
         if status in [200, 201, 202]:
@@ -301,7 +307,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 status, _, data = await request_json(client, 'GET', url, key)
                 if status != 200:
                     trace.emit('poll_http_error', http=status, consecutive_failures=failures + 1,
-                               seconds=round(clock() - poll_started, 3))
+                               seconds=round(clock() - poll_started, 3),
+                               **({'error': trace.preview(data['error'])} if data.get('error') else {}))
                     if status in [429, 500, 502, 503, 504]:
                         failures += 1
                         if failures <= 20:
