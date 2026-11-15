@@ -30,8 +30,8 @@ MAX_REPLY_BYTES = 2 * 1024 * 1024
 # Use only Google-documented Search-compatible models. Do not infer support
 # from the "gemini-" prefix: e.g. gemini-4-hydrogen is not documented.
 SEARCHABLE_CHAT_MODEL = re.compile(
-    r'^gemini-(?:2\\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
-    r'3\\.(?:1-pro|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
+    r'^gemini-(?:2\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
+    r'3\.(?:1-pro|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
     r'3-(?:pro|flash))(?=$|-)', re.I)
 NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
 
