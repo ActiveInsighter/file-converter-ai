@@ -201,5 +201,28 @@ Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保�
 GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_agent_state.js`
 与 checkpoint 路由。使用现有 `GEMINI_API_KEYS`，无需把任何服务器凭据挂入沙盒。
 
+### Antigravity 使用 GitHub 仓库（可选，按用户限制）
+
+启用后，受信任的 **PocketBase `aw_clients` 用户**通过 Remote 的「Gemini 消息」调用 Antigravity 时，Agent 自动挂载以下工作区：
+`/workspace/file-converter-ai` 和 `/workspace/Anyworkflow-remote`。
+同时启用官方 GitHub Remote MCP（可以读取、提交文件及创建 PR），并允许沙盒通过
+`github.com` 的 Git HTTPS 和 `api.github.com` 的 REST API 访问授权仓库。
+只配置密钥不会给所有账号开启 GitHub 写权限；未满足以下两个条件时继续使用原来的普通远程 Agent。
+
+1. **先部署后端**：将 `ActiveInsighter/AnyWorkflow-workers` 的 `gemini_execution.js` 更新，使经过服务端认证的 `/jobs/{id}/claim` 响应包含 `owner`（对应 `aw_clients` 的记录 ID）。不要让前端或用户提示词提供此字段。
+2. **再更新本仓库**，在 GitHub `Settings → Secrets and variables → Actions` 中设置：
+   - **Actions Secret** `ANTIGRAVITY_GITHUB_TOKEN`：GitHub Fine-grained PAT，仅选择 `file-converter-ai`、`Anyworkflow-remote`，授予 Contents Read/Write 和 Pull requests Read/Write。
+   - **Actions Variable** `ANTIGRAVITY_GITHUB_ALLOWED_OWNER`：允许使用 PAT 的 PocketBase `aw_clients` **记录 ID**（在 PB 后台此集合中查看，**不是 GitHub 用户名**）。
+3. 用该 PB 账号发起一条 Antigravity 消息，先要求只检查仓库与 GitHub MCP 权限；验证成功后再要求 Agent 创建单独功能分支、运行测试并创建 PR。请勿让 Agent 直接推送 `main`：Remote 的正式部署由 `main` 推送触发。
+
+Token 仅位于 GitHub Actions Secret / 受保护的执行器进程，并由 Python 通过 Interactions
+API 请求的代理网络规则与 MCP headers 注入。**Token 会出现在发往 Google 的请求体中**，
+但不会写入 Agent 沙盒的环境变量、提示词或仓库文件；不要记录完整请求体或密钥相关报错。
+网络规则仅将 Basic 认证发送至 `github.com`、Bearer 发送至 `api.github.com`，
+GitHub MCP 单独使用 Bearer。使用最小权限和短有效期的 PAT 并定期轮换。
+
+官方参考：https://ai.google.dev/gemini-api/docs/agent-environment
+以及 https://ai.google.dev/gemini-api/docs/function-calling 。
+
 官方参考：https://aistudio.google.com/docs/antigravity-agent
 验证：`python -m unittest discover -s tests`。
