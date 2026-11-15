@@ -27,12 +27,13 @@ MAX_REPLY_BYTES = 2 * 1024 * 1024
 
 # Current Gemini text models support Google Search grounding. Do not add the
 # tool to arbitrary user-saved model IDs (image/audio/legacy models may reject it).
-# Use only Google-documented Search-compatible models. Do not infer support
-# from the "gemini-" prefix: e.g. gemini-4-hydrogen is not documented.
+# Google Search is available for these Gemini API families, including
+# Gemini 4 Hydrogen (confirmed in Google's Firebase AI Logic documentation).
+# Availability on a given API key/project/tier is a separate runtime check.
 SEARCHABLE_CHAT_MODEL = re.compile(
     r'^gemini-(?:2\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
-    r'3\.(?:1-pro|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
-    r'3-(?:pro|flash))(?=$|-)', re.I)
+    r'3\.(?:1-(?:pro|flash-lite)|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
+    r'3-(?:pro|flash)|4-(?:hydrogen|argon|carbon))(?=$|-)', re.I)
 NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
 
 
