@@ -7,13 +7,14 @@ from github_context import git_write_access, prepare_github_context, repository_
 
 REPOS = [{'full_name': 'owner/Anyworkflow-remote', 'default_branch': 'main'},
          {'full_name': 'owner/exam-docs', 'default_branch': 'main'},
+         {'full_name': 'owner/openai-gemini', 'default_branch': 'main'},
          {'full_name': 'owner/Anyworkflow-remote-drive', 'default_branch': 'main'}]
 
 
 class RepositoryTests(unittest.TestCase):
     def test_user_project_names_resolve_without_global_search(self):
         for text, expected in [('重新推送部署下我的exam docs项目', 'owner/exam-docs'),
-                               ('看看工作流remote项目，重构后推送分支', 'owner/Anyworkflow-remote'),
+                               ('看看工作流remote项目，gemini消息界面重构后推送分支', 'owner/Anyworkflow-remote'),
                                ('修改 https://github.com/owner/exam-docs', 'owner/exam-docs')]:
             self.assertEqual(repository_candidates(text, REPOS)[0]['full_name'], expected)
 

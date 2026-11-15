@@ -30,6 +30,8 @@ def repository_candidates(text, repositories):
         else:
             suffix = re.split(r'[-_.]', short.casefold())[-1]
             score = 10 + len(suffix) if len(suffix) >= 4 and suffix in words else 0
+            if score and re.search(re.escape(suffix) + r'\s*(?:项目|仓库|project\b|repository\b)', text, re.I):
+                score += 50
         if score:
             ranked.append((score, repo))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]['full_name']))
@@ -105,6 +107,8 @@ async def prepare_github_context(client, token, text, *, require_write=None, tra
         context['write_verified'] = await git_write_access(client, token, selected['full_name'])
     if trace:
         trace.emit('github_preflight', **context)
+    if needs_write and len(candidates) > 1:
+        raise RuntimeError('目标仓库有歧义，请明确 owner/repository；候选：' + ', '.join(r['full_name'] for r in candidates[:5]))
     if selected and needs_write and context['write_verified'] is False:
         raise RuntimeError(f'Agent GitHub 密钥无法写入 {selected["full_name"]}（Git receive-pack 拒绝）。'
                            '请为该密钥授予目标仓库 Contents: Read and write；本次未启动远程 Agent。')
