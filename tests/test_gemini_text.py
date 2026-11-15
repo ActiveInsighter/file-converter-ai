@@ -30,7 +30,8 @@ class TextPayloadTests(unittest.TestCase):
 
     def test_default_google_search_for_supported_chat_models_only(self):
         for model in ('gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview',
-                      'gemini-2.5-pro', 'gemini-2.0-flash'):
+                      'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-4-hydrogen',
+                      'gemini-4-argon', 'gemini-4-carbon', 'gemini-3.1-flash-lite'):
             value = job()
             value['model'] = model
             self.assertTrue(supports_google_search(model), model)
@@ -39,8 +40,7 @@ class TextPayloadTests(unittest.TestCase):
             self.assertEqual(payload['contents'][0]['parts'][0]['text'], 'shared prompt')
             self.assertNotIn('inlineData', json.dumps(payload))
         for model in ('gemini-test', 'my-custom-model', 'gemini-1.5-pro',
-                      'gemini-3.1-flash-image-preview', 'gemini-3.5-live-audio',
-                      'gemini-4-hydrogen', 'gemini-4-carbon'):
+                      'gemini-3.1-flash-image-preview', 'gemini-3.5-live-audio'):
             value = job()
             value['model'] = model
             self.assertFalse(supports_google_search(model), model)
@@ -218,20 +218,20 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['usage']['googleSearchFallback'])
         self.assertEqual(result['usage']['googleSearchErrorCode'], 'INVALID_ARGUMENT')
 
-    async def test_hydrogen_does_not_send_search_and_preserves_http_error(self):
+    async def test_hydrogen_sends_search_and_preserves_non_search_http_error(self):
         requests = []
         value = job(1)
         value['model'] = 'gemini-4-hydrogen'
         async def outbound(request):
             requests.append(json.loads(request.content))
-            return httpx.Response(400, json={'error': {
-                'status': 'INVALID_ARGUMENT', 'message': 'fixture-error-secret'}})
+            return httpx.Response(403, json={'error': {
+                'status': 'PERMISSION_DENIED', 'message': 'fixture-error-secret'}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
-            with self.assertRaisesRegex(RuntimeError, 'HTTP 400.*INVALID_ARGUMENT'):
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 403.*PERMISSION_DENIED'):
                 await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
                                value, value['messages'][0])
         self.assertEqual(len(requests), 1)
-        self.assertNotIn('tools', requests[0])
+        self.assertEqual(requests[0]['tools'], [{'googleSearch': {}}])
 
     async def test_database_outage_keeps_recovery_artifact_and_no_model_resend(self):
         value = job(1)
