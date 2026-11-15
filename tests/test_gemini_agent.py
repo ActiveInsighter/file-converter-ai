@@ -3,10 +3,14 @@ import hashlib
 import json
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stdout
+from io import StringIO
 
 import httpx
 
-from gemini_agent import AgentCanceled, DEFAULT_AGENT, build_agent_payload, generate_agent, parse_interaction, upstream_error
+from gemini_agent import (AgentCanceled, DEFAULT_AGENT, DEFAULT_AGENT_TOKEN_BUDGET,
+                          agent_usage_diagnostics, build_agent_payload, generate_agent,
+                          parse_interaction, upstream_error)
 from key_pool import KeyPool
 
 
@@ -16,12 +20,13 @@ def job():
 
 
 class AgentPayloadTests(unittest.TestCase):
-    def test_alias_uses_agent_api_with_all_tools_and_unlimited_budget(self):
+    def test_alias_uses_agent_api_with_default_safety_budget(self):
         data = build_agent_payload(job(), {'inputText': 'document'})
         self.assertEqual(data['agent'], DEFAULT_AGENT)
         self.assertEqual(data['input'], 'question\n\ndocument')
-        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen'})
+        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen', 'max_total_tokens': str(DEFAULT_AGENT_TOKEN_BUDGET)})
         self.assertEqual(data['environment'], {'type': 'remote'})
+        self.assertEqual(data['agent_config']['max_total_tokens'], str(DEFAULT_AGENT_TOKEN_BUDGET))
         self.assertEqual({tool['type'] for tool in data['tools']}, {'code_execution', 'google_search', 'url_context'})
         self.assertTrue(data['background']); self.assertTrue(data['store'])
         self.assertEqual(data['system_instruction'], 'system')
@@ -39,6 +44,7 @@ class AgentPayloadTests(unittest.TestCase):
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}, clear=True):
             for owner in ['', 'a' * 15, 'b' * 15]:
                 task = job()
+                task['prompt'] = '检查我的 GitHub 仓库权限'
                 if owner:
                     task['owner'] = owner
                 payload = build_agent_payload(task, {})
@@ -58,8 +64,38 @@ class AgentPayloadTests(unittest.TestCase):
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_ALLOWED_OWNER': 'a' * 15}, clear=True):
             task = job()
             task['owner'] = 'a' * 15
-            self.assertEqual(build_agent_payload(task, {})['environment'], {'type': 'remote'})
-            self.assertNotIn('mcp_server', [tool['type'] for tool in build_agent_payload(task, {})['tools']])
+            self.assertEqual(build_agent_payload(task, {'inputText': '读取github'})['environment'], {'type': 'remote'})
+            self.assertNotIn('mcp_server', [tool['type'] for tool in build_agent_payload(task, {'inputText': '读取github'})['tools']])
+
+    def test_simple_prompts_do_not_mount_github_or_disable_safety_cap(self):
+        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}):
+            value = build_agent_payload(job(), {'inputText': '你是谁？'})
+            self.assertEqual(value['environment'], {'type': 'remote'})
+            self.assertNotIn('mcp_server', [tool['type'] for tool in value['tools']])
+            self.assertNotIn('fixture-github-secret', json.dumps(value))
+            self.assertEqual(value['agent_config']['max_total_tokens'], str(DEFAULT_AGENT_TOKEN_BUDGET))
+            value = build_agent_payload(job(), {'inputText': '你能查看 gh 仓库吗？'})
+            self.assertIn('mcp_server', [tool['type'] for tool in value['tools']])
+
+    def test_google_cumulative_usage_is_not_duplicated_and_diagnostics_are_safe(self):
+        source = {'status': 'completed', 'usage': {
+            'total_tokens': 94123, 'total_input_tokens': 40000,
+            'total_output_tokens': 2000, 'total_thought_tokens': 30000,
+            'total_tool_use_tokens': 22123, 'total_cached_tokens': 5000,
+        }, 'steps': [{'type': 'mcp_server_call', 'arguments': 'super-secret-payload'},
+                     {'type': 'mcp_server_result', 'content': [{'text': 'private tool result'}]},
+                     {'type': 'model_output', 'content': [{'type': 'text', 'text': 'OK'}]}]}
+        result = parse_interaction(source)
+        self.assertEqual(result['usage']['totalTokenCount'], 94123)
+        self.assertEqual(result['usage']['toolUseTokenCount'], 22123)
+        self.assertEqual(result['reply'], 'OK')
+        summary = json.dumps(agent_usage_diagnostics(source))
+        self.assertIn('94123', summary)
+        self.assertIn('mcp_server_call', summary)
+        self.assertNotIn('super-secret', summary)
+        self.assertNotIn('private tool result', summary)
+        # Cached tokens are a subset of input; never add counters together.
+        self.assertEqual(result['usage']['totalTokenCount'], source['usage']['total_tokens'])
 
     def test_upstream_error_redacts_github_bearer_and_basic_token(self):
         import base64
@@ -105,9 +141,16 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             if gets == 1: raise httpx.ReadTimeout('GET interrupted')
             return httpx.Response(200, json={'id': 'v1_agent', 'environment_id': 'env_test', 'status': 'completed', 'steps': [{'type': 'model_output', 'content': [{'type': 'text', 'text': 'agent answer'}]}]})
         async def sleep(_): pass
-        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
-            result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
+        logs = StringIO()
+        with redirect_stdout(logs):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'agent answer')
+        self.assertIn('"event":"created"', logs.getvalue())
+        self.assertIn('"event":"progress"', logs.getvalue())
+        self.assertIn('"event":"completed"', logs.getvalue())
+        self.assertIn('"step_types":{"model_output":1}', logs.getvalue())
+        self.assertNotIn('fixture-secret', logs.getvalue())
         self.assertEqual(sum(request.method == 'POST' for request in requests), 1)
         self.assertEqual(state['id'], 'v1_agent'); self.assertEqual(state['environmentId'], 'env_test')
         self.assertEqual(state['credentialHash'], hashlib.sha256(b'fixture-secret').hexdigest())

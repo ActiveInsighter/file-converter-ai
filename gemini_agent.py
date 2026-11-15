@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -20,6 +21,31 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+DEFAULT_AGENT_TOKEN_BUDGET = 20000  # 0 previously permitted unlimited loops.
+GITHUB_TASK = re.compile(r'github|(?<![a-z])gh(?![a-z])|git(?:hub)?\b|repo(?:sitory)?\b|pull.request|'
+                         r'仓库|代码库|项目源码|项目代码|拉取代码|提交代码|推送代码|克隆|分支', re.I)
+
+
+def agent_telemetry(event, **fields):
+    """Metadata only: no prompts, interaction IDs, credentials, or tool payloads."""
+    print('[agent.telemetry] ' + json.dumps({'event': event, **fields}, ensure_ascii=False, separators=(',', ':')), flush=True)
+
+
+def agent_usage_diagnostics(data):
+    """Google's cumulative usage; never sum multiple polling responses."""
+    raw = data.get('usage') or {}
+    keys = ('total_tokens', 'total_input_tokens', 'total_output_tokens', 'total_thought_tokens',
+            'total_tool_use_tokens', 'total_cached_tokens')
+    usage = {k: raw[k] for k in keys if type(raw.get(k)) is int and raw[k] >= 0}
+    kinds = {}
+    for step in data.get('steps', []):
+        if not isinstance(step, dict):
+            continue
+        kind = step.get('type', '')
+        if not isinstance(kind, str) or not re.fullmatch(r'[a-z_]{1,48}', kind):
+            kind = 'other'
+        kinds[kind] = kinds.get(kind, 0) + 1
+    return {'usage': usage, 'step_count': sum(kinds.values()), 'step_types': kinds}
 
 
 class AgentCanceled(RuntimeError):
@@ -42,16 +68,16 @@ def build_agent_payload(job, message):
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
         'agent_config': {'type': 'antigravity', 'model': options.get('model', DEFAULT_MODEL)},
     }
-    # Omission means no additional token-budget cap. Never send generation_config.
-    if options.get('maxTotalTokens', 0):
-        payload['agent_config']['max_total_tokens'] = str(options['maxTotalTokens'])
+    # Legacy 0 meant unlimited; bound it while preserving explicit positive budgets.
+    payload['agent_config']['max_total_tokens'] = str(options.get('maxTotalTokens') or DEFAULT_AGENT_TOKEN_BUDGET)
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
     # A configured GitHub PAT grants access to every repository permitted by
     # that PAT, not an application-defined list. Clone repositories on demand.
     # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
-    if github_token:
+    task_text = '\n'.join(str(x or '') for x in (job.get('prompt'), message.get('inputText')))
+    if github_token and GITHUB_TASK.search(task_text):
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         payload['environment'] = {
             'type': 'remote',
@@ -75,7 +101,10 @@ def build_agent_payload(job, message):
             'requested task into /workspace. You may read or write any repository '
             'that GitHub grants this token access to; do not assume a fixed two-repo '
             'list. Before editing, read the repository AGENTS.md when present; '
-            'prefer a feature branch and pull request to pushing main.'
+            'prefer a feature branch and pull request to pushing main. For read-only '
+            'permission checks, make only a few lightweight MCP requests. Do not '
+            'clone or scan all repositories or enumerate issues unless explicitly '
+            'asked. Stop as soon as you can answer the question.'
         )
         payload['system_instruction'] = '\n\n'.join(
             part for part in [payload.get('system_instruction', ''), github_guide] if part
@@ -119,6 +148,8 @@ def parse_interaction(data):
     if calls:
         normalized['agentToolCalls'] = calls
     normalized['agentStepCount'] = len(data.get('steps', []))
+    if type(usage.get('total_tool_use_tokens')) is int and usage['total_tool_use_tokens'] >= 0:
+        normalized['toolUseTokenCount'] = usage['total_tool_use_tokens']
     return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized}
 
 
@@ -156,7 +187,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     from providers import GeminiProvider
     provider = GeminiProvider()
     payload = build_agent_payload(job, message)
+    started = clock()
     state = (await checkpoint()).get('state') or {}
+    agent_telemetry('prepared',
+        model=payload['agent_config']['model'],
+        budget_tokens=int(payload['agent_config']['max_total_tokens']),
+        tools=[tool.get('type') for tool in payload['tools']],
+        github_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
+        input_chars=len(payload['input']),
+        system_chars=len(payload.get('system_instruction', '')),
+        resumed=bool(state.get('id')))
     index = key = lease = None
     current = None
     for attempt in range(max(1, len(pool.keys))):
@@ -181,6 +221,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = data
             if not isinstance(data.get('id'), str) or not data['id']:
                 raise RuntimeError('Agent 未返回 interaction ID；未自动重发。')
+            agent_telemetry('created', elapsed_seconds=round(clock() - started, 2),
+                            status=data.get('status', 'unknown'),
+                            environment_created=bool(data.get('environment_id')))
             state = {'id': data['id'], 'credentialHash': fingerprint, 'status': data.get('status', 'in_progress')}
             if isinstance(data.get('environment_id'), str):
                 state['environmentId'] = data['environment_id']
@@ -210,12 +253,22 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     url = f'{ROOT}/{quote(current["id"], safe="")}'
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
+    poll_count = 0
+    last_report = started
+    last_status = None
     try:
         while True:
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
-                return parse_interaction(current)
+                result = parse_interaction(current)
+                agent_telemetry('completed',
+                    status=current['status'],
+                    elapsed_seconds=round(clock() - started, 2),
+                    polls=poll_count,
+                    reply_chars=len(result['reply']),
+                    **agent_usage_diagnostics(current))
+                return result
             control = await checkpoint()
             if control.get('canceled'):
                 await request_json(client, 'POST', url + ':cancel', key)
@@ -237,6 +290,15 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                             continue
                     raise upstream_error(status, data, key)
                 current, failures = data, 0
+                poll_count += 1
+                # Heartbeat and cumulative counters, never the response body or thoughts.
+                if current.get('status') != last_status or clock() - last_report >= 30:
+                    summary = agent_usage_diagnostics(current)
+                    agent_telemetry('progress', elapsed_seconds=round(clock() - started, 2),
+                                    polls=poll_count, status=current.get('status', 'unknown'),
+                                    **summary)
+                    last_status = current.get('status')
+                    last_report = clock()
             except (httpx.TransportError, TimeoutError):
                 failures += 1
                 if failures > 20:
