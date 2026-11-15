@@ -222,10 +222,16 @@ GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_a
 **只需配置这一个 Secret**，无需 `ANTIGRAVITY_GITHUB_ALLOWED_OWNER`、
 PocketBase 用户 ID、额外后端迁移或 Google Credentials API。
 `gemini-text.yml` 将密钥仅传给服务端执行器；`gemini_agent.py` 在发起
-Antigravity Interactions API 请求时检测密钥，并在本次任务涉及 GitHub、仓库、分支、提交等操作时按需启用 GitHub MCP。
-普通身份问答、闲聊不自动挂载 GitHub MCP，避免不必要的工具初始化与 Agent 循环。
-有仓库需求时可通过 MCP 查询 Token 可访问的仓库，并让 Agent 在需要时把指定仓库按需克隆到 `/workspace`；
-不会在每次请求中预先克隆所有仓库。还会配置 GitHub Git/REST 请求认证；
+Antigravity Interactions API 请求时检测密钥；只要已配置，GitHub Git/REST 认证就始终可用，
+不再依赖“仓库”“分支”等提示词关键词。默认使用 REST/Git 和精简的工作区 helper，
+不加载完整 GitHub MCP 工具目录；特殊调用可显式设置 `options.agent.githubMcpEnabled=true`。
+项目任务在创建 Google interaction 前解析目标仓库，并在需要推送代码时用只读 Git
+receive-pack 握手检查实际写权限。检查不修改仓库；拒绝时立即说明目标和所需权限，
+不先花几十分钟改代码。它检查普通 Git 写权限，不替代分支保护、workflow 文件权限或 PR 权限。
+执行器优先明确的 owner/repository，其次匹配当前 Token 可访问仓库的精简清单，
+不在全 GitHub 搜索 `remote`、`exam` 等泛词。仓库歧义明确报出候选，不盲选。
+只有需要源码的任务才克隆指定仓库到 `/workspace`，不预先克隆所有仓库。
+单纯重新部署使用 workflow API，不先克隆、安装依赖或本地构建。
 为空则保持原来的普通 Agent 模式。
 普通 Gemini 模型和 PDF 转换流程不受影响。
 
@@ -237,9 +243,33 @@ Antigravity Interactions API 请求时检测密钥，并在本次任务涉及 Gi
 建议使用最小范围、短有效期的 PAT，定期轮换。
 
 配置后先在 Remote 的「Gemini 消息」选择 Antigravity，要求它只读取目标仓库并测试
-GitHub MCP 访问，不执行任何修改；确认成功后再要求它创建功能分支、运行测试并提交 PR。
+GitHub REST 访问；需要修改源码时，执行器还会在开始前验证 Git 写权限。
 **不要直接推送 `main`**：Anyworkflow-remote 的 `main` 推送会触发正式 Cloudflare 部署。
-目前只覆盖本地 mock / CI 测试，未执行真实 Antigravity GitHub 写入验证。
+真实凭据能力检查、工作区恢复和运行时探针记录在本次修复说明中。
+
+### 部署防重与故障恢复
+
+项目任务挂载 `/workspace/.anyworkflow/github.py` 与部署 hook。Agent 通过
+`deploy --repo OWNER/REPO --workflow FILE.yml --ref BRANCH --inputs-json '{...}'` 提交：
+
+- 先写入任务工作区日志，再发出一次 POST；布尔输入统一转为字符串。
+- HTTP 204 视为已接受。通过限定 workflow、分支、SHA 和提交前运行集合查找新增运行，
+  绑定 run ID 后只查询该运行，不使用整个仓库列表的“第一条”。
+- 同一工作区重复调用复用原 run；响应丢失、暂不可见或结果有歧义都不再次 POST。
+- `watch --repo OWNER/REPO --run-id ID` 等待指定运行；success 立即结束。
+- pre-tool hook 对常见直接 curl dispatch / gh workflow run 返回 helper 使用说明。
+  这是防止误操作的执行约定，不是针对恶意代码的网络安全隔离。
+
+维护入口沿用既有 workflow，`request_id` 使用以下显式前缀，与原任务队列隔离：
+
+- `check-<原任务ID>`：仅 GET，检查原任务目标及当前密钥的写权限。
+- `rescue-<原任务ID>`：仅 GET，从原 Google 环境下载目标仓库的 `.git`，保存为
+  `anyworkflow-git-recovery-v1` JSON artifact，供恢复提交；不包含 node_modules。
+- `probe-<原任务ID>`：创建一个最长 3 分钟的只读 Google Agent 探针，验证挂载工具、hook
+  配置和 GitHub identity；不修改原任务、不推送代码、不部署网站。它会产生真实 API 用量。
+
+Git 恢复 JSON 不是回复恢复 JSON，不能交给 `--recover-dir`。恢复时校验 SHA-256，
+将 Git objects/refs 导入干净仓库，丢弃沙盒的 config 和 hooks，再检查和验证提交。
 
 ### Actions Agent 诊断日志
 
@@ -284,7 +314,7 @@ interaction 身份并使用匹配 Key 获取现有事件，不领取、生成、
 **说明：** `total_cached_tokens` 通常是输入 Token 的子集，不能简单把所有字段相加当作总计；
 页面显示的 Total Token 直接来自 Google `usage.total_tokens`。更新前的任务没有这些明细日志，
 无法从旧日志反推为什么消耗了多少工具 Token 或思考 Token。
-有仓库权限的任务仍可使用 Github MCP，但仅在提示词明确涉及 GitHub/仓库时挂载；
+GitHub MCP 可显式选择启用，默认仓库任务通过已认证的 REST/Git 执行；
 普通问题仍然经过 Antigravity Agent，因此耗时不会完全等同于简单模型的 generateContent。
 
 官方参考：https://aistudio.google.com/docs/antigravity-agent
