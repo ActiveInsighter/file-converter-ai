@@ -3,6 +3,8 @@ import hashlib
 import json
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stdout
+from io import StringIO
 
 import httpx
 
@@ -139,9 +141,16 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             if gets == 1: raise httpx.ReadTimeout('GET interrupted')
             return httpx.Response(200, json={'id': 'v1_agent', 'environment_id': 'env_test', 'status': 'completed', 'steps': [{'type': 'model_output', 'content': [{'type': 'text', 'text': 'agent answer'}]}]})
         async def sleep(_): pass
-        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
-            result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
+        logs = StringIO()
+        with redirect_stdout(logs):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'agent answer')
+        self.assertIn('"event":"created"', logs.getvalue())
+        self.assertIn('"event":"progress"', logs.getvalue())
+        self.assertIn('"event":"completed"', logs.getvalue())
+        self.assertIn('"step_types":{"model_output":1}', logs.getvalue())
+        self.assertNotIn('fixture-secret', logs.getvalue())
         self.assertEqual(sum(request.method == 'POST' for request in requests), 1)
         self.assertEqual(state['id'], 'v1_agent'); self.assertEqual(state['environmentId'], 'env_test')
         self.assertEqual(state['credentialHash'], hashlib.sha256(b'fixture-secret').hexdigest())
