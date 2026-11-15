@@ -8,7 +8,7 @@ from io import StringIO
 
 import httpx
 
-from gemini_agent import (AgentCanceled, DEFAULT_AGENT, DEFAULT_AGENT_TOKEN_BUDGET,
+from gemini_agent import (AgentCanceled, DEFAULT_AGENT,
                           agent_usage_diagnostics, build_agent_payload, generate_agent,
                           parse_interaction, upstream_error)
 from key_pool import KeyPool
@@ -20,23 +20,23 @@ def job():
 
 
 class AgentPayloadTests(unittest.TestCase):
-    def test_alias_uses_agent_api_with_default_safety_budget(self):
+    def test_alias_uses_agent_api_without_token_budget(self):
         data = build_agent_payload(job(), {'inputText': 'document'})
         self.assertEqual(data['agent'], DEFAULT_AGENT)
         self.assertEqual(data['input'], 'question\n\ndocument')
-        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen', 'max_total_tokens': str(DEFAULT_AGENT_TOKEN_BUDGET)})
+        self.assertEqual(data['agent_config'], {'type': 'antigravity', 'model': 'gemini-4-hydrogen'})
         self.assertEqual(data['environment'], {'type': 'remote'})
-        self.assertEqual(data['agent_config']['max_total_tokens'], str(DEFAULT_AGENT_TOKEN_BUDGET))
+        self.assertNotIn('max_total_tokens', data['agent_config'])
         self.assertEqual({tool['type'] for tool in data['tools']}, {'code_execution', 'google_search', 'url_context'})
         self.assertTrue(data['background']); self.assertTrue(data['store'])
         self.assertEqual(data['system_instruction'], 'system')
         for key in ['model', 'generationConfig', 'generation_config', 'max_output_tokens', 'thinkingConfig']:
             self.assertNotIn(key, data)
 
-    def test_explicit_budget_and_model_are_agent_config_not_generation_config(self):
+    def test_legacy_budget_is_ignored_and_model_still_applied(self):
         value = job(); value['options']['agent'] = {'id': DEFAULT_AGENT, 'model': 'gemini-4-argon', 'maxTotalTokens': 50000}
         data = build_agent_payload(value, {})
-        self.assertEqual(data['agent_config']['max_total_tokens'], '50000')
+        self.assertNotIn('max_total_tokens', data['agent_config'])
         self.assertEqual(data['agent_config']['model'], 'gemini-4-argon')
 
     def test_github_access_depends_only_on_configured_pat(self):
@@ -67,13 +67,13 @@ class AgentPayloadTests(unittest.TestCase):
             self.assertEqual(build_agent_payload(task, {'inputText': '读取github'})['environment'], {'type': 'remote'})
             self.assertNotIn('mcp_server', [tool['type'] for tool in build_agent_payload(task, {'inputText': '读取github'})['tools']])
 
-    def test_simple_prompts_do_not_mount_github_or_disable_safety_cap(self):
+    def test_simple_prompts_do_not_mount_github_and_no_budget_is_sent(self):
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}):
             value = build_agent_payload(job(), {'inputText': '你是谁？'})
             self.assertEqual(value['environment'], {'type': 'remote'})
             self.assertNotIn('mcp_server', [tool['type'] for tool in value['tools']])
             self.assertNotIn('fixture-github-secret', json.dumps(value))
-            self.assertEqual(value['agent_config']['max_total_tokens'], str(DEFAULT_AGENT_TOKEN_BUDGET))
+            self.assertNotIn('max_total_tokens', value['agent_config'])
             value = build_agent_payload(job(), {'inputText': '你能查看 gh 仓库吗？'})
             self.assertIn('mcp_server', [tool['type'] for tool in value['tools']])
 
@@ -146,6 +146,8 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'agent answer')
+        self.assertIn('"event":"prepared"', logs.getvalue())
+        self.assertNotIn('budget_tokens', logs.getvalue())
         self.assertIn('"event":"created"', logs.getvalue())
         self.assertIn('"event":"progress"', logs.getvalue())
         self.assertIn('"event":"completed"', logs.getvalue())
