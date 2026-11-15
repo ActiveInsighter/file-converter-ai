@@ -8,13 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import argparse
-import base64
 import json
-from html.parser import HTMLParser
 import os
 import re
 import time
-from urllib.parse import urlsplit
 from pathlib import Path
 
 import httpx
@@ -25,25 +22,9 @@ from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 
-# Current Gemini text models support Google Search grounding. Do not add the
-# tool to arbitrary user-saved model IDs (image/audio/legacy models may reject it).
-# Google Search is available for these Gemini API families, including
-# Gemini 4 Hydrogen (confirmed in Google's Firebase AI Logic documentation).
-# Availability on a given API key/project/tier is a separate runtime check.
-SEARCHABLE_CHAT_MODEL = re.compile(
-    r'^gemini-(?:2\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
-    r'3\.(?:1-(?:pro|flash-lite)|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
-    r'3-(?:pro|flash)|4-(?:hydrogen|argon|carbon))(?=$|-)', re.I)
-NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
-
-
-def supports_google_search(model: str) -> bool:
-    value = str(model).lower().strip()
-    return bool(SEARCHABLE_CHAT_MODEL.match(value)) and not NON_CHAT_MODEL.search(value)
-
-
+# Keep HTTP/error-category diagnostics; ordinary chat intentionally uses no tools.
 def safe_error_code(data: dict) -> str:
-    """Only expose machine-readable Google status, never provider message text."""
+    """Only expose a machine-readable Google status, never message text."""
     error = data.get('error') if isinstance(data, dict) else None
     if not isinstance(error, dict):
         return 'UNKNOWN'
@@ -53,117 +34,6 @@ def safe_error_code(data: dict) -> str:
     if isinstance(value, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value):
         return value.upper()
     return 'UNKNOWN'
-
-
-def search_fallback_allowed(status: int, data: dict, seconds: float) -> bool:
-    """Retry only a definite, fast rejection: never duplicate a possibly billed tool run."""
-    error = data.get('error') if isinstance(data, dict) else None
-    message = str(error.get('message', '')).casefold() if isinstance(error, dict) else ''
-    if 'too many tool calls' in message or 'quota' in message or 'rate limit' in message:
-        return False
-    if status in (400, 403) and any(word in message for word in
-                                     ('google search', 'google_search', 'googlesearch',
-                                      'grounding', 'search tool')):
-        return True
-    return (status == 400 and seconds <= 10 and
-            not data.get('usageMetadata') and safe_error_code(data) in
-            ('INVALID_ARGUMENT', 'FAILED_PRECONDITION', '400', 'UNKNOWN'))
-
-
-
-def safe_search_link(url: object) -> str | None:
-    if not isinstance(url, str) or len(url) > 2048:
-        return None
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return None
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-        return None
-    if any(char in url for char in '\r\n<>'):
-        return None
-    return url.replace(')', '%29').replace('(', '%28')
-
-
-def link_label(text: object) -> str:
-    return re.sub(r'[\[\]\r\n]', ' ', str(text or '来源'))[:100].strip() or '来源'
-
-
-class _SearchSuggestionLinks(HTMLParser):
-    """Read clickable suggestions from Google's supplied renderedContent without rendering raw HTML."""
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.links = []
-        self.current_url = None
-        self.current_label = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag == 'a':
-            self.current_url = safe_search_link(dict(attrs).get('href'))
-            self.current_label = []
-
-    def handle_data(self, data):
-        if self.current_url:
-            self.current_label.append(data)
-
-    def handle_endtag(self, tag):
-        if tag == 'a' and self.current_url:
-            self.links.append((link_label(' '.join(self.current_label)), self.current_url))
-            self.current_url = None
-            self.current_label = []
-
-
-
-def grounding_appendix(candidate: dict) -> str:
-    """Preserve Google grounding sources and Search Suggestions as clickable links.
-
-    Use Google's returned URLs (not a model-generated URL). The standard
-    searchEntryPoint.sdkBlob contains [query, url] pairs; render them as
-    Google Search suggestions in Markdown, which the existing chat UI renders.
-    """
-    grounding = candidate.get('groundingMetadata') or {}
-    if not isinstance(grounding, dict):
-        return ''
-    lines = []
-    sources = []
-    for chunk in grounding.get('groundingChunks') or []:
-        if not isinstance(chunk, dict) or not isinstance(chunk.get('web'), dict):
-            continue
-        web = chunk['web']
-        url = safe_search_link(web.get('uri'))
-        if url and url not in {item[1] for item in sources}:
-            sources.append((link_label(web.get('title')), url))
-        if len(sources) >= 12:
-            break
-    if sources:
-        lines.extend(['**Google 搜索参考来源**', *[f'- [{title}]({url})' for title, url in sources]])
-    entry = grounding.get('searchEntryPoint') or {}
-    suggestions = []
-    if isinstance(entry, dict) and isinstance(entry.get('sdkBlob'), str):
-        try:
-            blob = base64.b64decode(entry['sdkBlob'], validate=True)
-            if len(blob) <= 32768:
-                rows = json.loads(blob)
-                if isinstance(rows, list):
-                    for item in rows[:8]:
-                        if isinstance(item, list) and len(item) >= 2:
-                            url = safe_search_link(item[1])
-                            if url:
-                                suggestions.append((link_label(item[0]), url))
-        except (ValueError, UnicodeDecodeError, TypeError):
-            pass
-    if not suggestions and isinstance(entry, dict):
-        rendered = entry.get('renderedContent')
-        if isinstance(rendered, str) and len(rendered) <= 65536:
-            extractor = _SearchSuggestionLinks()
-            extractor.feed(rendered)
-            suggestions = extractor.links[:8]
-    if suggestions:
-        if lines:
-            lines.append('')
-        lines.extend(['**Google 搜索建议**', *[f'- [{title}]({url})' for title, url in suggestions]])
-    return '\n'.join(lines)
 
 
 async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") -> KeyPool:
@@ -182,10 +52,6 @@ def build_payload(job: dict, message: dict) -> dict:
         payload["generationConfig"].pop("thinkingConfig", None)
     if job.get("systemPrompt"):
         payload["systemInstruction"] = {"parts": [{"text": job["systemPrompt"]}]}
-    if supports_google_search(job["model"]):
-        # Model decides whether a query needs web search; this does not force
-        # a search on every turn. Keep OCR/PDF requests completely untouched.
-        payload["tools"] = [{"googleSearch": {}}]
     return payload
 
 
@@ -195,9 +61,6 @@ def parse_answer(payload: dict) -> dict:
     reply = "\n".join(part["text"] for part in (candidate.get("content") or {}).get("parts", [])
                       if isinstance(part.get("text"), str) and not part.get("thought"))
     error = ""
-    appendix = grounding_appendix(candidate)
-    if appendix:
-        reply += "\n\n" + appendix
     if len(reply.encode("utf-8")) > MAX_REPLY_BYTES:
         raise RuntimeError("Gemini reply exceeds 2 MiB; reduce the output limit")
     if reason == "MAX_TOKENS":
@@ -209,9 +72,6 @@ def parse_answer(payload: dict) -> dict:
     usage = {key: value for key, value in (payload.get("usageMetadata") or {}).items()
              if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
              and isinstance(value, int) and value >= 0}
-    grounding = candidate.get('groundingMetadata') or {}
-    if isinstance(grounding, dict) and isinstance(grounding.get('webSearchQueries'), list):
-        usage['googleSearchCount'] = len(grounding['webSearchQueries'])
     return {"reply": reply, "error": error, "finishReason": reason, "usage": usage}
 
 
@@ -259,8 +119,6 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep)
     provider = GeminiProvider()
     payload = build_payload(job, message)
-    search_fallback_used = False
-    search_error_code = ''
     last_http_error = ''
     for attempt in range(4):
         try:
@@ -271,7 +129,6 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             if last_http_error:
                 raise RuntimeError(last_http_error) from None
             raise
-        attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(180):
                 # Gemini responses are bounded too, even for a chunked HTTP response.
@@ -300,32 +157,13 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise
         if status == 200:
             await pool.mark_success(index, lease)
-            result = parse_answer(data)
-            if search_fallback_used:
-                result['reply'] = ('*Google 搜索暂时不可用，本次已自动切换为不联网回答。*'
-                                   '\n\n' + result['reply'])
-                result['usage']['googleSearchFallback'] = True
-                result['usage']['googleSearchErrorCode'] = search_error_code
-            return result
+            return parse_answer(data)
         error_code = safe_error_code(data)
         last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
                            "请检查模型、工具权限、密钥权限或项目额度")
-        search_used = bool(payload.get('tools'))
         print(f'[gemini] upstream_http={status} error_code={error_code} '
-              f'model={job["model"]} search_enabled={search_used}', flush=True)
+              f'model={job["model"]}', flush=True)
         await pool.mark_error(index, lease, http_status=status)
-        # A search tool may be unavailable for a specific Google project even
-        # if the model is on the public support list. A definite rejected 400
-        # contains no generated output, so retry ONCE without tools; do not
-        # replay 429s, network timeouts or errors after a long tool loop.
-        if (search_used and not search_fallback_used and
-                search_fallback_allowed(status, data, time.monotonic() - attempt_started)):
-            payload.pop('tools', None)
-            search_fallback_used = True
-            search_error_code = error_code
-            print(f'[gemini] search_fallback=enabled rejected_http={status} '
-                  f'error_code={error_code} retry_without_tool=1', flush=True)
-            continue
         scope = provider.credential_error_scope(status, data)
         if scope == "key":
             pool.retire_key(index, "invalid credential")
