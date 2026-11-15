@@ -88,6 +88,31 @@ class FigureGroupsTests(unittest.TestCase):
         self.assertFalse(figures)
         self.assertFalse(removed)
 
+    def test_real_layout_recovers_three_flows_and_one_nine_panel_figure(self):
+        import json
+
+        fixtures = json.loads((Path(__file__).parent / 'fixtures/ocr_figure_geometry.json').read_text())
+        for fixture, count, fragments in zip(fixtures, (3, 1), (17, 9)):
+            with self.subTest(page=fixture['page']):
+                # Use the real OCR page aspect ratio, without the source PDF.
+                with fitz.open() as doc:
+                    doc.new_page(width=fixture['prunedResult']['width'],
+                                 height=fixture['prunedResult']['height'])
+                    doc.save(self.root / 'geometry.pdf')
+                text, figures, removed = merge_figure_fragments(
+                    fixture['markdown']['text'], fixture['markdown']['images'], fixture,
+                    self.root / 'geometry.pdf', 1, 3, self.root / 'recovered')
+                self.assertEqual(len(figures), count)
+                self.assertEqual(len(removed), fragments)
+                # The two independent diagrams on page 190 remain references.
+                if fixture['page'] == 190:
+                    self.assertEqual(text.count('<img'), 5)
+                    self.assertIn('图(a)', text)
+                    self.assertNotIn('<div>⑥</div>', text)
+                else:
+                    self.assertEqual(text.count('<img'), 1)
+                    self.assertNotIn('h=2', text)  # labels are inside the recovered image
+
 
 class OcrRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_recovered_figures_skip_fragment_downloads(self):

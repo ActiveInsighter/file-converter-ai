@@ -1,0 +1,628 @@
+[
+  {
+    "page": 190,
+    "markdown": {
+      "text": "BODY TEXT\n\nBODY TEXT\n\n<div><img src=\"imgs/img_in_image_box_183_168_368_267.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_391_186_446_249.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_470_181_603_254.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_625_197_680_239.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_704_167_888_268.jpg\" /></div>\n\n<div>图(a) 删除平衡二叉树中叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 不相同</div>\n\n<div><img src=\"imgs/img_in_image_box_183_337_317_408.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_332_351_388_401.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_406_336_492_407.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_506_348_562_393.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_580_321_665_393.jpg\" /></div>\n\n<div>⑥</div>\n\n<div><img src=\"imgs/img_in_image_box_682_352_737_394.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_755_332_887_409.jpg\" /></div>\n\n<div>图(b) 删除平衡二叉树中非叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 相同</div>\n\n<div><img src=\"imgs/img_in_image_box_182_476_368_577.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_390_496_445_559.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_469_491_602_564.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_624_507_679_548.jpg\" /></div>\n\n<div><img src=\"imgs/img_in_image_box_754_472_887_581.jpg\" /></div>\n\n<div>图(b) 删除平衡二叉树中非叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 不相同</div>\n\nBODY TEXT\n\nBODY TEXT\n\nBODY TEXT\n\nBODY TEXT\n\nBODY TEXT\n\n<div><img src=\"imgs/img_in_image_box_184_1175_586_1327.jpg\" /></div>\n\n<div>(a) 表达式二叉树</div>\n\n<div><img src=\"imgs/img_in_image_box_689_1173_911_1330.jpg\" /></div>\n\n<div>(b) 有向无环图</div>\n\nBODY TEXT\n\nBODY TEXT",
+      "images": {
+        "imgs/img_in_image_box_183_168_368_267.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_391_186_446_249.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_470_181_603_254.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_625_197_680_239.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_704_167_888_268.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_183_337_317_408.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_332_351_388_401.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_406_336_492_407.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_506_348_562_393.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_580_321_665_393.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_682_352_737_394.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_755_332_887_409.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_182_476_368_577.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_390_496_445_559.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_469_491_602_564.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_624_507_679_548.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_754_472_887_581.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_184_1175_586_1327.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_689_1173_911_1330.jpg": "https://ocr.test/crop.jpg"
+      }
+    },
+    "prunedResult": {
+      "width": 1083,
+      "height": 1509,
+      "parsing_res_list": [
+        {
+          "block_label": "text",
+          "block_bbox": [
+            99,
+            74,
+            833,
+            118
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            138,
+            131,
+            959,
+            155
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            183,
+            168,
+            368,
+            267
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            391,
+            186,
+            446,
+            249
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            470,
+            181,
+            603,
+            254
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            625,
+            197,
+            680,
+            239
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            704,
+            167,
+            888,
+            268
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            312,
+            287,
+            757,
+            311
+          ],
+          "block_content": "图(a) 删除平衡二叉树中叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 不相同"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            183,
+            337,
+            317,
+            408
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            332,
+            351,
+            388,
+            401
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            406,
+            336,
+            492,
+            407
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            506,
+            348,
+            562,
+            393
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            580,
+            321,
+            665,
+            393
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            630,
+            395,
+            664,
+            423
+          ],
+          "block_content": "⑥"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            682,
+            352,
+            737,
+            394
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            755,
+            332,
+            887,
+            409
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            313,
+            443,
+            758,
+            466
+          ],
+          "block_content": "图(b) 删除平衡二叉树中非叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 相同"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            182,
+            476,
+            368,
+            577
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            390,
+            496,
+            445,
+            559
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            469,
+            491,
+            602,
+            564
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            624,
+            507,
+            679,
+            548
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            754,
+            472,
+            887,
+            581
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            303,
+            596,
+            767,
+            620
+          ],
+          "block_content": "图(b) 删除平衡二叉树中非叶结点再插入， $ T_{1} $ 和  $ T_{3} $ 不相同"
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            98,
+            627,
+            971,
+            747
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "table",
+          "block_bbox": [
+            307,
+            758,
+            763,
+            865
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "table",
+          "block_bbox": [
+            256,
+            891,
+            811,
+            1034
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            139,
+            1044,
+            969,
+            1132
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            98,
+            1141,
+            810,
+            1166
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            184,
+            1175,
+            586,
+            1327
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            314,
+            1336,
+            454,
+            1360
+          ],
+          "block_content": "(a) 表达式二叉树"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            689,
+            1173,
+            911,
+            1330
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            738,
+            1340,
+            859,
+            1363
+          ],
+          "block_content": "(b) 有向无环图"
+        },
+        {
+          "block_label": "footer",
+          "block_bbox": [
+            97,
+            1399,
+            839,
+            1462
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "footer_image",
+          "block_bbox": [
+            862,
+            1378,
+            968,
+            1485
+          ],
+          "block_content": ""
+        }
+      ]
+    }
+  },
+  {
+    "page": 284,
+    "markdown": {
+      "text": "BODY TEXT\n\nBODY TEXT\n\nBODY TEXT\n\nBODY TEXT\n\n<div><img src=\"imgs/img_in_image_box_140_446_293_513.jpg\" /></div>\n\n<div>① h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_304_446_447_514.jpg\" /></div>\n\n<div>② h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_459_444_612_513.jpg\" /></div>\n\n<div>③ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_623_444_766_513.jpg\" /></div>\n\n<div>④ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_772_441_931_514.jpg\" /></div>\n\n<div> $ ⑤ $ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_140_585_272_655.jpg\" /></div>\n\n<div>⑥ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_340_585_495_654.jpg\" /></div>\n\n<div> $ ⑦ $ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_552_584_707_654.jpg\" /></div>\n\n<div>⑧ h=2</div>\n\n<div><img src=\"imgs/img_in_image_box_750_545_932_655.jpg\" /></div>\n\n<div> $ ⑨ $ h=3</div>\n\nBODY TEXT",
+      "images": {
+        "imgs/img_in_image_box_140_446_293_513.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_304_446_447_514.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_459_444_612_513.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_623_444_766_513.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_772_441_931_514.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_140_585_272_655.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_340_585_495_654.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_552_584_707_654.jpg": "https://ocr.test/crop.jpg",
+        "imgs/img_in_image_box_750_545_932_655.jpg": "https://ocr.test/crop.jpg"
+      }
+    },
+    "prunedResult": {
+      "width": 1083,
+      "height": 1509,
+      "parsing_res_list": [
+        {
+          "block_label": "header",
+          "block_bbox": [
+            100,
+            74,
+            142,
+            94
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "header",
+          "block_bbox": [
+            149,
+            74,
+            718,
+            94
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "header",
+          "block_bbox": [
+            239,
+            96,
+            831,
+            118
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            135,
+            130,
+            969,
+            422
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            140,
+            446,
+            293,
+            513
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            190,
+            517,
+            246,
+            534
+          ],
+          "block_content": "① h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            304,
+            446,
+            447,
+            514
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            349,
+            517,
+            404,
+            534
+          ],
+          "block_content": "② h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            459,
+            444,
+            612,
+            513
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            508,
+            517,
+            563,
+            535
+          ],
+          "block_content": "③ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            623,
+            444,
+            766,
+            513
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            668,
+            517,
+            722,
+            535
+          ],
+          "block_content": "④ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            772,
+            441,
+            931,
+            514
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            826,
+            517,
+            881,
+            535
+          ],
+          "block_content": " $ ⑤ $ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            140,
+            585,
+            272,
+            655
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            179,
+            657,
+            233,
+            674
+          ],
+          "block_content": "⑥ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            340,
+            585,
+            495,
+            654
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            391,
+            657,
+            445,
+            674
+          ],
+          "block_content": " $ ⑦ $ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            552,
+            584,
+            707,
+            654
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            603,
+            657,
+            657,
+            674
+          ],
+          "block_content": "⑧ h=2"
+        },
+        {
+          "block_label": "image",
+          "block_bbox": [
+            750,
+            545,
+            932,
+            655
+          ],
+          "block_content": ""
+        },
+        {
+          "block_label": "figure_title",
+          "block_bbox": [
+            814,
+            657,
+            869,
+            673
+          ],
+          "block_content": " $ ⑨ $ h=3"
+        },
+        {
+          "block_label": "text",
+          "block_bbox": [
+            141,
+            687,
+            969,
+            775
+          ],
+          "block_content": ""
+        }
+      ]
+    }
+  }
+]
