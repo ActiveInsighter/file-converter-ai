@@ -171,6 +171,17 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 `gemini-text.yml` 和 `gemini_text.py` 从 PocketBase 领取文本任务，复用现有 Gemini KeyPool，
 按任务并发数独立发送各段。请求只有系统提示词、用户提示词与该段文本，不经过 PDF/OCR 流程，
 不上传 Gemini Files API；回复逐段写回 PB，截断回复也会保留并标明错误。
+
+**普通聊天默认提供 Google 搜索：** 对 Gemini 2.0/2.5/3.x/4.x 的受支持文本生成模型，
+`gemini_text.py` 会在 generateContent 请求中附带 `tools: [{"googleSearch": {}}]`。
+模型根据问题判断是否实际搜索，普通闲聊不会被强制联网。搜索过的回复自动附带
+`groundingMetadata` 中的网页参考来源和 Google 搜索建议链接，并保留原始 Token 统计，
+另记录 `usage.googleSearchCount`（Google 返回的搜索查询数）。自定义、旧版、
+图像、语音或不支持搜索的模型不会被强制插入这个参数，避免工具不兼容引起 HTTP 400。
+**这项修改仅针对 Remote 的 Gemini 文本聊天；不改变 PDF/OCR 转换，也不改变 Antigravity
+Interactions API 的独立搜索工具。** Gemini 3 系列按实际执行的搜索查询计费，
+并受到 Google 项目搜索工具额度/计费规则的约束。详见官方 Google Search grounding 文档。
+
 不同 Gemini 对话使用各自的 GitHub Actions concurrency group（由 request_id 区分），
 与 PDF 转换独立调度；Cloudflare Gemini 任务并发上限为 4。
 每个 Actions Runner 的 KeyPool 仅管理当前任务，多个任务复用相同 API Key 时可能

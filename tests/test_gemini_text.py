@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -7,7 +8,8 @@ from unittest.mock import patch
 
 import httpx
 
-from gemini_text import PocketBase, build_payload, create_key_pool, generate, parse_answer, recover, run_job
+from gemini_text import (PocketBase, build_payload, create_key_pool, generate, parse_answer,
+                         recover, run_job, supports_google_search)
 from key_pool import KeyPool
 
 
@@ -24,6 +26,67 @@ class TextPayloadTests(unittest.TestCase):
         self.assertEqual(data["systemInstruction"], {"parts": [{"text": "system instruction"}]})
         self.assertNotIn("thinkingConfig", data["generationConfig"])
         self.assertNotIn("inlineData", json.dumps(data))
+
+    def test_default_google_search_for_supported_chat_models_only(self):
+        for model in ('gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview',
+                      'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-4-hydrogen'):
+            value = job()
+            value['model'] = model
+            self.assertTrue(supports_google_search(model), model)
+            payload = build_payload(value, {'inputText': '今天有什么新闻？'})
+            self.assertEqual(payload['tools'], [{'googleSearch': {}}])
+            self.assertEqual(payload['contents'][0]['parts'][0]['text'], 'shared prompt')
+            self.assertNotIn('inlineData', json.dumps(payload))
+        for model in ('gemini-test', 'my-custom-model', 'gemini-1.5-pro',
+                      'gemini-3.1-flash-image-preview', 'gemini-3.5-live-audio'):
+            value = job()
+            value['model'] = model
+            self.assertFalse(supports_google_search(model), model)
+            self.assertNotIn('tools', build_payload(value, {'inputText': 'test'}))
+
+    def test_grounding_response_includes_google_sources_and_search_suggestions(self):
+        blob = base64.b64encode(json.dumps([
+            ['UEFA EURO winners', 'https://www.google.com/search?q=UEFA+EURO+winners'],
+            ['Invalid', 'javascript:alert(1)'],
+        ]).encode()).decode()
+        response = {'candidates': [{
+            'finishReason': 'STOP',
+            'content': {'parts': [{'text': 'Spain won.'}]},
+            'groundingMetadata': {
+                'groundingChunks': [
+                    {'web': {'title': 'UEFA', 'uri': 'https://www.uefa.com/euro2024'}},
+                    {'web': {'title': 'UEFA duplicate', 'uri': 'https://www.uefa.com/euro2024'}},
+                    {'web': {'title': 'Malicious', 'uri': 'javascript:alert(1)'}},
+                ],
+                'searchEntryPoint': {'sdkBlob': blob},
+            },
+        }], 'usageMetadata': {'totalTokenCount': 46}}
+        parsed = parse_answer(response)
+        self.assertEqual(parsed['usage']['totalTokenCount'], 46)
+        self.assertEqual(parsed['error'], '')
+        self.assertIn('Spain won.\n\n**Google 搜索参考来源**', parsed['reply'])
+        self.assertIn('[UEFA](https://www.uefa.com/euro2024)', parsed['reply'])
+        self.assertIn('[UEFA EURO winners](https://www.google.com/search?q=UEFA+EURO+winners)', parsed['reply'])
+        self.assertEqual(parsed['reply'].count('https://www.uefa.com/euro2024'), 1)
+        self.assertNotIn('javascript:', parsed['reply'])
+
+    def test_google_rendered_suggestions_fallback_has_safe_links(self):
+        answer = parse_answer({'candidates': [{
+            'finishReason': 'STOP',
+            'content': {'parts': [{'text': 'Result'}]},
+            'groundingMetadata': {
+                'webSearchQueries': ['latest AI model'],
+                'searchEntryPoint': {
+                    'renderedContent': '<style>.x{display:block}</style>'
+                                       '<a href="https://www.google.com/search?q=latest">搜索最新模型</a>'
+                                       '<a href="javascript:alert(1)">Danger</a>',
+                },
+            },
+        }]})
+        self.assertIn('**Google 搜索建议**', answer['reply'])
+        self.assertIn('[搜索最新模型](https://www.google.com/search?q=latest)', answer['reply'])
+        self.assertNotIn('javascript:', answer['reply'])
+        self.assertEqual(answer['usage']['googleSearchCount'], 1)
 
     def test_thoughts_are_excluded_and_truncated_text_is_retained(self):
         answer = parse_answer({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"thought": True, "text": "private reasoning"}, {"text": "partial reply"}]}}]})
@@ -94,6 +157,24 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, 5)
         self.assertEqual(peak, 2)
         self.assertGreater(writes, requests)
+
+    async def test_supported_chat_sends_google_search_with_generate_content(self):
+        captured = []
+        value = job(1)
+        value['model'] = 'gemini-3.5-flash-lite'
+        async def outbound(request):
+            captured.append(request)
+            return httpx.Response(200, json={
+                'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': 'Current news'}]}}],
+                'usageMetadata': {'totalTokenCount': 12},
+            })
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                                    value, value['messages'][0])
+        self.assertEqual(result['reply'], 'Current news')
+        self.assertEqual(result['usage']['totalTokenCount'], 12)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(json.loads(captured[0].content)['tools'], [{'googleSearch': {}}])
 
     async def test_database_outage_keeps_recovery_artifact_and_no_model_resend(self):
         value = job(1)

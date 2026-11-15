@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import base64
 import json
+from html.parser import HTMLParser
 import os
 import re
 import time
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import httpx
@@ -21,6 +24,111 @@ from providers import GeminiProvider
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+
+# Current Gemini text models support Google Search grounding. Do not add the
+# tool to arbitrary user-saved model IDs (image/audio/legacy models may reject it).
+SEARCHABLE_CHAT_MODEL = re.compile(r'^gemini-(?:2\.(?:0|5)|3(?:\.\d+)?|4(?:\.\d+)?)-', re.I)
+NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
+
+
+def supports_google_search(model: str) -> bool:
+    value = str(model).lower().strip()
+    return bool(SEARCHABLE_CHAT_MODEL.match(value)) and not NON_CHAT_MODEL.search(value)
+
+
+def safe_search_link(url: object) -> str | None:
+    if not isinstance(url, str) or len(url) > 2048:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    if any(char in url for char in '\r\n<>'):
+        return None
+    return url.replace(')', '%29').replace('(', '%28')
+
+
+def link_label(text: object) -> str:
+    return re.sub(r'[\[\]\r\n]', ' ', str(text or '来源'))[:100].strip() or '来源'
+
+
+class _SearchSuggestionLinks(HTMLParser):
+    """Read clickable suggestions from Google's supplied renderedContent without rendering raw HTML."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.current_url = None
+        self.current_label = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self.current_url = safe_search_link(dict(attrs).get('href'))
+            self.current_label = []
+
+    def handle_data(self, data):
+        if self.current_url:
+            self.current_label.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.current_url:
+            self.links.append((link_label(' '.join(self.current_label)), self.current_url))
+            self.current_url = None
+            self.current_label = []
+
+
+
+def grounding_appendix(candidate: dict) -> str:
+    """Preserve Google grounding sources and Search Suggestions as clickable links.
+
+    Use Google's returned URLs (not a model-generated URL). The standard
+    searchEntryPoint.sdkBlob contains [query, url] pairs; render them as
+    Google Search suggestions in Markdown, which the existing chat UI renders.
+    """
+    grounding = candidate.get('groundingMetadata') or {}
+    if not isinstance(grounding, dict):
+        return ''
+    lines = []
+    sources = []
+    for chunk in grounding.get('groundingChunks') or []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get('web'), dict):
+            continue
+        web = chunk['web']
+        url = safe_search_link(web.get('uri'))
+        if url and url not in {item[1] for item in sources}:
+            sources.append((link_label(web.get('title')), url))
+        if len(sources) >= 12:
+            break
+    if sources:
+        lines.extend(['**Google 搜索参考来源**', *[f'- [{title}]({url})' for title, url in sources]])
+    entry = grounding.get('searchEntryPoint') or {}
+    suggestions = []
+    if isinstance(entry, dict) and isinstance(entry.get('sdkBlob'), str):
+        try:
+            blob = base64.b64decode(entry['sdkBlob'], validate=True)
+            if len(blob) <= 32768:
+                rows = json.loads(blob)
+                if isinstance(rows, list):
+                    for item in rows[:8]:
+                        if isinstance(item, list) and len(item) >= 2:
+                            url = safe_search_link(item[1])
+                            if url:
+                                suggestions.append((link_label(item[0]), url))
+        except (ValueError, UnicodeDecodeError, TypeError):
+            pass
+    if not suggestions and isinstance(entry, dict):
+        rendered = entry.get('renderedContent')
+        if isinstance(rendered, str) and len(rendered) <= 65536:
+            extractor = _SearchSuggestionLinks()
+            extractor.feed(rendered)
+            suggestions = extractor.links[:8]
+    if suggestions:
+        if lines:
+            lines.append('')
+        lines.extend(['**Google 搜索建议**', *[f'- [{title}]({url})' for title, url in suggestions]])
+    return '\n'.join(lines)
 
 
 async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") -> KeyPool:
@@ -39,6 +147,10 @@ def build_payload(job: dict, message: dict) -> dict:
         payload["generationConfig"].pop("thinkingConfig", None)
     if job.get("systemPrompt"):
         payload["systemInstruction"] = {"parts": [{"text": job["systemPrompt"]}]}
+    if supports_google_search(job["model"]):
+        # Model decides whether a query needs web search; this does not force
+        # a search on every turn. Keep OCR/PDF requests completely untouched.
+        payload["tools"] = [{"googleSearch": {}}]
     return payload
 
 
@@ -48,6 +160,9 @@ def parse_answer(payload: dict) -> dict:
     reply = "\n".join(part["text"] for part in (candidate.get("content") or {}).get("parts", [])
                       if isinstance(part.get("text"), str) and not part.get("thought"))
     error = ""
+    appendix = grounding_appendix(candidate)
+    if appendix:
+        reply += "\n\n" + appendix
     if len(reply.encode("utf-8")) > MAX_REPLY_BYTES:
         raise RuntimeError("Gemini reply exceeds 2 MiB; reduce the output limit")
     if reason == "MAX_TOKENS":
@@ -59,6 +174,9 @@ def parse_answer(payload: dict) -> dict:
     usage = {key: value for key, value in (payload.get("usageMetadata") or {}).items()
              if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
              and isinstance(value, int) and value >= 0}
+    grounding = candidate.get('groundingMetadata') or {}
+    if isinstance(grounding, dict) and isinstance(grounding.get('webSearchQueries'), list):
+        usage['googleSearchCount'] = len(grounding['webSearchQueries'])
     return {"reply": reply, "error": error, "finishReason": reason, "usage": usage}
 
 
