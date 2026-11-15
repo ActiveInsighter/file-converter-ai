@@ -15,6 +15,10 @@ def task_text(job, message):
     return '\n'.join(str(v or '') for v in (job.get('prompt'), message.get('inputText')))
 
 
+def is_project_task(text):
+    return bool(PROJECT_TASK.search(text) or re.search(r'(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', text))
+
+
 def repository_candidates(text, repositories):
     """Prefer explicit owner/name, then exact normalized name, then distinct suffix."""
     normalized = re.sub(r'[^a-z0-9]', '', text.casefold())
@@ -70,7 +74,7 @@ async def git_write_access(client, token, repo):
 
 
 async def prepare_github_context(client, token, text, *, require_write=None, trace=None):
-    if not PROJECT_TASK.search(text) and not re.search(r'(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', text):
+    if not is_project_task(text):
         return None
     if not token:
         raise RuntimeError('当前项目任务未配置 Agent GitHub 密钥；请配置 ANTIGRAVITY_GITHUB_TOKEN 后再执行。')

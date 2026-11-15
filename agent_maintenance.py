@@ -16,7 +16,7 @@ from github_context import prepare_github_context
 
 async def main(mode, job_id):
     from gemini_text import PocketBase
-    if mode not in ('check', 'rescue') or not re.fullmatch(r'[a-z0-9]{15}', job_id):
+    if mode not in ('check', 'rescue', 'probe') or not re.fullmatch(r'[a-z0-9]{15}', job_id):
         raise RuntimeError('Invalid maintenance mode or job ID')
     root = os.environ.get('GEMINI_PB_URL', '').rstrip('/')
     if not re.fullmatch(r'https://[^/?#@]+', root):
@@ -52,6 +52,28 @@ async def main(mode, job_id):
         key = next((k for k in keys if hashlib.sha256(k.encode()).hexdigest() == state.get('credentialHash')), None)
         if not key or not state.get('environmentId'):
             raise RuntimeError('Saved environment or matching credential missing')
+        if mode == 'probe':
+            from gemini_agent import generate_agent
+            from key_pool import KeyPool
+            pool = KeyPool([key], rpm_per_key=60, rpd_per_key=10000)
+            probe_state = {}
+            async def checkpoint(update=None):
+                if update:
+                    probe_state.update(update)
+                return {'state': probe_state, 'canceled': False}
+            try:
+                result = await generate_agent(client, pool, {
+                    'id': 'probe-' + job_id, 'model': 'Antigravity',
+                    'prompt': 'Read-only runtime check for ' + context['selected']['full_name'] + '. '
+                        'Read /workspace/.anyworkflow/github.py and /.agents/hooks.json. '
+                        'Run python3 /workspace/.anyworkflow/github.py identity. '
+                        'Only inspect those files and identity; no repository clone or changes. '
+                        'If all succeed reply AW_RUNTIME_OK and the authenticated login.',
+                    'options': {'agent': {'timeoutMinutes': 3}}}, {'index': 1}, checkpoint=checkpoint)
+                trace.emit('runtime_probe_result', error=result['error'], reply=result['reply'][:800], usage=result['usage'])
+                return 0 if not result['error'] and 'AW_RUNTIME_OK' in result['reply'] else 2
+            finally:
+                await pool.close()
         context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
                                                job['prompt'], require_write=False, trace=trace)
         if not context or not context['selected']:

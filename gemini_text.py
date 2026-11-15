@@ -271,7 +271,7 @@ async def main():
     parser.add_argument('--recover-dir', type=Path, help='Write saved recovery JSONs to PB without calling Gemini')
     args = parser.parse_args()
     job_id = os.environ.get("REQUEST_ID", "")
-    maintenance = re.fullmatch(r'(check|rescue)-([a-z0-9]{15})', job_id)
+    maintenance = re.fullmatch(r'(check|rescue|probe)-([a-z0-9]{15})', job_id)
     if not args.recover_dir and maintenance:
         from agent_maintenance import main as maintenance_main
         return await maintenance_main(*maintenance.groups())

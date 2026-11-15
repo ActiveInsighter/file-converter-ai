@@ -48,18 +48,16 @@ class AgentPayloadTests(unittest.TestCase):
                 if owner:
                     task['owner'] = owner
                 payload = build_agent_payload(task, {})
-                self.assertNotIn('sources', payload['environment'])
-                self.assertIn('any repository', payload['system_instruction'])
-                self.assertIn('clone only the repository needed', payload['system_instruction'])
+                self.assertEqual(len(payload['environment']['sources']), 3)
+                self.assertIn('Access is determined by the configured token', payload['system_instruction'])
+                self.assertIn('Clone only the target repository', payload['system_instruction'])
                 rules = payload['environment']['network']['allowlist']
                 self.assertEqual(rules[0]['domain'], 'github.com')
                 self.assertEqual(rules[1]['transform']['Authorization'], 'Bearer fixture-github-secret')
                 self.assertEqual(rules[2], {'domain': '*'})
                 self.assertEqual(rules[0]['transform']['Authorization'],
                                  'Basic ' + base64.b64encode(b'x-oauth-basic:fixture-github-secret').decode())
-                github = next(tool for tool in payload['tools'] if tool['type'] == 'mcp_server')
-                self.assertEqual(github['url'], 'https://api.githubcopilot.com/mcp')
-                self.assertEqual(github['headers']['Authorization'], 'Bearer fixture-github-secret')
+                self.assertNotIn('mcp_server', [tool['type'] for tool in payload['tools']])
                 self.assertNotIn('fixture-github-secret', payload['system_instruction'])
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_ALLOWED_OWNER': 'a' * 15}, clear=True):
             task = job()
@@ -70,12 +68,24 @@ class AgentPayloadTests(unittest.TestCase):
     def test_simple_prompts_do_not_mount_github_and_no_budget_is_sent(self):
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}):
             value = build_agent_payload(job(), {'inputText': '你是谁？'})
-            self.assertEqual(value['environment'], {'type': 'remote'})
+            self.assertIn('network', value['environment'])
+            self.assertNotIn('sources', value['environment'])
             self.assertNotIn('mcp_server', [tool['type'] for tool in value['tools']])
-            self.assertNotIn('fixture-github-secret', json.dumps(value))
+            self.assertNotIn('fixture-github-secret', value['system_instruction'])
             self.assertNotIn('max_total_tokens', value['agent_config'])
             value = build_agent_payload(job(), {'inputText': '你能查看 gh 仓库吗？'})
-            self.assertIn('mcp_server', [tool['type'] for tool in value['tools']])
+            self.assertIn('sources', value['environment'])
+            self.assertNotIn('mcp_server', [tool['type'] for tool in value['tools']])
+
+    def test_github_authentication_does_not_depend_on_task_keywords(self):
+        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}):
+            for prompt in ['重新推送部署下我的exam docs项目', '看看remote项目', '。']:
+                task = job(); task['prompt'] = prompt
+                data = build_agent_payload(task, {})
+                self.assertEqual(data['environment']['network']['allowlist'][1]['transform']['Authorization'],
+                                 'Bearer fixture-github-secret')
+            task['options']['agent'] = {'githubMcpEnabled': True}
+            self.assertIn('mcp_server', [t['type'] for t in build_agent_payload(task, {})['tools']])
 
     def test_google_cumulative_usage_is_not_duplicated_and_diagnostics_are_safe(self):
         source = {'status': 'completed', 'usage': {
