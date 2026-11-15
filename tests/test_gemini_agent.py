@@ -34,36 +34,31 @@ class AgentPayloadTests(unittest.TestCase):
         self.assertEqual(data['agent_config']['max_total_tokens'], '50000')
         self.assertEqual(data['agent_config']['model'], 'gemini-4-argon')
 
-    def test_github_access_requires_exact_server_claim_owner_and_pat(self):
-        trusted = 'a' * 15
-        settings = {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret',
-                    'ANTIGRAVITY_GITHUB_ALLOWED_OWNER': trusted}
-        with patch.dict('os.environ', settings):
-            for owner in ['', 'b' * 15]:
-                task = job()
-                task['owner'] = owner
-                payload = build_agent_payload(task, {})
-                self.assertEqual(payload['environment'], {'type': 'remote'})
-                self.assertNotIn('mcp_server', [tool['type'] for tool in payload['tools']])
-            task = job()
-            task['owner'] = trusted
-            payload = build_agent_payload(task, {})
-            self.assertEqual([source['target'] for source in payload['environment']['sources']],
-                             ['/workspace/file-converter-ai', '/workspace/Anyworkflow-remote'])
-            rules = payload['environment']['network']['allowlist']
-            self.assertEqual(rules[0]['domain'], 'github.com')
-            self.assertEqual(rules[1]['transform']['Authorization'], 'Bearer fixture-github-secret')
-            self.assertEqual(rules[2], {'domain': '*'})
-            self.assertEqual(rules[0]['transform']['Authorization'],
-                             'Basic ' + __import__('base64').b64encode(b'x-oauth-basic:fixture-github-secret').decode())
-            github = next(tool for tool in payload['tools'] if tool['type'] == 'mcp_server')
-            self.assertEqual(github['url'], 'https://api.githubcopilot.com/mcp')
-            self.assertEqual(github['headers']['Authorization'], 'Bearer fixture-github-secret')
-            self.assertNotIn('fixture-github-secret', payload['system_instruction'])
+    def test_github_access_depends_only_on_configured_pat(self):
+        import base64
         with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}, clear=True):
+            for owner in ['', 'a' * 15, 'b' * 15]:
+                task = job()
+                if owner:
+                    task['owner'] = owner
+                payload = build_agent_payload(task, {})
+                self.assertEqual([source['target'] for source in payload['environment']['sources']],
+                                 ['/workspace/file-converter-ai', '/workspace/Anyworkflow-remote'])
+                rules = payload['environment']['network']['allowlist']
+                self.assertEqual(rules[0]['domain'], 'github.com')
+                self.assertEqual(rules[1]['transform']['Authorization'], 'Bearer fixture-github-secret')
+                self.assertEqual(rules[2], {'domain': '*'})
+                self.assertEqual(rules[0]['transform']['Authorization'],
+                                 'Basic ' + base64.b64encode(b'x-oauth-basic:fixture-github-secret').decode())
+                github = next(tool for tool in payload['tools'] if tool['type'] == 'mcp_server')
+                self.assertEqual(github['url'], 'https://api.githubcopilot.com/mcp')
+                self.assertEqual(github['headers']['Authorization'], 'Bearer fixture-github-secret')
+                self.assertNotIn('fixture-github-secret', payload['system_instruction'])
+        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_ALLOWED_OWNER': 'a' * 15}, clear=True):
             task = job()
-            task['owner'] = trusted
+            task['owner'] = 'a' * 15
             self.assertEqual(build_agent_payload(task, {})['environment'], {'type': 'remote'})
+            self.assertNotIn('mcp_server', [tool['type'] for tool in build_agent_payload(task, {})['tools']])
 
     def test_upstream_error_redacts_github_bearer_and_basic_token(self):
         import base64
