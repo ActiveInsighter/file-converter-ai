@@ -70,6 +70,24 @@ class TextPayloadTests(unittest.TestCase):
         self.assertEqual(parsed['reply'].count('https://www.uefa.com/euro2024'), 1)
         self.assertNotIn('javascript:', parsed['reply'])
 
+    def test_google_rendered_suggestions_fallback_has_safe_links(self):
+        answer = parse_answer({'candidates': [{
+            'finishReason': 'STOP',
+            'content': {'parts': [{'text': 'Result'}]},
+            'groundingMetadata': {
+                'webSearchQueries': ['latest AI model'],
+                'searchEntryPoint': {
+                    'renderedContent': '<style>.x{display:block}</style>'
+                                       '<a href="https://www.google.com/search?q=latest">搜索最新模型</a>'
+                                       '<a href="javascript:alert(1)">Danger</a>',
+                },
+            },
+        }]})
+        self.assertIn('**Google 搜索建议**', answer['reply'])
+        self.assertIn('[搜索最新模型](https://www.google.com/search?q=latest)', answer['reply'])
+        self.assertNotIn('javascript:', answer['reply'])
+        self.assertEqual(answer['usage']['googleSearchCount'], 1)
+
     def test_thoughts_are_excluded_and_truncated_text_is_retained(self):
         answer = parse_answer({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"thought": True, "text": "private reasoning"}, {"text": "partial reply"}]}}]})
         self.assertEqual(answer["reply"], "partial reply")
