@@ -187,7 +187,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     from providers import GeminiProvider
     provider = GeminiProvider()
     payload = build_agent_payload(job, message)
+    started = clock()
     state = (await checkpoint()).get('state') or {}
+    agent_telemetry('prepared',
+        model=payload['agent_config']['model'],
+        budget_tokens=int(payload['agent_config']['max_total_tokens']),
+        tools=[tool.get('type') for tool in payload['tools']],
+        github_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
+        input_chars=len(payload['input']),
+        system_chars=len(payload.get('system_instruction', '')),
+        resumed=bool(state.get('id')))
     index = key = lease = None
     current = None
     for attempt in range(max(1, len(pool.keys))):
@@ -212,6 +221,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = data
             if not isinstance(data.get('id'), str) or not data['id']:
                 raise RuntimeError('Agent 未返回 interaction ID；未自动重发。')
+            agent_telemetry('created', elapsed_seconds=round(clock() - started, 2),
+                            status=data.get('status', 'unknown'),
+                            environment_created=bool(data.get('environment_id')))
             state = {'id': data['id'], 'credentialHash': fingerprint, 'status': data.get('status', 'in_progress')}
             if isinstance(data.get('environment_id'), str):
                 state['environmentId'] = data['environment_id']
@@ -241,12 +253,22 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     url = f'{ROOT}/{quote(current["id"], safe="")}'
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
+    poll_count = 0
+    last_report = started
+    last_status = None
     try:
         while True:
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
-                return parse_interaction(current)
+                result = parse_interaction(current)
+                agent_telemetry('completed',
+                    status=current['status'],
+                    elapsed_seconds=round(clock() - started, 2),
+                    polls=poll_count,
+                    reply_chars=len(result['reply']),
+                    **agent_usage_diagnostics(current))
+                return result
             control = await checkpoint()
             if control.get('canceled'):
                 await request_json(client, 'POST', url + ':cancel', key)
@@ -268,6 +290,15 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                             continue
                     raise upstream_error(status, data, key)
                 current, failures = data, 0
+                poll_count += 1
+                # Heartbeat and cumulative counters, never the response body or thoughts.
+                if current.get('status') != last_status or clock() - last_report >= 30:
+                    summary = agent_usage_diagnostics(current)
+                    agent_telemetry('progress', elapsed_seconds=round(clock() - started, 2),
+                                    polls=poll_count, status=current.get('status', 'unknown'),
+                                    **summary)
+                    last_status = current.get('status')
+                    last_report = clock()
             except (httpx.TransportError, TimeoutError):
                 failures += 1
                 if failures > 20:
