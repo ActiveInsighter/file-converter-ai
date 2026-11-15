@@ -54,6 +54,22 @@ def safe_error_code(data: dict) -> str:
     return 'UNKNOWN'
 
 
+def search_fallback_allowed(status: int, data: dict, seconds: float) -> bool:
+    """Retry only a definite, fast rejection: never duplicate a possibly billed tool run."""
+    error = data.get('error') if isinstance(data, dict) else None
+    message = str(error.get('message', '')).casefold() if isinstance(error, dict) else ''
+    if 'too many tool calls' in message or 'quota' in message or 'rate limit' in message:
+        return False
+    if status in (400, 403) and any(word in message for word in
+                                     ('google search', 'google_search', 'googlesearch',
+                                      'grounding', 'search tool')):
+        return True
+    return (status == 400 and seconds <= 10 and
+            not data.get('usageMetadata') and safe_error_code(data) in
+            ('INVALID_ARGUMENT', 'FAILED_PRECONDITION', '400', 'UNKNOWN'))
+
+
+
 def safe_search_link(url: object) -> str | None:
     if not isinstance(url, str) or len(url) > 2048:
         return None
@@ -242,7 +258,10 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep)
     provider = GeminiProvider()
     payload = build_payload(job, message)
+    search_fallback_used = False
+    search_error_code = ''
     for attempt in range(4):
+        attempt_started = time.monotonic()
         index, key, lease = await pool.acquire()
         try:
             async with asyncio.timeout(180):
@@ -272,8 +291,30 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise
         if status == 200:
             await pool.mark_success(index, lease)
-            return parse_answer(data)
+            result = parse_answer(data)
+            if search_fallback_used:
+                result['reply'] = ('*Google 搜索暂时不可用，本次已自动切换为不联网回答。*'
+                                   '\n\n' + result['reply'])
+                result['usage']['googleSearchFallback'] = True
+                result['usage']['googleSearchErrorCode'] = search_error_code
+            return result
+        error_code = safe_error_code(data)
+        search_used = bool(payload.get('tools'))
+        print(f'[gemini] upstream_http={status} error_code={error_code} '
+              f'model={job["model"]} search_enabled={search_used}', flush=True)
         await pool.mark_error(index, lease, http_status=status)
+        # A search tool may be unavailable for a specific Google project even
+        # if the model is on the public support list. A definite rejected 400
+        # contains no generated output, so retry ONCE without tools; do not
+        # replay 429s, network timeouts or errors after a long tool loop.
+        if (search_used and not search_fallback_used and
+                search_fallback_allowed(status, data, time.monotonic() - attempt_started)):
+            payload.pop('tools', None)
+            search_fallback_used = True
+            search_error_code = error_code
+            print(f'[gemini] search_fallback=enabled rejected_http={status} '
+                  f'error_code={error_code} retry_without_tool=1', flush=True)
+            continue
         scope = provider.credential_error_scope(status, data)
         if scope == "key":
             pool.retire_key(index, "invalid credential")
@@ -284,7 +325,8 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             await pool.rate_limited(index, lease, provider.retry_after(headers, data),
                                     daily_exhausted=quota in {"rpd", "spend"}, quota_type=quota)
         elif status not in (500, 502, 503, 504):
-            raise RuntimeError(f"Gemini 拒绝请求（HTTP {status}），请检查模型及参数")
+            raise RuntimeError(f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
+                               "请检查模型、搜索工具权限或项目额度")
         if attempt < 3 and not scope and status != 429:
             await sleep(min(30, max(2 ** (attempt + 1), provider.retry_after(headers, data) or 0)))
     raise RuntimeError("Gemini 暂时不可用或请求额度不足，请稍后重新提交")
