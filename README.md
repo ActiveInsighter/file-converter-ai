@@ -172,9 +172,15 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 按任务并发数独立发送各段。请求只有系统提示词、用户提示词与该段文本，不经过 PDF/OCR 流程，
 不上传 Gemini Files API；回复逐段写回 PB，截断回复也会保留并标明错误。
 
-**普通聊天默认提供 Google 搜索：** 对 Gemini 2.0/2.5/3.x/4.x 的受支持文本生成模型，
-`gemini_text.py` 会在 generateContent 请求中附带 `tools: [{"googleSearch": {}}]`。
-模型根据问题判断是否实际搜索，普通闲聊不会被强制联网。搜索过的回复自动附带
+**普通聊天默认提供 Google 搜索：** 对 Gemini 2.0/2.5/3.x/4.x 的受支持文本生成模型
+（包含 `gemini-4-hydrogen`），`gemini_text.py` 在 generateContent 请求中附带
+`tools: [{"googleSearch": {}}]`。模型根据问题判断是否实际搜索，普通闲聊不会被强制联网。
+**模型支持搜索 ≠ 当前 API Key 的服务层级允许搜索。** Google AI Studio 网页中可测试搜索，
+但 Gemini Developer API 中部分模型的 Free tier 不提供 Google Search Grounding。
+若服务器明确快速拒绝搜索工具（400、带有搜索/grounding 说明的 403），执行器自动移除工具
+**仅重试一次**，回复标注「不联网回答」；密钥无效、限流、超时或可能已运行工具的请求
+不进行这项重试，避免重复计费。Actions 会记录上游 HTTP 状态及 Google 错误类别（不打印响应体），
+失败分段也会显示 HTTP 状态和错误类别，不再只剩「1 段失败」。搜索过的回复自动附带
 `groundingMetadata` 中的网页参考来源和 Google 搜索建议链接，并保留原始 Token 统计，
 另记录 `usage.googleSearchCount`（Google 返回的搜索查询数）。自定义、旧版、
 图像、语音或不支持搜索的模型不会被强制插入这个参数，避免工具不兼容引起 HTTP 400。

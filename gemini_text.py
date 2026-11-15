@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from key_pool import KeyPool, parse_key_groups
+from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
@@ -27,13 +27,48 @@ MAX_REPLY_BYTES = 2 * 1024 * 1024
 
 # Current Gemini text models support Google Search grounding. Do not add the
 # tool to arbitrary user-saved model IDs (image/audio/legacy models may reject it).
-SEARCHABLE_CHAT_MODEL = re.compile(r'^gemini-(?:2\.(?:0|5)|3(?:\.\d+)?|4(?:\.\d+)?)-', re.I)
+# Google Search is available for these Gemini API families, including
+# Gemini 4 Hydrogen (confirmed in Google's Firebase AI Logic documentation).
+# Availability on a given API key/project/tier is a separate runtime check.
+SEARCHABLE_CHAT_MODEL = re.compile(
+    r'^gemini-(?:2\.(?:0-flash|5-(?:pro|flash(?:-lite)?))|'
+    r'3\.(?:1-(?:pro|flash-lite)|5-flash(?:-lite)?|6-flash|7-flash|8-flash)|'
+    r'3-(?:pro|flash)|4-(?:hydrogen|argon|carbon))(?=$|-)', re.I)
 NON_CHAT_MODEL = re.compile(r'image|audio|tts|embedding|live|speech|video', re.I)
 
 
 def supports_google_search(model: str) -> bool:
     value = str(model).lower().strip()
     return bool(SEARCHABLE_CHAT_MODEL.match(value)) and not NON_CHAT_MODEL.search(value)
+
+
+def safe_error_code(data: dict) -> str:
+    """Only expose machine-readable Google status, never provider message text."""
+    error = data.get('error') if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return 'UNKNOWN'
+    value = error.get('status') or error.get('code')
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value):
+        return value.upper()
+    return 'UNKNOWN'
+
+
+def search_fallback_allowed(status: int, data: dict, seconds: float) -> bool:
+    """Retry only a definite, fast rejection: never duplicate a possibly billed tool run."""
+    error = data.get('error') if isinstance(data, dict) else None
+    message = str(error.get('message', '')).casefold() if isinstance(error, dict) else ''
+    if 'too many tool calls' in message or 'quota' in message or 'rate limit' in message:
+        return False
+    if status in (400, 403) and any(word in message for word in
+                                     ('google search', 'google_search', 'googlesearch',
+                                      'grounding', 'search tool')):
+        return True
+    return (status == 400 and seconds <= 10 and
+            not data.get('usageMetadata') and safe_error_code(data) in
+            ('INVALID_ARGUMENT', 'FAILED_PRECONDITION', '400', 'UNKNOWN'))
+
 
 
 def safe_search_link(url: object) -> str | None:
@@ -224,8 +259,19 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep)
     provider = GeminiProvider()
     payload = build_payload(job, message)
+    search_fallback_used = False
+    search_error_code = ''
+    last_http_error = ''
     for attempt in range(4):
-        index, key, lease = await pool.acquire()
+        try:
+            index, key, lease = await pool.acquire()
+        except QuotaPoolExhaustedError:
+            # If every key was rejected, keep the actual HTTP code instead of
+            # replacing it with the generic exhausted-pool exception.
+            if last_http_error:
+                raise RuntimeError(last_http_error) from None
+            raise
+        attempt_started = time.monotonic()
         try:
             async with asyncio.timeout(180):
                 # Gemini responses are bounded too, even for a chunked HTTP response.
@@ -254,8 +300,32 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise
         if status == 200:
             await pool.mark_success(index, lease)
-            return parse_answer(data)
+            result = parse_answer(data)
+            if search_fallback_used:
+                result['reply'] = ('*Google 搜索暂时不可用，本次已自动切换为不联网回答。*'
+                                   '\n\n' + result['reply'])
+                result['usage']['googleSearchFallback'] = True
+                result['usage']['googleSearchErrorCode'] = search_error_code
+            return result
+        error_code = safe_error_code(data)
+        last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
+                           "请检查模型、工具权限、密钥权限或项目额度")
+        search_used = bool(payload.get('tools'))
+        print(f'[gemini] upstream_http={status} error_code={error_code} '
+              f'model={job["model"]} search_enabled={search_used}', flush=True)
         await pool.mark_error(index, lease, http_status=status)
+        # A search tool may be unavailable for a specific Google project even
+        # if the model is on the public support list. A definite rejected 400
+        # contains no generated output, so retry ONCE without tools; do not
+        # replay 429s, network timeouts or errors after a long tool loop.
+        if (search_used and not search_fallback_used and
+                search_fallback_allowed(status, data, time.monotonic() - attempt_started)):
+            payload.pop('tools', None)
+            search_fallback_used = True
+            search_error_code = error_code
+            print(f'[gemini] search_fallback=enabled rejected_http={status} '
+                  f'error_code={error_code} retry_without_tool=1', flush=True)
+            continue
         scope = provider.credential_error_scope(status, data)
         if scope == "key":
             pool.retire_key(index, "invalid credential")
@@ -266,7 +336,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             await pool.rate_limited(index, lease, provider.retry_after(headers, data),
                                     daily_exhausted=quota in {"rpd", "spend"}, quota_type=quota)
         elif status not in (500, 502, 503, 504):
-            raise RuntimeError(f"Gemini 拒绝请求（HTTP {status}），请检查模型及参数")
+            raise RuntimeError(last_http_error)
         if attempt < 3 and not scope and status != 429:
             await sleep(min(30, max(2 ** (attempt + 1), provider.retry_after(headers, data) or 0)))
     raise RuntimeError("Gemini 暂时不可用或请求额度不足，请稍后重新提交")
