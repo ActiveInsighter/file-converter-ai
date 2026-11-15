@@ -25,6 +25,7 @@ jobs:
       REQUEST_ID: ${{ inputs.request_id }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
+      ANTIGRAVITY_GITHUB_TOKEN: ${{ secrets.ANTIGRAVITY_GITHUB_TOKEN }}
       GEMINI_PB_URL: ${{ vars.GEMINI_PB_URL || 'https://pb.any1.tech' }}
       POCKETBASE_SERVER_TOKEN: ${{ secrets.POCKETBASE_SERVER_TOKEN }}
       GEMINI_PB_EMAIL: ${{ secrets.GEMINI_PB_EMAIL }}

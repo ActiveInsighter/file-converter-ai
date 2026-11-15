@@ -6,8 +6,10 @@ interaction ID exists, retries only GET that ID, using the same API credential.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import os
 import time
 from urllib.parse import quote
 
@@ -18,6 +20,10 @@ DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
 MAX_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+GITHUB_REPOSITORIES = (
+    ('ActiveInsighter/file-converter-ai', '/workspace/file-converter-ai'),
+    ('ActiveInsighter/Anyworkflow-remote', '/workspace/Anyworkflow-remote'),
+)
 
 
 class AgentCanceled(RuntimeError):
@@ -45,6 +51,31 @@ def build_agent_payload(job, message):
         payload['agent_config']['max_total_tokens'] = str(options['maxTotalTokens'])
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
+    # A configured GitHub PAT enables the fixed repository integration for
+    # every Antigravity job handled by this private executor. Prompts and user
+    # options cannot change the token, repository allowlist or MCP endpoint.
+    github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
+    if github_token:
+        basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
+        payload['environment'] = {
+            'type': 'remote',
+            'sources': [
+                {'type': 'repository', 'source': f'https://github.com/{repo}', 'target': target}
+                for repo, target in GITHUB_REPOSITORIES
+            ],
+            'network': {
+                'allowlist': [
+                    {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
+                    {'domain': 'api.github.com', 'transform': {'Authorization': f'Bearer {github_token}'}},
+                    {'domain': '*'},
+                ],
+            },
+        }
+        payload['tools'].append({
+            'type': 'mcp_server', 'name': 'github',
+            'url': 'https://api.githubcopilot.com/mcp',
+            'headers': {'Authorization': f'Bearer {github_token}'},
+        })
     return payload
 
 
@@ -105,7 +136,12 @@ async def request_json(client, method, url, key, payload=None):
 def upstream_error(status, data, key):
     error = data.get('error') or {}
     detail = error.get('message', '') if isinstance(error, dict) else str(error)
-    detail = str(detail).replace(key, '[REDACTED]')[:1200]
+    detail = str(detail).replace(key, '[REDACTED]')
+    github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
+    if github_token:
+        basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
+        detail = detail.replace(github_token, '[REDACTED]').replace(basic, '[REDACTED]')
+    detail = detail[:1200]
     if status == 429 and 'free tier' in detail.casefold() and 'limit: 0' in detail.casefold():
         detail = ('当前 API 项目的所选模型免费额度为 0。请使用有该模型 Agent 额度的 API Key，'
                   '或在 Google 项目中配置结算并确认可用额度。上游详情：' + detail)

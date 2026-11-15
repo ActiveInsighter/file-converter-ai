@@ -201,5 +201,32 @@ Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保�
 GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_agent_state.js`
 与 checkpoint 路由。使用现有 `GEMINI_API_KEYS`，无需把任何服务器凭据挂入沙盒。
 
+### Antigravity GitHub 仓库集成（仅需 Actions Secret）
+
+在本仓库的 `Settings → Secrets and variables → Actions → Secrets` 中添加
+`ANTIGRAVITY_GITHUB_TOKEN`（GitHub Fine-grained PAT）。Token 仅授权
+`ActiveInsighter/file-converter-ai` 与 `ActiveInsighter/Anyworkflow-remote`，
+授予 Contents: Read/Write；需要创建 PR 时再授予 Pull requests: Read/Write。
+
+**只需配置这一个 Secret**，无需 `ANTIGRAVITY_GITHUB_ALLOWED_OWNER`、
+PocketBase 用户 ID、额外后端迁移或 Google Credentials API。
+`gemini-text.yml` 将密钥仅传给服务端执行器；`gemini_agent.py` 在发起
+Antigravity Interactions API 请求时检测密钥，非空则挂载两个仓库到
+`/workspace/file-converter-ai` 和 `/workspace/Anyworkflow-remote`，
+并添加 GitHub MCP 和 GitHub Git/REST 请求认证；为空则保持原来的普通 Agent 模式。
+普通 Gemini 模型和 PDF 转换流程不受影响。
+
+**安全边界：** 启用后，任何能够通过该执行器提交 Antigravity 任务的用户，
+都可能间接获得这份 PAT 的仓库写权限。仓库是私有执行器还是公开仓库，
+并不能代替调用入口的身份验证。请确认 Remote 和 PocketBase 任务创建权限只开放给可信用户；
+否则请勿配置写权限 PAT。Token 会出现在发送给 Google 的 API 请求体中，
+但不应进入模型提示词、代码仓库文件、生成日志或用户可见消息。
+建议使用最小范围、短有效期的 PAT，定期轮换。
+
+配置后先在 Remote 的「Gemini 消息」选择 Antigravity，要求它只读取两个仓库并测试
+GitHub MCP 访问，不执行任何修改；确认成功后再要求它创建功能分支、运行测试并提交 PR。
+**不要直接推送 `main`**：Anyworkflow-remote 的 `main` 推送会触发正式 Cloudflare 部署。
+目前只覆盖本地 mock / CI 测试，未执行真实 Antigravity GitHub 写入验证。
+
 官方参考：https://aistudio.google.com/docs/antigravity-agent
 验证：`python -m unittest discover -s tests`。
