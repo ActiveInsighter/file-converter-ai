@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 import fitz
 import httpx
 from key_pool import retry_after_seconds
+from figure_groups import merge_figure_fragments
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_MODEL = "PaddleOCR-VL-1.6"
@@ -318,6 +319,7 @@ class PaddleOcr:
         self.fatal: str | None = None
         self.retired_tokens: set[str] = set()
         self.pages: dict[int, asyncio.Future] = {}
+        self.pdf_path: Path | None = None
         #: The link the service fetches; ``None`` means "upload". The first
         #: submission doubles as a probe: a rejected link
         #: (``https://arxiv.org/pdf/<id>`` gets 10004), a submission that
@@ -362,6 +364,7 @@ class PaddleOcr:
 
     def start(self, pdf_path: Path, first: int, last: int, width: int) -> asyncio.Task | None:
         loop = asyncio.get_running_loop()
+        self.pdf_path = pdf_path
         self.started = time.monotonic()
         self.pages = {number: loop.create_future() for number in range(first, last + 1)}
         if not self.enabled:
@@ -812,6 +815,17 @@ class PaddleOcr:
         sources = markdown.get("images") or {}
         figure_dir = self.work_dir / "figures"
         figure_dir.mkdir(parents=True, exist_ok=True)
+        text = markdown.get("text") or ""
+        merged, superseded = {}, set()
+        try:
+            text, merged, superseded = await asyncio.to_thread(
+                merge_figure_fragments, text, sources, result, self.pdf_path,
+                number, width, figure_dir)
+        except Exception as exc:  # preserve original figures if recovery is unavailable
+            print(f"[ocr] page {number}: figure recovery skipped ({type(exc).__name__})", flush=True)
+        if merged:
+            print(f"[ocr] page {number}: recovered {len(merged)} diagrams "
+                  f"from {len(superseded)} fragments", flush=True)
 
         async def fetch(index: int, source: str, url: str) -> tuple[str, str, Path] | None:
             suffix = Path(source).suffix.lower() or ".jpg"
@@ -833,9 +847,12 @@ class PaddleOcr:
         fetched = await asyncio.gather(*(
             fetch(index, source, url)
             for index, (source, url) in enumerate(sources.items(), start=1)
+            if source not in superseded
         ))
         figures = {link: path for item in fetched if item for _, link, path in [item]}
         links = {source: link for item in fetched if item for source, link, _ in [item]}
+        figures.update(merged)
+        links.update({link: link for link in merged})
         self.stats["figures"] += len(figures)
-        text = normalize_markdown(markdown.get("text") or "", links)
+        text = normalize_markdown(text, links)
         return OcrPage(number, text, figures)
