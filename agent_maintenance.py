@@ -52,6 +52,10 @@ async def main(mode, job_id):
         key = next((k for k in keys if hashlib.sha256(k.encode()).hexdigest() == state.get('credentialHash')), None)
         if not key or not state.get('environmentId'):
             raise RuntimeError('Saved environment or matching credential missing')
+        context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
+                                               job['prompt'], require_write=False, trace=trace)
+        if not context or not context['selected']:
+            raise RuntimeError('Maintenance requires an unambiguous repository')
         if mode == 'probe':
             from gemini_agent import generate_agent
             from key_pool import KeyPool
@@ -74,10 +78,6 @@ async def main(mode, job_id):
                 return 0 if not result['error'] and 'AW_RUNTIME_OK' in result['reply'] else 2
             finally:
                 await pool.close()
-        context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
-                                               job['prompt'], require_write=False, trace=trace)
-        if not context or not context['selected']:
-            raise RuntimeError('Recovery requires an unambiguous repository')
         # Recover Git objects only, not node_modules or arbitrary workspace data.
         path = 'workspace/' + context['selected']['full_name'].split('/')[1] + '/.git'
         url = ('https://generativelanguage.googleapis.com/v1beta/environments/' +
