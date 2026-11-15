@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import httpx
 
-from gemini_text import PocketBase, build_payload, generate, parse_answer, recover, run_job
+from gemini_text import PocketBase, build_payload, create_key_pool, generate, parse_answer, recover, run_job
 from key_pool import KeyPool
 
 
@@ -34,6 +34,15 @@ class TextPayloadTests(unittest.TestCase):
 
 
 class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_executor_startup_accepts_empty_and_shared_project_groups(self):
+        options = {"rpmPerKey": 15, "rpdPerKey": 500}
+        default = await create_key_pool(["fixture-a", "fixture-b"], options)
+        self.assertEqual(len(default.buckets), 2)
+        grouped = await create_key_pool(["fixture-a", "fixture-b"], options, "project-one\nproject-one")
+        self.assertEqual(len(grouped.buckets), 1)
+        self.assertIs(grouped.bucket_of[0], grouped.bucket_of[1])
+        self.assertEqual(grouped.rpd_per_key, 500)
+
     async def test_repository_server_token_takes_precedence_and_stays_in_authorization(self):
         seen = []
         async def outbound(request):
