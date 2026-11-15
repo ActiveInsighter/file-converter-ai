@@ -10,6 +10,7 @@ import asyncio
 import argparse
 import base64
 import json
+from html.parser import HTMLParser
 import os
 import re
 import time
@@ -53,6 +54,32 @@ def link_label(text: object) -> str:
     return re.sub(r'[\[\]\r\n]', ' ', str(text or '来源'))[:100].strip() or '来源'
 
 
+class _SearchSuggestionLinks(HTMLParser):
+    """Read clickable suggestions from Google's supplied renderedContent without rendering raw HTML."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.current_url = None
+        self.current_label = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self.current_url = safe_search_link(dict(attrs).get('href'))
+            self.current_label = []
+
+    def handle_data(self, data):
+        if self.current_url:
+            self.current_label.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.current_url:
+            self.links.append((link_label(' '.join(self.current_label)), self.current_url))
+            self.current_url = None
+            self.current_label = []
+
+
+
 def grounding_appendix(candidate: dict) -> str:
     """Preserve Google grounding sources and Search Suggestions as clickable links.
 
@@ -91,6 +118,12 @@ def grounding_appendix(candidate: dict) -> str:
                                 suggestions.append((link_label(item[0]), url))
         except (ValueError, UnicodeDecodeError, TypeError):
             pass
+    if not suggestions and isinstance(entry, dict):
+        rendered = entry.get('renderedContent')
+        if isinstance(rendered, str) and len(rendered) <= 65536:
+            extractor = _SearchSuggestionLinks()
+            extractor.feed(rendered)
+            suggestions = extractor.links[:8]
     if suggestions:
         if lines:
             lines.append('')
@@ -141,6 +174,9 @@ def parse_answer(payload: dict) -> dict:
     usage = {key: value for key, value in (payload.get("usageMetadata") or {}).items()
              if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
              and isinstance(value, int) and value >= 0}
+    grounding = candidate.get('groundingMetadata') or {}
+    if isinstance(grounding, dict) and isinstance(grounding.get('webSearchQueries'), list):
+        usage['googleSearchCount'] = len(grounding['webSearchQueries'])
     return {"reply": reply, "error": error, "finishReason": reason, "usage": usage}
 
 
