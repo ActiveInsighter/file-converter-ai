@@ -150,6 +150,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: anyworkflow-gemini-quota
+  cancel-in-progress: false
+
 jobs:
   convert:
     runs-on: ubuntu-latest

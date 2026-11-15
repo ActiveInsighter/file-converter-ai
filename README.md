@@ -165,3 +165,21 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 
 该链接属于持有即可访问的能力链接，应按原始文档的访问范围使用。原文件由 Remote 资料库管理，
 执行器不会删除源文件；用户在 Remote 删除原文件后，既有下载产物仍保留。
+
+## Gemini 独立文本消息
+
+`gemini-text.yml` 和 `gemini_text.py` 从 PocketBase 领取文本任务，复用现有 Gemini KeyPool，
+按任务并发数独立发送各段。请求只有系统提示词、用户提示词与该段文本，不经过 PDF/OCR 流程，
+不上传 Gemini Files API；回复逐段写回 PB，截断回复也会保留并标明错误。
+该 workflow 与 PDF workflow 共用 `anyworkflow-gemini-quota` concurrency group，避免手动
+运行绕过 Cloudflare 队列后同时消耗同一池配额。
+
+新增 Actions secrets：`GEMINI_PB_EMAIL`、`GEMINI_PB_PASSWORD`（PB 的专用
+`aw_gemini_services` 账号），variable `GEMINI_PB_URL` 默认 `https://pb.any1.tech`。
+不使用数据库超级用户凭据。调度器只传 `request_id`，内容保持在数据库，不进入 workflow inputs。
+需要先部署 AnyWorkflow-workers 的 Gemini migration/hooks，再发布本 workflow，最后发布 Remote。
+完整操作和发布说明见 Remote 的 `docs/gemini-messages.md` 与后端 `deploy/gemini-messages.md`。
+
+PB 写入失败的回复保留在三天有效的 `gemini-text-recovery-<runId>` artifact 中。
+解压后设置专用 PB 凭据及 URL，运行 `python gemini_text.py --recover-dir ./recovery`，
+只重试保存，不再次生成。传输超时、失去发送许可和新的 GitHub run attempt 不自动重复发送。
