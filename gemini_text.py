@@ -17,6 +17,7 @@ import httpx
 
 from key_pool import KeyPool, parse_key_groups
 from providers import GeminiProvider
+from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 
@@ -97,7 +98,11 @@ class PocketBase:
             await asyncio.sleep(min(16, 2 ** attempt))
 
 
-async def generate(client, pool, job, message, *, sleep=asyncio.sleep) -> dict:
+async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None) -> dict:
+    if is_antigravity(job['model']):
+        if checkpoint is None:
+            raise RuntimeError('Agent requires durable execution state')
+        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep)
     provider = GeminiProvider()
     payload = build_payload(job, message)
     for attempt in range(4):
@@ -170,7 +175,14 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 if not permit.get("send"):
                     continue
                 try:
-                    result = await generate(client, pool, job, message)
+                    if is_antigravity(job['model']):
+                        async def checkpoint(state=None):
+                            return await pb.post(f"{endpoint}/checkpoint", {**identity, **({'state': state} if state is not None else {})}, retries=3)
+                        result = await generate(client, pool, job, message, checkpoint=checkpoint)
+                    else:
+                        result = await generate(client, pool, job, message)
+                except AgentCanceled:
+                    continue
                 except Exception as error:
                     # Never include provider bodies, credentials, or source text in logs.
                     detail = str(error)
