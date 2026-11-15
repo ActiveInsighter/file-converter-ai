@@ -16,6 +16,8 @@ from urllib.parse import quote
 
 import httpx
 
+from agent_trace import AgentTrace, watch_interaction
+
 ROOT = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 DEFAULT_AGENT = 'antigravity-preview-09-2026'
 DEFAULT_MODEL = 'gemini-4-hydrogen'
@@ -185,6 +187,19 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     provider = GeminiProvider()
     payload = build_agent_payload(job, message)
     started = clock()
+    trace = AgentTrace(job=job.get('id', os.environ.get('REQUEST_ID', '')),
+                       segment=message.get('index'), secrets=pool.keys, clock=clock)
+    original_checkpoint = checkpoint
+    checkpoint_report = started
+    async def checkpoint(update=None):
+        nonlocal checkpoint_report
+        began = clock()
+        try:
+            return await original_checkpoint(update)
+        finally:
+            if clock() - checkpoint_report >= 30 or clock() - began >= 1:
+                trace.emit('checkpoint_timing', seconds=round(clock() - began, 3), writing=update is not None)
+                checkpoint_report = clock()
     state = (await checkpoint()).get('state') or {}
     agent_telemetry('prepared',
         model=payload['agent_config']['model'],
@@ -198,7 +213,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     for attempt in range(max(1, len(pool.keys))):
         if not state.get('id') and (await checkpoint()).get('canceled'):
             raise AgentCanceled('Agent 已取消，未创建远程执行。')
+        acquire_started = clock()
         index, key, lease = await pool.acquire()
+        trace.emit('credential_acquired', wait_seconds=round(clock() - acquire_started, 3), key_index=index)
         fingerprint = hashlib.sha256(key.encode()).hexdigest()
         if state.get('id'):
             # Resume the original remote execution, never create a second interaction.
@@ -209,8 +226,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = {'id': state['id'], 'status': 'in_progress'}
             break
         try:
+            create_started = clock()
             status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
-        except (httpx.TransportError, TimeoutError):
+            trace.emit('create_http', http=status, seconds=round(clock() - create_started, 3),
+                       attempt=attempt + 1,
+                       **({'error': trace.preview(data['error'])} if data.get('error') else {}))
+        except (httpx.TransportError, TimeoutError) as error:
+            trace.emit('create_transport_error', error_type=type(error).__name__,
+                       seconds=round(clock() - create_started, 3), resent=False)
             await pool.mark_error(index, lease)
             raise RuntimeError('Agent 提交连接中断，无法确认是否已创建；为避免重复执行，未自动重发。') from None
         if status in [200, 201, 202]:
@@ -247,6 +270,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
     url = f'{ROOT}/{quote(current["id"], safe="")}'
+    # Independent, read-only event stream; polling remains authoritative for control/results.
+    stream_task = asyncio.create_task(watch_interaction(client, url, key, trace))
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
@@ -258,6 +283,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
                 result = parse_interaction(current)
+                trace.snapshot(current)
                 agent_telemetry('completed',
                     status=current['status'],
                     elapsed_seconds=round(clock() - started, 2),
@@ -277,8 +303,12 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 raise RuntimeError('Agent 达到执行时限，已取消远程执行。')
             await sleep(3)
             try:
+                poll_started = clock()
                 status, _, data = await request_json(client, 'GET', url, key)
                 if status != 200:
+                    trace.emit('poll_http_error', http=status, consecutive_failures=failures + 1,
+                               seconds=round(clock() - poll_started, 3),
+                               **({'error': trace.preview(data['error'])} if data.get('error') else {}))
                     if status in [429, 500, 502, 503, 504]:
                         failures += 1
                         if failures <= 20:
@@ -293,10 +323,13 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     agent_telemetry('progress', elapsed_seconds=round(clock() - started, 2),
                                     polls=poll_count, status=current.get('status', 'unknown'),
                                     **summary)
+                    trace.emit('poll_timing', http=status, seconds=round(clock() - poll_started, 3),
+                               polls=poll_count, status=current.get('status', 'unknown'), **summary)
                     last_status = current.get('status')
                     last_report = clock()
-            except (httpx.TransportError, TimeoutError):
+            except (httpx.TransportError, TimeoutError) as error:
                 failures += 1
+                trace.emit('poll_transport_error', error_type=type(error).__name__, consecutive_failures=failures)
                 if failures > 20:
                     raise RuntimeError('Agent 状态连接持续失败，interaction 已保留，未重复创建。') from None
                 await sleep(min(failures * 2, 30))
@@ -315,3 +348,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         except Exception:
             pass
         raise
+    finally:
+        # A diagnostic failure must never alter execution or hide the actual result.
+        stream_task.cancel()
+        await asyncio.gather(stream_task, return_exceptions=True)
+        trace.summary('executor finished monitoring')

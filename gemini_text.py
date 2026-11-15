@@ -271,6 +271,11 @@ async def main():
     parser.add_argument('--recover-dir', type=Path, help='Write saved recovery JSONs to PB without calling Gemini')
     args = parser.parse_args()
     job_id = os.environ.get("REQUEST_ID", "")
+    # Manual diagnostics use the existing workflow, with an isolated concurrency
+    # identity. No real PB job ID has this prefix; never claim or mutate that job.
+    if not args.recover_dir and re.fullmatch(r'trace-[a-z0-9]{15}', job_id):
+        from agent_diagnostics import main as diagnose_main
+        return await diagnose_main(job_id.removeprefix('trace-'))
     execution_id = f"{os.environ.get('GITHUB_RUN_ID', '')}:{os.environ.get('GITHUB_RUN_ATTEMPT', '')}"
     if not args.recover_dir and (not re.fullmatch(r"[a-z0-9]{15}", job_id) or not re.fullmatch(r"\d+:\d+", execution_id)):
         raise RuntimeError("Valid REQUEST_ID and GitHub run identity are required")

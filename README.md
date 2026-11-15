@@ -248,9 +248,38 @@ JSON 行（`prepared` / `created` / `progress` / `completed`），只记录：
 使用模型、是否挂载 GitHub、工具**类型**、输入/系统提示词**字符数**、轮询次数、耗时、
 返回步骤的类型统计，以及 Google 原样返回的累计 `total_tokens`、
 `total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、
-`total_tool_use_tokens`、`total_cached_tokens`。不记录任何密钥、提示词正文、
-工具参数、工具返回内容或 Agent 私有思考。日志不会把轮询的累计用量重复求和。
+`total_tool_use_tokens`、`total_cached_tokens`。该组计数日志不记录正文。
+日志不会把轮询的累计用量重复求和。
 `[gemini]` 行还会记录任务领取、分段开始、分段保存与总耗时。
+
+执行器同时以只读 SSE 连接已有 interaction，输出更详细的 `[agent.trace]` JSON 行：
+
+- 每行携带 UTC 时间、任务 ID、分段序号、从开始观察至今的耗时。
+- 工具调用和结果的类型、名称、脱敏参数/命令/输出预览；每项最多 1800 字符，
+  每次观察的正文预览总量最多约 1 MiB。输出预览不等同于完整工具日志。
+- 工具调用到结果的观察耗时；有 `call_id` 时精确关联，否则标注 `type_fifo_estimate`。
+- API 提供的 `thought_summary` 摘要；不打印内部原始思考或加密 signature。
+  Agent 未提供摘要时，只能看到 thought 阶段的起止，不能凭空补出内容。
+- 状态查询耗时、PB checkpoint 耗时、获取 Key 等待、HTTP 错误、事件流重连、
+  每 20 秒一次的空闲时间/待返回工具状态，以及末尾的阶段汇总。
+
+SSE 断线时使用最后事件 ID 续接，并去重；事件流故障不影响原有轮询、取消和结果保存。
+日志会脱敏已配置的 API Key、PAT、PB 凭据、常见认证头及令牌字段。
+工具正文预览会出现在 Actions 日志中；公开仓库的日志也公开可读。
+**历史回放的事件到达间隔不代表原始执行耗时**，日志明确标注这一点。
+
+对正在运行或已结束的任务，可以用现有 workflow 启动只读诊断：
+
+```sh
+gh workflow run gemini-text.yml --repo ActiveInsighter/file-converter-ai \
+  --ref main -f request_id=trace-<15位原任务ID>
+```
+
+`trace-` 前缀与正常任务使用不同的 Actions concurrency group，执行器只读取 PB 中保存的
+interaction 身份并使用匹配 Key 获取现有事件，不领取、生成、保存或取消原任务。
+默认观察 180 秒。也可本地设置相同服务端凭据后运行 `python agent_diagnostics.py`，
+此时 `REQUEST_ID` 使用原任务 ID；`AGENT_TRACE_SECONDS` 可设为 10–900 秒。
+该操作需要执行器拥有读取对应 PB 消息的权限；缺少权限或匹配 Key 时明确失败。
 
 **说明：** `total_cached_tokens` 通常是输入 Token 的子集，不能简单把所有字段相加当作总计；
 页面显示的 Total Token 直接来自 Google `usage.total_tokens`。更新前的任务没有这些明细日志，
