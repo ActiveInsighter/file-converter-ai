@@ -174,9 +174,10 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 该 workflow 与 PDF workflow 共用 `anyworkflow-gemini-quota` concurrency group，避免手动
 运行绕过 Cloudflare 队列后同时消耗同一池配额。
 
-新增 Actions secrets：`GEMINI_PB_EMAIL`、`GEMINI_PB_PASSWORD`（PB 的专用
-`aw_gemini_services` 账号），variable `GEMINI_PB_URL` 默认 `https://pb.any1.tech`。
-不使用数据库超级用户凭据。调度器只传 `request_id`，内容保持在数据库，不进入 workflow inputs。
+仓库 Actions Secret `POCKETBASE_SERVER_TOKEN` 支持直接使用 PB 超级用户令牌，具有整个数据库的服务端读写权限。
+填入后优先使用它；未填写时回退到 `GEMINI_PB_EMAIL`、`GEMINI_PB_PASSWORD`（PB 专用
+`aw_gemini_services` 账号）。variable `GEMINI_PB_URL` 默认 `https://pb.any1.tech`。
+令牌不进入前端、日志或 workflow inputs；调度器只传 `request_id`，内容保持在数据库。
 需要先部署 AnyWorkflow-workers 的 Gemini migration/hooks，再发布本 workflow，最后发布 Remote。
 完整操作和发布说明见 Remote 的 `docs/gemini-messages.md` 与后端 `deploy/gemini-messages.md`。
 

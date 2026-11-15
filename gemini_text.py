@@ -59,6 +59,16 @@ class PocketBase:
     def __init__(self, client: httpx.AsyncClient, root: str):
         self.client, self.root, self.token = client, root.rstrip("/"), ""
 
+    async def authenticate(self, *, token="", email="", password=""):
+        # A repository server token is server-side only. Dedicated executor
+        # credentials remain available when full database access is unnecessary.
+        if token.strip():
+            self.token = token.strip()
+        elif email and password:
+            await self.login(email, password)
+        else:
+            raise RuntimeError("Set POCKETBASE_SERVER_TOKEN or GEMINI_PB_EMAIL and GEMINI_PB_PASSWORD in repository secrets")
+
     async def login(self, email: str, password: str):
         response = await self.client.post(f"{self.root}/api/collections/aw_gemini_services/auth-with-password",
                                           json={"identity": email, "password": password}, timeout=30)
@@ -211,7 +221,8 @@ async def main():
         raise RuntimeError("GEMINI_API_KEYS is required")
     async with httpx.AsyncClient(follow_redirects=False) as client:
         pb = PocketBase(client, root)
-        await pb.login(os.environ["GEMINI_PB_EMAIL"], os.environ["GEMINI_PB_PASSWORD"])
+        await pb.authenticate(token=os.environ.get("POCKETBASE_SERVER_TOKEN", ""),
+            email=os.environ.get("GEMINI_PB_EMAIL", ""), password=os.environ.get("GEMINI_PB_PASSWORD", ""))
         if args.recover_dir:
             if not args.recover_dir.is_dir():
                 raise RuntimeError('Recovery directory does not exist')

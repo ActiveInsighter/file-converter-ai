@@ -34,6 +34,21 @@ class TextPayloadTests(unittest.TestCase):
 
 
 class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repository_server_token_takes_precedence_and_stays_in_authorization(self):
+        seen = []
+        async def outbound(request):
+            seen.append(request)
+            return httpx.Response(200, json={"id": "claimed"})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = PocketBase(client, "https://pb.example")
+            await pb.authenticate(token=" fixture-server-token ", email="unused", password="unused")
+            await pb.post("jobs/aaaaaaaaaaaaaaa/claim", {"executionId": "123:1"})
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0].headers["Authorization"], "fixture-server-token")
+            self.assertNotIn("fixture-server-token", seen[0].content.decode())
+            with self.assertRaisesRegex(RuntimeError, 'POCKETBASE_SERVER_TOKEN'):
+                await PocketBase(client, "https://pb.example").authenticate()
+
     async def test_bounded_parallelism_and_persistence_retry_does_not_generate_again(self):
         active = peak = requests = writes = 0
         value = job()
