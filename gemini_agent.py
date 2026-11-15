@@ -51,12 +51,11 @@ def build_agent_payload(job, message):
         payload['agent_config']['max_total_tokens'] = str(options['maxTotalTokens'])
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
-    # Only the owner identified by the trusted PocketBase executor claim may
-    # receive GitHub write access. Neither prompt text nor client options can
-    # select or override the account, token, repositories or tool definition.
+    # A configured GitHub PAT enables the fixed repository integration for
+    # every Antigravity job handled by this private executor. Prompts and user
+    # options cannot change the token, repository allowlist or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
-    allowed_owner = os.environ.get('ANTIGRAVITY_GITHUB_ALLOWED_OWNER', '').strip()
-    if github_token and allowed_owner and job.get('owner') == allowed_owner:
+    if github_token:
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         payload['environment'] = {
             'type': 'remote',
