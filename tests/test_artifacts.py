@@ -51,6 +51,14 @@ class ArtifactTests(unittest.TestCase):
                                         'Page 3 ![](images/p003-1.jpg)\n'))
         self.assertEqual(merged.count('https://example.test/book.pdf'), 1)
 
+    def test_missing_svg_keeps_original_image_link_and_titled_images_copy(self):
+        (self.state / 'figures/p002-1.png').write_bytes(b'original')
+        results = [self.page_text(2, '![图](images/p002-1.png "原图")')]
+        files = self.write([page(2)], results,
+                           svg_map={'images/p002-1.png': 'images/p002-1.svg'})
+        self.assertIn('![图](images/p002-1.png "原图")', files.markdown.read_text())
+        self.assertEqual((self.root / 'output/images/p002-1.png').read_bytes(), b'original')
+
     def test_fallback_sources_are_listed(self):
         results = [self.page_text(2, 'A', source='ocr'), self.page_text(3, 'B', source='model')]
         merged = self.write([page(2), page(3)], results).markdown.read_text()

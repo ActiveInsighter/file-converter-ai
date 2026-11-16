@@ -319,3 +319,33 @@ GitHub MCP 可显式选择启用，默认仓库任务通过已认证的 REST/Git
 
 官方参考：https://aistudio.google.com/docs/antigravity-agent
 验证：`python -m unittest discover -s tests`。
+
+## 图片拼接与 SVG 重绘
+
+Remote 新任务默认启用图片 SVG 重绘，可分别选择正文和 SVG 的模型接口、模型与提示词。
+OCR 完成后先按原始 PDF 坐标恢复同一图中的相邻碎片，保留原来的相对位置、连线和图内标注；
+正文、完整图题和独立插图阻断合并。恢复后的完整裁图与独立插图分别交给 SVG 模型，
+与正文转录并行处理，不把一页中的所有图片拼成一张。
+
+成功时 Markdown 和 `pages/` 中的引用改为 `.svg`，`images/` 同时保留原始裁图供核对。
+无效 XML、缺失标准命名空间/有效 viewBox、空图、嵌入位图、脚本或外部资源引用均视为失败；
+按配置重试后仍失败时继续引用原图，不影响正文完成。没有 OCR 图块时不发送 SVG 请求。
+同接口、同地址、同密钥的正文与 SVG 请求共用配额桶，独立接口则分别记录配额；
+`quota-usage.json` 与 Actions Summary 包含 SVG 成功/失败计数。
+
+Actions 的 25 个输入已用满，图片设置通过一个 `image_config` JSON 传入：
+
+```sh
+gh workflow run pdf-to-md.yml --repo ActiveInsighter/file-converter-ai --ref <已发布分支> \
+  -f source_url='https://example.com/document.pdf' \
+  -f image_config='{"jpeg_quality":95,"svg":{"enabled":true,"provider":"gemini","model":"gemini-3.5-flash-lite","prompt":""}}'
+```
+
+原先直接通过 `workflow_dispatch` 传递的 `jpeg_quality` 须改为 `image_config.jpeg_quality`；
+Remote 和后端派发端已同步适配。CLI 的 `--jpeg-quality` 保持可用。直接在 Actions 运行而不传
+`image_config.svg.enabled=true` 时沿用原图。独立 SVG 接口需要对应的 `GEMINI_API_KEYS` 或
+`MODELFLARE_API_KEYS` Secret；无需另外添加一组密钥。
+
+CLI 也支持 `--svg-enabled --svg-provider gemini --svg-model <模型>`，以及
+`--svg-config '{"enabled":true,...}'`、`--image-config '{"jpeg_quality":95,"svg":{...}}'`。
+完整参数见 `python pdf2md.py --help`。

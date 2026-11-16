@@ -54,8 +54,9 @@ from providers import (
 from render_stream import RenderPlan, render_pages
 from request_policy import CURRENT_POLICY, RequestPolicy
 
-from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt
+from prompts import DEFAULT_PROMPT, MAX_PROMPT_CHARS, PROMPT_VERSION, compose_prompt, compose_svg_prompt
 from markdown_quality import clean_layout_markup
+from svg_rewrite import SvgRewriter
 
 
 MAX_INLINE_REQUEST_BYTES = 18 * 1024 * 1024
@@ -752,6 +753,18 @@ async def process_pages(
     ocr: PaddleOcr | None = None,
     adjacent_pages: bool = False,
     images_per_request: int = 1,
+    svg_enabled: bool = False,
+    svg_provider: Provider | None = None,
+    svg_model: str = "",
+    svg_prompt: str = "",
+    svg_keys: list[str] | None = None,
+    svg_api_base: str = "",
+    svg_thinking_level: str = "",
+    svg_reasoning_effort: str = "",
+    svg_max_output_tokens: int = 0,
+    svg_concurrency: int = 0,
+    svg_fallback_models: tuple[str, ...] = (),
+    svg_map_out: dict[str, str] | None = None,
 ) -> list[dict]:
     """Finalise every page with the model, using its OCR draft when there is one."""
     provider = provider or resolve_provider(None)
@@ -778,6 +791,46 @@ async def process_pages(
         key_pool = await KeyPool.create(
             keys, groups, rpm_per_key=rpm_per_key, rpd_per_key=rpd_per_key
         )
+        svg_rewriter: SvgRewriter | None = None
+        svg_key_pool = None
+        owns_svg_pool = False
+        if svg_enabled:
+            eff_svg_provider = svg_provider or provider
+            eff_svg_model = svg_model or resolve_model(eff_svg_provider, "")
+            eff_svg_api_base = (svg_api_base or eff_svg_provider.default_base_url).rstrip("/")
+            eff_svg_keys = svg_keys if svg_keys is not None else keys
+            if (
+                eff_svg_provider.name == provider.name
+                and eff_svg_api_base == (api_base or provider.default_base_url).rstrip("/")
+                and eff_svg_keys == keys
+            ):
+                svg_key_pool = key_pool
+            else:
+                svg_groups = (
+                    parse_key_groups(len(eff_svg_keys), os.getenv(eff_svg_provider.key_groups_env))
+                    if eff_svg_provider.key_groups_env else None
+                )
+                svg_key_pool = await KeyPool.create(
+                    eff_svg_keys, svg_groups, rpm_per_key=rpm_per_key, rpd_per_key=rpd_per_key
+                )
+                owns_svg_pool = True
+            svg_rewriter = SvgRewriter(
+                call_model_fn=call_model,
+                is_retryable_fn=is_retryable_error,
+                client=client,
+                key_pool=svg_key_pool,
+                provider=eff_svg_provider,
+                model=eff_svg_model,
+                prompt=compose_svg_prompt(svg_prompt),
+                api_base=eff_svg_api_base,
+                thinking_level=svg_thinking_level or thinking_level,
+                reasoning_effort=svg_reasoning_effort if svg_reasoning_effort else reasoning_effort,
+                max_output_tokens=svg_max_output_tokens or max_output_tokens,
+                media_resolution=media_resolution,
+                fallback_models=svg_fallback_models,
+                concurrency=svg_concurrency or max(1, min(20, concurrency)),
+                attempts=attempts_per_page,
+            )
 
         if isinstance(pages, list):
             total_pages = len(pages)
@@ -839,9 +892,15 @@ async def process_pages(
         async def draft_ready(unit) -> None:
             if ocr is not None:
                 if isinstance(unit, PageBatch):
-                    await asyncio.gather(*(ocr.page(page.number) for page in unit.pages if not page.blank))
+                    pages_ocr = await asyncio.gather(*(ocr.page(page.number) for page in unit.pages if not page.blank))
+                    if svg_rewriter is not None:
+                        for ocr_page in pages_ocr:
+                            if ocr_page and ocr_page.figures:
+                                svg_rewriter.schedule_figures(ocr_page.figures)
                 elif not unit.blank:
-                    await ocr.page(unit.number)
+                    ocr_page = await ocr.page(unit.number)
+                    if svg_rewriter is not None and ocr_page and ocr_page.figures:
+                        svg_rewriter.schedule_figures(ocr_page.figures)
 
         def source():
             if ocr is None or not ocr.enabled:
@@ -1084,6 +1143,8 @@ async def process_pages(
                 except TimeoutError:
                     if publish_progress is not None:
                         try:
+                            if svg_rewriter is not None and svg_map_out is not None:
+                                svg_map_out.update(svg_rewriter.completed_map())
                             publish_progress(flatten_results(tracker.results.values()))
                         except Exception as exc:
                             print(f"[warn] Cannot refresh partial Markdown: {type(exc).__name__}: {exc}",
@@ -1104,12 +1165,22 @@ async def process_pages(
         metrics_task = asyncio.create_task(emit_metrics())
         try:
             results = flatten_results(await schedule_chunks(source(), run_unit, concurrency, retry_rounds, tracker))
+            if svg_rewriter is not None:
+                await svg_rewriter.finish()
+                if svg_map_out is not None:
+                    svg_map_out.update(svg_rewriter.completed_map())
         finally:
             CURRENT_POLICY.reset(policy_token)
             stop_metrics.set()
             try:
                 await metrics_task
             finally:
+                if svg_rewriter is not None:
+                    if svg_map_out is not None:
+                        svg_map_out.update(svg_rewriter.completed_map())
+                    await svg_rewriter.close()
+                if owns_svg_pool and svg_key_pool is not None:
+                    await svg_key_pool.close()
                 await key_pool.close()
 
         for result in results:
@@ -1118,6 +1189,11 @@ async def process_pages(
         usage = key_pool.usage_summary()
         usage["speculation"] = policy.summary()
         usage["ocr"] = ocr.stats if ocr and ocr.enabled else None
+        if svg_rewriter is not None:
+            usage["svg"] = svg_rewriter.summary()
+            usage["svg"]["shared_quota_pool"] = not owns_svg_pool
+            if owns_svg_pool:
+                usage["svg"]["quota"] = svg_key_pool.usage_summary()
         usage["page_sources"] = {
             source: sum(r.get("source") == source for r in results)
             for source in ("ocr+model", "model", "ocr")
@@ -1336,10 +1412,86 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--work-dir", default="work")
     p.add_argument("--output-dir", default="output",
                    help="Dedicated generated artifact directory; cleared on each run.")
+    p.add_argument("--svg-enabled", action="store_true",
+                   help="Rewrite Baidu OCR figure crops (including merged diagrams) as SVG using an independent AI.")
+    p.add_argument("--svg-provider", default="",
+                   help="Model gateway for SVG figure rewriting. Empty uses the Markdown provider.")
+    p.add_argument("--svg-model", default="",
+                   help="Model ID for SVG figure rewriting. Empty uses the SVG provider default.")
+    p.add_argument("--svg-api-base", default="",
+                   help="Optional base URL override for the SVG provider.")
+    p.add_argument("--svg-prompt", default="",
+                   help="Custom prompt for SVG figure rewriting. Empty uses the built-in SVG prompt.")
+    p.add_argument("--svg-thinking-level", choices=["", "minimal", "low", "medium", "high"], default="",
+                   help="Optional Gemini thinking level for SVG figure rewriting.")
+    p.add_argument("--svg-reasoning-effort", default="",
+                   help="Optional OpenAI-compatible reasoning effort for SVG figure rewriting.")
+    p.add_argument("--svg-max-output-tokens", type=int, default=0,
+                   help="Optional max output tokens for SVG figure rewriting (0 = default).")
+    p.add_argument("--svg-concurrency", type=int, default=0,
+                   help="Max concurrent SVG figure rewrite requests (0 = automatic).")
+    p.add_argument("--image-config", default="",
+                   help="JSON image options for workflow dispatch ({jpeg_quality, svg: {...}}).")
+    p.add_argument("--svg-config", default="",
+                   help="JSON-encoded SVG config object ({enabled, provider, model, prompt, ...}).")
     return p
 
 
+def _parse_image_config(args: argparse.Namespace) -> dict:
+    raw = getattr(args, "image_config", "").strip()
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.keys() - {"jpeg_quality", "svg"}:
+        raise ValueError("image_config must contain only jpeg_quality and svg")
+    if "jpeg_quality" in data and (type(data["jpeg_quality"]) is not int
+                                   or not 50 <= data["jpeg_quality"] <= 100):
+        raise ValueError("image_config.jpeg_quality must be an integer between 50 and 100")
+    if "svg" in data and not isinstance(data["svg"], dict):
+        raise ValueError("image_config.svg must be an object")
+    return data
+
+
+def _parse_svg_config(args: argparse.Namespace) -> dict:
+    raw = (getattr(args, "svg_config", "") or "").strip()
+    data: dict = dict(_parse_image_config(args).get("svg", {}))
+    if raw:
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            raise ValueError("svg_config must be a JSON object")
+        data.update(loaded)
+    allowed = {"enabled", "provider", "model", "api_base", "prompt", "thinking_level",
+               "reasoning_effort", "max_output_tokens", "concurrency"}
+    if data.keys() - allowed:
+        raise ValueError("svg_config contains unknown fields")
+    if "enabled" in data and not isinstance(data["enabled"], bool):
+        raise ValueError("svg_config.enabled must be a boolean")
+    for key in allowed - {"enabled", "max_output_tokens", "concurrency"}:
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"svg_config.{key} must be a string")
+    for key in ("max_output_tokens", "concurrency"):
+        if key in data and type(data[key]) is not int:
+            raise ValueError(f"svg_config.{key} must be an integer")
+    config = {
+        "enabled": args.svg_enabled or data.get("enabled", False),
+        "provider": str(args.svg_provider or data.get("provider") or "").strip(),
+        "model": str(args.svg_model or data.get("model") or "").strip(),
+        "api_base": str(args.svg_api_base or data.get("api_base") or "").strip(),
+        "prompt": str(args.svg_prompt or data.get("prompt") or "").strip(),
+        "thinking_level": str(args.svg_thinking_level or data.get("thinking_level") or "").strip(),
+        "reasoning_effort": str(args.svg_reasoning_effort or data.get("reasoning_effort") or "").strip(),
+        "max_output_tokens": int(args.svg_max_output_tokens or data.get("max_output_tokens") or 0),
+        "concurrency": int(args.svg_concurrency or data.get("concurrency") or 0),
+    }
+    if config["thinking_level"] not in {"", "minimal", "low", "medium", "high"}:
+        raise ValueError("svg_config.thinking_level is invalid")
+    return config
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    image = _parse_image_config(args)
+    if "jpeg_quality" in image:
+        args.jpeg_quality = image["jpeg_quality"]
     validate_output_name(args.output_name)
     source = urlparse(args.source_url)
     if source.scheme not in {"http", "https"} or not source.hostname:
@@ -1407,6 +1559,21 @@ def validate_args(args: argparse.Namespace) -> None:
         normalize_reasoning_effort(args.reasoning_effort)
     if not 0 <= args.max_output_tokens <= 200000:
         raise ValueError("max_output_tokens must be between 0 and 200000")
+    svg = _parse_svg_config(args)
+    if svg["provider"]:
+        resolve_provider(svg["provider"])
+    if svg["api_base"]:
+        parsed = urlparse(svg["api_base"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("svg_api_base must be an absolute http(s) URL")
+    if svg["reasoning_effort"]:
+        normalize_reasoning_effort(svg["reasoning_effort"])
+    if len(svg["prompt"]) > MAX_PROMPT_CHARS:
+        raise ValueError(f"svg_prompt must be at most {MAX_PROMPT_CHARS} characters")
+    if not 0 <= svg["max_output_tokens"] <= 200000:
+        raise ValueError("svg_max_output_tokens must be between 0 and 200000")
+    if not 0 <= svg["concurrency"] <= 100:
+        raise ValueError("svg_concurrency must be between 0 and 100")
 
 
 async def async_main(args: argparse.Namespace) -> int:
@@ -1444,13 +1611,33 @@ async def async_main(args: argparse.Namespace) -> int:
     source_pdf = work_dir / "source.pdf"
     images_dir = work_dir / "images"
 
+    svg = _parse_svg_config(args)
+    if svg["enabled"] and not ocr_tokens:
+        print("[svg] No OCR figure crops are available; SVG rewriting is skipped", flush=True)
+        svg["enabled"] = False
+    svg_provider = resolve_provider(svg["provider"] or provider.name) if svg["enabled"] else None
+    svg_model = resolve_model(svg_provider, svg["model"]) if svg_provider is not None else ""
+    svg_api_base = ((svg["api_base"] or svg_provider.default_base_url).rstrip("/") if svg_provider is not None else "")
+    svg_keys: list[str] = []
+    if svg_provider is not None:
+        svg_keys = parse_api_keys(os.getenv(svg_provider.api_key_env))
+        if not svg_keys:
+            raise RuntimeError(f"{svg_provider.api_key_env} is empty (needed for SVG rewriting). {svg_provider.api_key_hint}")
+        svg_fallback_models = resolve_fallback_models(
+            svg_provider, svg_model, os.getenv(svg_provider.fallbacks_env) if svg_provider.fallbacks_env else ""
+        )
+    else:
+        svg_fallback_models = ()
+
     print(
         f"[config] conversion_type={args.conversion_type} provider={provider.name} "
         f"model={model} keys={len(keys)} "
         f"ocr={args.ocr_model if ocr_tokens else 'off'} ocr_tokens={len(ocr_tokens)} "
         f"ocr_source={args.ocr_source} ocr_relay_dpi={args.ocr_relay_dpi} "
         f"ocr_relay={'on' if args.ocr_relay_url and os.getenv('PDF_RELAY_TOKEN') else 'off'} "
-        f"concurrency={args.concurrency} images_per_request={args.images_per_request} "
+        f"svg={'on' if svg['enabled'] else 'off'}"
+        + (f" svg_provider={svg_provider.name} svg_model={svg_model}" if svg_provider is not None else "") +
+        f" concurrency={args.concurrency} images_per_request={args.images_per_request} "
         f"thinking_level={args.thinking_level} "
         f"image_format={args.image_format} dpi={args.dpi} "
         f"verification_passes={args.verification_passes} "
@@ -1504,6 +1691,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 yield page
 
     pipeline_error = None
+    svg_map: dict[str, str] = {}
 
     def publish(results):
         return write_result(
@@ -1512,6 +1700,7 @@ async def async_main(args: argparse.Namespace) -> int:
             ocr_model=args.ocr_model if ocr_tokens else None,
             converted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             pages=pages, results=results, pipeline_error=pipeline_error,
+            svg_map=svg_map or None,
         )
 
     # Always keep a compact partial package, including during cancellation.
@@ -1555,6 +1744,18 @@ async def async_main(args: argparse.Namespace) -> int:
                 ocr=ocr,
                 adjacent_pages=args.adjacent_pages,
                 images_per_request=args.images_per_request,
+                svg_enabled=svg["enabled"],
+                svg_provider=svg_provider,
+                svg_model=svg_model,
+                svg_prompt=svg["prompt"],
+                svg_keys=svg_keys or None,
+                svg_api_base=svg_api_base,
+                svg_thinking_level=svg["thinking_level"],
+                svg_reasoning_effort=svg["reasoning_effort"],
+                svg_max_output_tokens=svg["max_output_tokens"],
+                svg_concurrency=svg["concurrency"],
+                svg_fallback_models=svg_fallback_models,
+                svg_map_out=svg_map,
             )
         except (Exception, asyncio.CancelledError) as exc:
             cancelled = isinstance(exc, asyncio.CancelledError) or asyncio.current_task().cancelling() > 0

@@ -85,11 +85,25 @@ def _write(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _apply_svg_map(text: str, svg_map: dict[str, str] | None) -> str:
+    if not svg_map:
+        return text
+    return re.sub(
+        r'(!\[[^\]\n]*\]\()(images/[^)\s]+)(?=[\s)])',
+        lambda m: f'{m.group(1)}{svg_map.get(m.group(2), m.group(2))}',
+        text,
+    )
+
+
 def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: str,
                  plan: RenderPlan, provider: str, model: str, ocr_model: str | None,
                  converted_at: str, pages, results: list[dict],
-                 pipeline_error: str | None) -> ResultFiles:
+                 pipeline_error: str | None, svg_map: dict[str, str] | None = None) -> ResultFiles:
     name = validate_output_name(name)
+    # A canceled/failed writer must never replace a good raster reference with
+    # a missing file. Only published SVGs are eligible for the download package.
+    svg_map = {original: svg for original, svg in (svg_map or {}).items()
+               if (state_dir / 'figures' / Path(svg).name).is_file()}
     indexed = {result['chunk']: result for result in results}
     completed, blanks = set(), set()
     by_source: dict[str, set[int]] = {}
@@ -105,7 +119,7 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
         by_source.setdefault(result.get('source', 'model'), set()).add(page.number)
         text = (state_dir / 'pages' / f'{page.stem}.md').read_text(encoding='utf-8').strip()
         if text:
-            contents.append((page.stem, text))
+            contents.append((page.stem, _apply_svg_map(text, svg_map)))
         else:
             blanks.add(page.number)
     missing = set(range(plan.first, plan.last + 1)) - completed
@@ -147,13 +161,18 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
     for stem, text in contents:
         pages_dir.mkdir(exist_ok=True)
         current.add(f'{stem}.md')
-        linked.update(re.findall(r'\]\(images/([^)\s/]+)\)', text))
+        linked.update(re.findall(r'\]\(images/([^)\s/]+)(?=[\s)])', text))
         # Page files sit one level down, so their figure links do too.
         _write(pages_dir / f'{stem}.md', re.sub(r'\]\(images/', '](../images/', text) + '\n')
     if pages_dir.exists():
         for stale in pages_dir.iterdir():
             if stale.name not in current:
                 stale.unlink()
+    if svg_map:
+        reverse_svg = {Path(svg_link).name: Path(orig_link).name for orig_link, svg_link in svg_map.items()}
+        for figure in list(linked):
+            if figure in reverse_svg:
+                linked.add(reverse_svg[figure])
     for figure in sorted(linked):
         source = state_dir / 'figures' / figure
         target = images_dir / figure
