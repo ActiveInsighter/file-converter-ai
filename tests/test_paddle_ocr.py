@@ -433,14 +433,20 @@ class PaddleOcrTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_next_segment_is_on_the_relay_before_the_running_job_finishes(self):
         service = FakeService()
         respond, events = service.handler, []
+        second_staged = asyncio.Event()
 
-        def handler(request):
+        async def handler(request):
             url = str(request.url)
             if request.method == "PUT":
                 events.append("put")
+                if events.count("put") >= 2:
+                    second_staged.set()
             elif url.startswith(JOBS + "/"):
                 response = respond(request)
                 if response.json()["data"]["state"] == "done":
+                    # Gate the fake remote job on the prefetch event rather than
+                    # thread scheduling speed. Missing prefetch still times out.
+                    await asyncio.wait_for(second_staged.wait(), timeout=3)
                     events.append("done")
                 return response
             return respond(request)

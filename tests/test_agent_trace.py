@@ -113,7 +113,7 @@ class TraceTests(unittest.TestCase):
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
-    async def test_diagnostic_failure_cannot_change_generation_or_cancel_remote(self):
+    async def test_generation_uses_only_non_streaming_snapshots(self):
         from gemini_agent import generate_agent
         from key_pool import KeyPool
         requests, state = [], {}
@@ -126,15 +126,14 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             if request.method == 'POST':
                 return httpx.Response(200, json={'id': 'saved', 'status': 'in_progress'})
             return httpx.Response(200, json={'id': 'saved', 'status': 'completed', 'output_text': 'answer'})
-        async def broken_observer(*_):
-            raise RuntimeError('diagnostic failed')
         async def sleep(_):
             await asyncio.sleep(0.001)
-        with patch('gemini_agent.watch_interaction', broken_observer):
+        with patch('agent_trace.watch_interaction', new_callable=AsyncMock) as observer:
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
                     {'model': 'Antigravity', 'prompt': 'hi', 'options': {}}, {'index': 1}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'answer')
+        observer.assert_not_awaited()
         self.assertEqual(requests, [('POST', '/v1beta/interactions'), ('GET', '/v1beta/interactions/saved')])
 
     async def test_workflow_trace_prefix_routes_without_claiming_job(self):

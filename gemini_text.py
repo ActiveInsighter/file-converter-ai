@@ -12,12 +12,14 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
+from response_capture import generate_content_snapshot
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
@@ -48,14 +50,21 @@ def build_payload(job: dict, message: dict) -> dict:
         job["model"], parts, thinking_level=options.get("thinkingLevel", ""),
         max_output_tokens=options["maxOutputTokens"],
     )
-    if not options.get("thinkingLevel"):
-        payload["generationConfig"].pop("thinkingConfig", None)
+    if job['model'].startswith(('gemini-2.5', 'gemini-3', 'gemini-4')):
+        payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
+    elif not options.get('thinkingLevel'):
+        payload['generationConfig'].pop('thinkingConfig', None)
+    if job.get('history'):
+        payload['contents'] = [
+            {'role': turn['role'], 'parts': [{'text': turn['text']}]}
+            for turn in job['history']
+        ] + payload['contents']
     if job.get("systemPrompt"):
         payload["systemInstruction"] = {"parts": [{"text": job["systemPrompt"]}]}
     return payload
 
 
-def parse_answer(payload: dict) -> dict:
+def parse_answer(payload: dict, *, secrets=()) -> dict:
     candidate = (payload.get("candidates") or [{}])[0]
     reason = str(candidate.get("finishReason") or "")[:64]
     reply = "\n".join(part["text"] for part in (candidate.get("content") or {}).get("parts", [])
@@ -70,9 +79,12 @@ def parse_answer(payload: dict) -> dict:
     elif not reply.strip():
         error = "Gemini 返回空回复"
     usage = {key: value for key, value in (payload.get("usageMetadata") or {}).items()
-             if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
+             if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount", "toolUsePromptTokenCount", "toolUseTokenCount"}
              and isinstance(value, int) and value >= 0}
-    return {"reply": reply, "error": error, "finishReason": reason, "usage": usage}
+    if 'toolUsePromptTokenCount' in usage:
+        usage['toolUseTokenCount'] = usage['toolUsePromptTokenCount']
+    response = generate_content_snapshot(payload, secrets=secrets)
+    return {"reply": reply, "error": error, "finishReason": reason, "usage": usage, "response": response}
 
 
 class PocketBase:
@@ -157,7 +169,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise
         if status == 200:
             await pool.mark_success(index, lease)
-            return parse_answer(data)
+            return parse_answer(data, secrets=pool.keys)
         error_code = safe_error_code(data)
         last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
                            "请检查模型、工具权限、密钥权限或项目额度")
@@ -200,6 +212,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
             endpoint = f"{path}/messages/{message['id']}"
             try:
                 begun = time.monotonic()
+                started_at = datetime.now(timezone.utc).isoformat()
                 # Not retried: a lost permit is not permission to send twice.
                 permit = await pb.post(f"{endpoint}/start", identity)
                 if not permit.get("send"):
@@ -223,6 +236,11 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
                     result = {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
+                if isinstance(result.get('response'), dict):
+                    result['response']['metadata']['execution'] = {
+                        'startedAt': started_at, 'finishedAt': datetime.now(timezone.utc).isoformat(),
+                        'durationSeconds': round(time.monotonic() - begun, 3), 'timingBasis': 'Actions runner wall clock',
+                    }
                 saved = {**identity, **result}
                 target = work_dir / f"{message['id']}.json"
                 temporary = target.with_suffix(".tmp")

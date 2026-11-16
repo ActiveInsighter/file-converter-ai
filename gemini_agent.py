@@ -16,7 +16,8 @@ from urllib.parse import quote
 
 import httpx
 
-from agent_trace import AgentTrace, watch_interaction
+from agent_trace import AgentTrace
+from response_capture import interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, prepare_github_context, task_text
 
@@ -63,7 +64,9 @@ def build_agent_payload(job, message):
     name = str(job['model']).lower()
     payload = {
         'agent': options.get('id') or (DEFAULT_AGENT if name == 'antigravity' else name),
-        'input': '\n\n'.join(value for value in [job.get('prompt', ''), message.get('inputText', '')] if value),
+        'input': '\n\n'.join(value for value in [
+            *[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])],
+            job.get('prompt', ''), message.get('inputText', '')] if value),
         'background': True, 'store': True,
         'environment': {'type': 'remote'},
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
@@ -103,7 +106,7 @@ def build_agent_payload(job, message):
     return payload
 
 
-def parse_interaction(data):
+def parse_interaction(data, *, secrets=()):
     reply = data.get('output_text')
     if not isinstance(reply, str):
         reply = '\n\n'.join(
@@ -141,7 +144,8 @@ def parse_interaction(data):
     normalized['agentStepCount'] = len(data.get('steps', []))
     if type(usage.get('total_tool_use_tokens')) is int and usage['total_tool_use_tokens'] >= 0:
         normalized['toolUseTokenCount'] = usage['total_tool_use_tokens']
-    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized}
+    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized,
+            'response': interaction_snapshot(data, secrets=secrets)}
 
 
 async def request_json(client, method, url, key, payload=None):
@@ -268,8 +272,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
     url = f'{ROOT}/{quote(current["id"], safe="")}'
-    # Independent, read-only event stream; polling remains authoritative for control/results.
-    stream_task = asyncio.create_task(watch_interaction(client, url, key, trace))
+    # Non-streaming snapshots are authoritative for control, metadata and results.
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
@@ -280,7 +283,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
-                result = parse_interaction(current)
+                result = parse_interaction(current, secrets=pool.keys)
                 trace.snapshot(current)
                 agent_telemetry('completed',
                     status=current['status'],
@@ -348,6 +351,4 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise
     finally:
         # A diagnostic failure must never alter execution or hide the actual result.
-        stream_task.cancel()
-        await asyncio.gather(stream_task, return_exceptions=True)
         trace.summary('executor finished monitoring')
