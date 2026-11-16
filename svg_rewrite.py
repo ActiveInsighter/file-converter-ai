@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import mimetypes
 import random
 import re
@@ -14,7 +15,7 @@ from typing import Awaitable, Callable
 from providers import Provider
 
 _CODE_FENCE = re.compile(r"^```(?:svg|xml|html)?\s*\n(.*?)```\s*$", re.I | re.S)
-_SVG_BLOCK = re.compile(r"<svg\b[^>]*>.*?</svg>", re.I | re.S)
+_SVG_BLOCK = re.compile(r"<svg\b[^>]*>.*</svg>", re.I | re.S)
 
 _MIME_BY_SUFFIX = {
     ".png": "image/png",
@@ -26,12 +27,14 @@ _MIME_BY_SUFFIX = {
 
 
 class InvalidSvgError(ValueError):
-    """Model returned text without a well-formed <svg>...</svg> document."""
+    """Model returned an invalid or non-self-contained vector SVG document."""
 
 
 def extract_svg(raw_text: str) -> str:
     """Extract and validate a self-contained <svg>...</svg> document from model output."""
     text = raw_text.strip()
+    if re.search(r'<!DOCTYPE|<!ENTITY', text, re.I):
+        raise InvalidSvgError("SVG must not contain document/entity declarations")
     fence = _CODE_FENCE.match(text)
     if fence:
         text = fence.group(1).strip()
@@ -43,9 +46,40 @@ def extract_svg(raw_text: str) -> str:
         root = ET.fromstring(svg)
     except ET.ParseError as exc:
         raise InvalidSvgError(f"Malformed SVG XML: {exc}") from exc
-    tag = root.tag.split("}", 1)[-1].lower()
-    if tag != "svg":
-        raise InvalidSvgError(f"Unexpected root tag: {root.tag}")
+    namespace = "{http://www.w3.org/2000/svg}"
+    if root.tag != namespace + "svg":
+        raise InvalidSvgError("SVG must declare the standard SVG namespace")
+    try:
+        bounds = [float(v) for v in re.split(r'[\s,]+', root.attrib['viewBox'].strip())]
+        if len(bounds) != 4 or not all(math.isfinite(v) for v in bounds) or min(bounds[2:]) <= 0:
+            raise ValueError("invalid dimensions")
+    except (KeyError, ValueError) as exc:
+        raise InvalidSvgError("SVG must have a finite, positive viewBox") from exc
+    # Model output is a downloadable document. Require vectors and local
+    # references so a valid XML response cannot silently become a bitmap,
+    # active HTML, or an asset that disappears without a remote server.
+    forbidden = {'script', 'foreignobject', 'image', 'feimage', 'iframe',
+                 'object', 'embed', 'animate', 'animatetransform', 'set'}
+    for node in root.iter():
+        if not node.tag.startswith(namespace) or node.tag[len(namespace):].lower() in forbidden:
+            raise InvalidSvgError(f"Unsupported SVG element: {node.tag}")
+        for key, value in node.attrib.items():
+            local = key.split('}')[-1].lower()
+            if local.startswith('on') or local == 'base':
+                raise InvalidSvgError(f"Unsupported SVG attribute: {key}")
+            if local == 'href' and not re.fullmatch(r'#[A-Za-z_][\w.:-]*', value.strip()):
+                raise InvalidSvgError("SVG references must be local fragment IDs")
+        css = ' '.join(node.attrib.values())
+        if node.tag == namespace + 'style':
+            css += ' ' + (node.text or '')
+        if re.search(r'@import|@font-face|expression\s*\(|javascript:|\\', css, re.I):
+            raise InvalidSvgError("SVG must not load external or executable styles")
+        for target in re.findall(r'url\s*\(\s*([^)]*)\)', css, re.I):
+            if not re.fullmatch(r'#[A-Za-z_][\w.:-]*', target.strip().strip('\"\'')):
+                raise InvalidSvgError("SVG resource URLs must be local fragment IDs")
+    if not any(node.tag[len(namespace):] in {'path', 'rect', 'circle', 'ellipse',
+               'line', 'polygon', 'polyline', 'text', 'use'} for node in root.iter()):
+        raise InvalidSvgError("SVG contains no vector content")
     return svg
 
 
@@ -108,6 +142,14 @@ class SvgRewriter:
             self._tasks[link] = asyncio.create_task(self._rewrite_one(link, image_path))
 
     async def _rewrite_one(self, link: str, image_path: Path) -> str | None:
+        try:
+            return await self._rewrite_image(link, image_path)
+        except Exception as exc:
+            self._failed[link] = type(exc).__name__
+            print(f"[svg] {link}: {type(exc).__name__}; keeping original image", flush=True)
+            return None
+
+    async def _rewrite_image(self, link: str, image_path: Path) -> str | None:
         async with self._semaphore:
             started = time.monotonic()
             data = await asyncio.to_thread(image_path.read_bytes)
@@ -141,7 +183,13 @@ class SvgRewriter:
                     )
                     svg = extract_svg(raw)
                     svg_path = image_path.with_suffix(".svg")
-                    await asyncio.to_thread(svg_path.write_text, svg + "\n", encoding="utf-8")
+                    # No thread can publish a late SVG after cancellation.
+                    temporary = svg_path.with_suffix('.svg.tmp')
+                    try:
+                        temporary.write_text(svg + "\n", encoding="utf-8")
+                        temporary.replace(svg_path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
                     svg_link = Path(link).with_suffix(".svg").as_posix()
                     self._results[link] = svg_link
                     elapsed = time.monotonic() - started
@@ -181,6 +229,11 @@ class SvgRewriter:
             if not task.done():
                 task.cancel()
 
+    async def close(self) -> None:
+        self.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+
     def summary(self) -> dict:
         return {
             "provider": self.provider.name,
@@ -188,4 +241,5 @@ class SvgRewriter:
             "scheduled": len(self._tasks),
             "succeeded": len(self._results),
             "failed": len(self._failed),
+            "failures": dict(self._failed),
         }

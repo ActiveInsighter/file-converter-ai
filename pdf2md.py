@@ -1178,7 +1178,7 @@ async def process_pages(
                 if svg_rewriter is not None:
                     if svg_map_out is not None:
                         svg_map_out.update(svg_rewriter.completed_map())
-                    svg_rewriter.cancel()
+                    await svg_rewriter.close()
                 if owns_svg_pool and svg_key_pool is not None:
                     await svg_key_pool.close()
                 await key_pool.close()
@@ -1191,6 +1191,9 @@ async def process_pages(
         usage["ocr"] = ocr.stats if ocr and ocr.enabled else None
         if svg_rewriter is not None:
             usage["svg"] = svg_rewriter.summary()
+            usage["svg"]["shared_quota_pool"] = not owns_svg_pool
+            if owns_svg_pool:
+                usage["svg"]["quota"] = svg_key_pool.usage_summary()
         usage["page_sources"] = {
             source: sum(r.get("source") == source for r in results)
             for source in ("ocr+model", "model", "ocr")
@@ -1427,22 +1430,50 @@ def parser() -> argparse.ArgumentParser:
                    help="Optional max output tokens for SVG figure rewriting (0 = default).")
     p.add_argument("--svg-concurrency", type=int, default=0,
                    help="Max concurrent SVG figure rewrite requests (0 = automatic).")
+    p.add_argument("--image-config", default="",
+                   help="JSON image options for workflow dispatch ({jpeg_quality, svg: {...}}).")
     p.add_argument("--svg-config", default="",
                    help="JSON-encoded SVG config object ({enabled, provider, model, prompt, ...}).")
     return p
 
 
+def _parse_image_config(args: argparse.Namespace) -> dict:
+    raw = getattr(args, "image_config", "").strip()
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.keys() - {"jpeg_quality", "svg"}:
+        raise ValueError("image_config must contain only jpeg_quality and svg")
+    if "jpeg_quality" in data and (type(data["jpeg_quality"]) is not int
+                                   or not 50 <= data["jpeg_quality"] <= 100):
+        raise ValueError("image_config.jpeg_quality must be an integer between 50 and 100")
+    if "svg" in data and not isinstance(data["svg"], dict):
+        raise ValueError("image_config.svg must be an object")
+    return data
+
+
 def _parse_svg_config(args: argparse.Namespace) -> dict:
     raw = (getattr(args, "svg_config", "") or "").strip()
-    data: dict = {}
+    data: dict = dict(_parse_image_config(args).get("svg", {}))
     if raw:
         loaded = json.loads(raw)
         if not isinstance(loaded, dict):
             raise ValueError("svg_config must be a JSON object")
-        data = loaded
-    enabled = bool(args.svg_enabled or data.get("enabled"))
-    return {
-        "enabled": enabled,
+        data.update(loaded)
+    allowed = {"enabled", "provider", "model", "api_base", "prompt", "thinking_level",
+               "reasoning_effort", "max_output_tokens", "concurrency"}
+    if data.keys() - allowed:
+        raise ValueError("svg_config contains unknown fields")
+    if "enabled" in data and not isinstance(data["enabled"], bool):
+        raise ValueError("svg_config.enabled must be a boolean")
+    for key in allowed - {"enabled", "max_output_tokens", "concurrency"}:
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"svg_config.{key} must be a string")
+    for key in ("max_output_tokens", "concurrency"):
+        if key in data and type(data[key]) is not int:
+            raise ValueError(f"svg_config.{key} must be an integer")
+    config = {
+        "enabled": args.svg_enabled or data.get("enabled", False),
         "provider": str(args.svg_provider or data.get("provider") or "").strip(),
         "model": str(args.svg_model or data.get("model") or "").strip(),
         "api_base": str(args.svg_api_base or data.get("api_base") or "").strip(),
@@ -1452,9 +1483,15 @@ def _parse_svg_config(args: argparse.Namespace) -> dict:
         "max_output_tokens": int(args.svg_max_output_tokens or data.get("max_output_tokens") or 0),
         "concurrency": int(args.svg_concurrency or data.get("concurrency") or 0),
     }
+    if config["thinking_level"] not in {"", "minimal", "low", "medium", "high"}:
+        raise ValueError("svg_config.thinking_level is invalid")
+    return config
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    image = _parse_image_config(args)
+    if "jpeg_quality" in image:
+        args.jpeg_quality = image["jpeg_quality"]
     validate_output_name(args.output_name)
     source = urlparse(args.source_url)
     if source.scheme not in {"http", "https"} or not source.hostname:
@@ -1575,6 +1612,9 @@ async def async_main(args: argparse.Namespace) -> int:
     images_dir = work_dir / "images"
 
     svg = _parse_svg_config(args)
+    if svg["enabled"] and not ocr_tokens:
+        print("[svg] No OCR figure crops are available; SVG rewriting is skipped", flush=True)
+        svg["enabled"] = False
     svg_provider = resolve_provider(svg["provider"] or provider.name) if svg["enabled"] else None
     svg_model = resolve_model(svg_provider, svg["model"]) if svg_provider is not None else ""
     svg_api_base = ((svg["api_base"] or svg_provider.default_base_url).rstrip("/") if svg_provider is not None else "")

@@ -105,10 +105,10 @@ on:
         options:
           - png
           - jpeg
-      jpeg_quality:
-        description: "JPEG quality (50-100; ignored for PNG)"
-        required: true
-        default: "95"
+      image_config:
+        description: 'Image options JSON: {"jpeg_quality":95,"svg":{"enabled":true,"provider":"gemini","model":"gemini-3.5-flash-lite"}}'
+        required: false
+        default: ""
         type: string
       verification_passes:
         description: "Extra image-vs-Markdown verification passes"
@@ -179,7 +179,7 @@ jobs:
       THINKING_LEVEL: ${{ github.event.inputs.thinking_level || 'high' }}
       DPI: ${{ github.event.inputs.dpi || '240' }}
       IMAGE_FORMAT: ${{ github.event.inputs.image_format || 'png' }}
-      JPEG_QUALITY: ${{ github.event.inputs.jpeg_quality || '95' }}
+      JPEG_QUALITY: '95'
       VERIFICATION_PASSES: ${{ github.event.inputs.verification_passes || '0' }}
       MEDIA_RESOLUTION: ${{ github.event.inputs.media_resolution || 'ultra_high' }}
       ADJACENT_PAGES: ${{ github.event.inputs.adjacent_pages || 'false' }}
@@ -193,6 +193,7 @@ jobs:
       RPD_PER_KEY: ${{ github.event.inputs.rpd_per_key || '500' }}
       START_PAGE: ${{ github.event.inputs.start_page || '' }}
       END_PAGE: ${{ github.event.inputs.end_page || '' }}
+      IMAGE_CONFIG: ${{ github.event.inputs.image_config || '' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       MODELFLARE_API_KEYS: ${{ secrets.MODELFLARE_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
@@ -276,6 +277,7 @@ jobs:
             --media-resolution "${MEDIA_RESOLUTION}"
             --rpm-per-key "${RPM_PER_KEY}"
             --rpd-per-key "${RPD_PER_KEY}"
+            --image-config "${IMAGE_CONFIG}"
             --work-dir work
             --output-dir output
           )

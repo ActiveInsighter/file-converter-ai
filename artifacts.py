@@ -89,8 +89,8 @@ def _apply_svg_map(text: str, svg_map: dict[str, str] | None) -> str:
     if not svg_map:
         return text
     return re.sub(
-        r'(\]\()(images/[^)\s]+)(\))',
-        lambda m: f'{m.group(1)}{svg_map.get(m.group(2), m.group(2))}{m.group(3)}',
+        r'(!\[[^\]\n]*\]\()(images/[^)\s]+)(?=[\s)])',
+        lambda m: f'{m.group(1)}{svg_map.get(m.group(2), m.group(2))}',
         text,
     )
 
@@ -100,6 +100,10 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
                  converted_at: str, pages, results: list[dict],
                  pipeline_error: str | None, svg_map: dict[str, str] | None = None) -> ResultFiles:
     name = validate_output_name(name)
+    # A canceled/failed writer must never replace a good raster reference with
+    # a missing file. Only published SVGs are eligible for the download package.
+    svg_map = {original: svg for original, svg in (svg_map or {}).items()
+               if (state_dir / 'figures' / Path(svg).name).is_file()}
     indexed = {result['chunk']: result for result in results}
     completed, blanks = set(), set()
     by_source: dict[str, set[int]] = {}
@@ -157,7 +161,7 @@ def write_result(*, output_dir: Path, state_dir: Path, name: str, source_url: st
     for stem, text in contents:
         pages_dir.mkdir(exist_ok=True)
         current.add(f'{stem}.md')
-        linked.update(re.findall(r'\]\(images/([^)\s/]+)\)', text))
+        linked.update(re.findall(r'\]\(images/([^)\s/]+)(?=[\s)])', text))
         # Page files sit one level down, so their figure links do too.
         _write(pages_dir / f'{stem}.md', re.sub(r'\]\(images/', '](../images/', text) + '\n')
     if pages_dir.exists():

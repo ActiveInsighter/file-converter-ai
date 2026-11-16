@@ -54,6 +54,12 @@ class WorkflowProviderContractTests(unittest.TestCase):
         names = [line for line in inputs.splitlines() if line.startswith("      ") and not line.startswith("       ")]
         self.assertLessEqual(len(names), 25, "workflow_dispatch accepts at most 25 inputs")
 
+    def test_independent_svg_json_reaches_the_converter(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn('      image_config:\n', workflow)
+        self.assertIn("IMAGE_CONFIG: ${{ github.event.inputs.image_config || '' }}", workflow)
+        self.assertIn('--image-config "${IMAGE_CONFIG}"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

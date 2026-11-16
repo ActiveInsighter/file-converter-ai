@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import fitz
 
-from artifacts import write_result
+from artifacts import _apply_svg_map, write_result
 from paddle_ocr import OcrPage
-from pdf2md import Page, _parse_svg_config, parser, process_pages
+from pdf2md import Page, _parse_svg_config, parser, process_pages, validate_args
 from providers import GEMINI, MODELFLARE
 from render_stream import RenderPlan
 from svg_rewrite import InvalidSvgError, SvgRewriter, extract_svg
@@ -43,6 +43,54 @@ class SvgExtractionTests(unittest.TestCase):
         self.assertEqual(cfg["provider"], "modelflare")
         self.assertEqual(cfg["model"], "gpt-6-sol")
         self.assertEqual(cfg["prompt"], "custom svg prompt")
+
+    def test_rejects_non_vector_and_external_or_active_content(self):
+        for content in ('<image href="data:image/png;base64,AAAA"/>',
+                        '<script>alert(1)</script>', '<foreignObject/>',
+                        '<use href="https://example.test/image.svg#x"/>',
+                        '<rect onclick="alert(1)"/>', '<rect fill="url(https://example.test/x)"/>',
+                        '<style>@import "https://example.test/x";</style>', ''):
+            with self.subTest(content=content), self.assertRaises(InvalidSvgError):
+                extract_svg('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">' + content + '</svg>')
+        for header in ('<svg>', '<svg xmlns="http://www.w3.org/2000/svg">',
+                       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 nan 10">'):
+            with self.subTest(header=header), self.assertRaises(InvalidSvgError):
+                extract_svg(header + '<rect width="1" height="1"/></svg>')
+
+    def test_local_vector_resources_and_unicode_labels_are_preserved(self):
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><defs><marker id="arrow"><path d="M0 0L1 1"/></marker></defs><path marker-end="url(#arrow)" d="M0 0L10 0"/><text>① 高度 h=2</text></svg>'
+        self.assertEqual(extract_svg(svg), svg)
+
+    def test_svg_json_is_strictly_typed(self):
+        for config in ({"enabled": "false"}, {"enabled": 1}, {"model": []},
+                       {"prompt": {}}, {"concurrency": True}, {"concurrency": 1.5},
+                       {"thinking_level": "unknown"}, {"unknown": True}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                _parse_svg_config(parser().parse_args(['--source-url', 'https://example.test/a.pdf',
+                                                      '--svg-config', json.dumps(config)]))
+        args = parser().parse_args(['--source-url', 'https://example.test/a.pdf', '--svg-config', '{"enabled":false}'])
+        self.assertFalse(_parse_svg_config(args)['enabled'])
+
+    def test_nested_svg_panels_are_not_truncated(self):
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><svg x="10"><rect width="10" height="10"/></svg><text>右图</text></svg>'
+        self.assertEqual(extract_svg(svg), svg)
+
+    def test_image_bundle_validation_and_jpeg_quality(self):
+        args = parser().parse_args(['--source-url', 'https://example.test/a.pdf', '--image-config',
+            json.dumps({'jpeg_quality': 88, 'svg': {'enabled': True, 'model': 'test-svg'}})])
+        validate_args(args)
+        self.assertEqual(args.jpeg_quality, 88)
+        self.assertEqual(_parse_svg_config(args)['model'], 'test-svg')
+        for bundle in ([], {'jpeg_quality': True}, {'jpeg_quality': 49}, {'jpeg_quality': 90.5},
+                       {'svg': None}, {'unknown': True}):
+            with self.subTest(bundle=bundle), self.assertRaises(ValueError):
+                args = parser().parse_args(['--source-url', 'https://example.test/a.pdf', '--image-config', json.dumps(bundle)])
+                validate_args(args)
+
+    def test_link_replacement_only_updates_image_destinations(self):
+        mapping = {'images/p001.png': 'images/p001.svg'}
+        self.assertEqual(_apply_svg_map('![图](images/p001.png "title") [原图](images/p001.png)', mapping),
+                         '![图](images/p001.svg "title") [原图](images/p001.png)')
 
 
 class FakeOcr:
@@ -166,3 +214,53 @@ class SvgPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((output_dir / "images" / "p001-2.jpg").is_file())
             page_md = (output_dir / "pages" / "001.md").read_text(encoding="utf-8")
             self.assertIn("![diagram](../images/p001-merged-1.svg)", page_md)
+
+
+class SvgLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def rewriter(self, call_model, attempts=1):
+        return SvgRewriter(call_model_fn=call_model, is_retryable_fn=lambda exc: False,
+                           client=None, key_pool=None, provider=GEMINI, model='test',
+                           prompt='redraw', attempts=attempts)
+
+    async def test_bad_svg_retries_and_cancellation_drains_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / 'figure.png'
+            image.write_bytes(b'png')
+            calls = []
+            async def model(*args):
+                calls.append(args)
+                if len(calls) == 1:
+                    return '<svg></svg>'
+                return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>'
+            rewriter = self.rewriter(model, attempts=2)
+            with patch('svg_rewrite.random.uniform', return_value=0):
+                rewriter.schedule_figures({'images/figure.png': image})
+                rewriter.schedule_figures({'images/figure.png': image})
+                mapping = await rewriter.finish()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(mapping, {'images/figure.png': 'images/figure.svg'})
+            self.assertFalse(image.with_suffix('.svg.tmp').exists())
+
+            started, drained = asyncio.Event(), asyncio.Event()
+            async def blocking(*args):
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    drained.set()
+            rewriter = self.rewriter(blocking)
+            rewriter.schedule_figures({'images/figure.png': image})
+            await asyncio.wait_for(started.wait(), 1)
+            await rewriter.close()
+            self.assertTrue(drained.is_set())
+            self.assertEqual(rewriter.completed_map(), {})
+
+    async def test_unreadable_crop_is_counted_as_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / 'gone.png'
+            image.touch()
+            rewriter = self.rewriter(None)
+            rewriter.schedule_figures({'images/gone.png': image})
+            image.unlink()
+            self.assertEqual(await rewriter.finish(), {})
+            self.assertEqual(rewriter.summary()['failed'], 1)

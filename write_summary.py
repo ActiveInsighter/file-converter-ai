@@ -16,6 +16,7 @@ def write_summary(state_dir: Path, destination: Path):
     performance = usage.get('performance') or {}
     spread = usage.get('spread') or {}
     ocr = usage.get('ocr') or {}
+    svg = usage.get('svg') or {}
     rows = [
         ('State', progress['state']),
         ('Completed pages', f"{progress.get('completed_pages', progress['completed_chunks'])}/{progress['total_pages']} ({progress['percent']}%)"),
@@ -33,6 +34,8 @@ def write_summary(state_dir: Path, destination: Path):
         ('Retired model keys / OCR tokens',
          f"{sum(bool(key.get('disabled')) for key in usage.get('keys', {}).values())} / {ocr.get('retired_tokens', 0)}"),
         ('OCR polling retries (same job)', ocr.get('poll_retries', 0)),
+        ('SVG figures scheduled / succeeded / original retained',
+         f"{svg.get('scheduled', 0)} / {svg.get('succeeded', 0)} / {svg.get('failed', 0)}" if svg else 'off'),
         ('Requests per key bucket (min–max)', f"{spread.get('min_requests', 0)}–{spread.get('max_requests', 0)}"),
         ('Elapsed seconds', progress['elapsed_seconds']),
         ('Speculative copies / wins', f"{requests.get('hedges_launched', 0)} / {requests.get('hedge_wins', 0)}"),
