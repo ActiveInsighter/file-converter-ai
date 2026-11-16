@@ -40,6 +40,15 @@ OCR 草稿：
 额外审校（仅在附带 <verification_draft> 时适用）：
 按上述相同要求对照当前页图片复核草稿，修正遗漏、公式、数字、表格和格式，直接输出完整结果，不输出审校说明。"""
 
+DEFAULT_SVG_PROMPT = r"""请将这张图片中的图形、图表、示意图、流程图或几何图形，忠实地重写为高质量、自包含的矢量 SVG 代码。
+
+要求：
+1. 准确还原原图中的所有几何形状、线条、箭头、节点、图例、标注文字、数字、数学符号、坐标轴、刻度、阴影或颜色关系，保持原有的空间布局与比例。
+2. 使用标准的 SVG 矢量元素（如 `<path>`、`<rect>`、`<circle>`、`<ellipse>`、`<line>`、`<polygon>`、`<polyline>`、`<text>`、`<g>`、`<defs>`、`<marker>` 等），不要使用 `<image>` 嵌入位图。
+3. 根元素 `<svg>` 必须包含 `xmlns="http://www.w3.org/2000/svg"` 和合理的 `viewBox="0 0 W H"`（与原图宽高比一致），确保清晰可读、线条锐利、文字不重叠不截断。
+4. 如原图背景为纯白或浅色，可使用白色背景矩形或透明背景，并保证深色线条与文字具有高对比度。
+5. 直接输出完整的 `<svg>...</svg>` 代码，不要输出任何解释、说明或多余文字。"""
+
 MAX_PROMPT_CHARS = 12000
 
 
@@ -51,3 +60,9 @@ def compose_prompt(system_prompt: str, user_prompt: str) -> str:
     """
     parts = [part.strip() for part in (system_prompt, user_prompt)]
     return "\n\n".join(part for part in parts if part) or DEFAULT_PROMPT
+
+
+def compose_svg_prompt(svg_prompt: str) -> str:
+    """Use the custom SVG prompt when supplied, otherwise fall back to DEFAULT_SVG_PROMPT."""
+    return svg_prompt.strip() or DEFAULT_SVG_PROMPT
+
