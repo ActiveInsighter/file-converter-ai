@@ -43,6 +43,7 @@ from paddle_ocr import (
 )
 from pipeline import Progress, ready_first, schedule_chunks
 from providers import (
+    media_resolution_payload,
     GEMINI,
     Provider,
     ProviderRefusal,
@@ -250,14 +251,6 @@ def is_blank_page(page: fitz.Page) -> tuple[bool, float, int]:
     ink, darkest = page_ink_stats(page)
     blank = ink < BLANK_PAGE_INK_RATIO and darkest >= BLANK_PAGE_DARK_LEVEL
     return blank, ink, darkest
-
-
-def media_resolution_payload(level: str) -> dict | None:
-    if level == "unspecified":
-        return None
-    return {
-        "level": f"MEDIA_RESOLUTION_{level.upper()}",
-    }
 
 
 def image_part(path: Path, media_resolution: str) -> tuple[dict, int]:

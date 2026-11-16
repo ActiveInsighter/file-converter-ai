@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from providers import Provider
+from providers import Provider, media_resolution_payload
 
 _CODE_FENCE = re.compile(r"^```(?:svg|xml|html)?\s*\n(.*?)```\s*$", re.I | re.S)
 _SVG_BLOCK = re.compile(r"<svg\b[^>]*>.*</svg>", re.I | re.S)
@@ -160,8 +160,9 @@ class SvgRewriter:
                     "data": encoded,
                 }
             }
-            if self.media_resolution and self.media_resolution != "unspecified":
-                image_part["mediaResolution"] = self.media_resolution
+            resolution = media_resolution_payload(self.media_resolution)
+            if resolution is not None:
+                image_part["mediaResolution"] = resolution
             parts = [{"text": self.prompt}, image_part]
             chunk_name = f"svg:{Path(link).stem}"
 

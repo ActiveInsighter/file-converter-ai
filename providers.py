@@ -31,6 +31,13 @@ from typing import ClassVar
 
 from key_pool import classify_quota_error, retry_after_seconds
 
+
+def media_resolution_payload(level: str) -> dict | None:
+    """Shared per-image hint consumed by Gemini and OpenAI protocol adapters."""
+    if not level or level == "unspecified":
+        return None
+    return {"level": f"MEDIA_RESOLUTION_{level.upper()}"}
+
 #: Finish reasons that mean "this page image was refused". Resending the same
 #: image reproduces the verdict, so these must never enter the backoff rounds.
 BLOCKED_FINISH_REASONS = frozenset(

@@ -83,6 +83,7 @@ class SvgConversionE2E(unittest.IsolatedAsyncioTestCase):
                     assert self.path == '/svg/test-svg:generateContent'
                     assert self.headers['x-goog-api-key'] == 'svg-key'
                     parts = data['contents'][0]['parts']
+                    assert parts[1]['mediaResolution'] == {'level': 'MEDIA_RESOLUTION_ULTRA_HIGH'}
                     assert parts[0]['text'] == DEFAULT_SVG_PROMPT
                     encoded = next(part['inlineData']['data'] for part in parts if 'inlineData' in part)
                     pixels = fitz.Pixmap(base64.b64decode(encoded))

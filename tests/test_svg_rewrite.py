@@ -255,6 +255,37 @@ class SvgLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(drained.is_set())
             self.assertEqual(rewriter.completed_map(), {})
 
+    async def test_svg_requests_serialize_through_both_real_provider_adapters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / 'figure.png'
+            image.write_bytes(b'png')
+            for provider in (GEMINI, MODELFLARE):
+                for resolution in ('low', 'high', 'ultra_high', 'unspecified'):
+                    with self.subTest(provider=provider.name, resolution=resolution):
+                        calls = []
+                        async def model(_client, _pool, actual, model, parts, *args):
+                            payload = actual.build_payload(model, parts, thinking_level='high')
+                            calls.append(payload)
+                            if actual is GEMINI:
+                                part = payload['contents'][0]['parts'][1]
+                                if resolution == 'unspecified':
+                                    self.assertNotIn('mediaResolution', part)
+                                else:
+                                    self.assertEqual(part['mediaResolution'], {'level': 'MEDIA_RESOLUTION_' + resolution.upper()})
+                            else:
+                                part = payload['messages'][0]['content'][1]['image_url']
+                                if resolution == 'unspecified':
+                                    self.assertNotIn('detail', part)
+                                else:
+                                    self.assertEqual(part['detail'], 'low' if resolution == 'low' else 'high')
+                            return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>'
+                        rewriter = SvgRewriter(call_model_fn=model, is_retryable_fn=lambda exc: False,
+                            client=None, key_pool=None, provider=provider, model='test', prompt='redraw',
+                            media_resolution=resolution, attempts=1)
+                        rewriter.schedule_figures({'images/figure.png': image})
+                        self.assertEqual(await rewriter.finish(), {'images/figure.png': 'images/figure.svg'})
+                        self.assertEqual(len(calls), 1)
+
     async def test_unreadable_crop_is_counted_as_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'gone.png'
