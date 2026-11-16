@@ -101,7 +101,7 @@ def generate_content_snapshot(data, *, secrets=()):
                                            'inline': key == 'inlineData'}})
     # 'data' is our normalized public payload, not provider base64 binary data.
     return snapshot('generateContent', parts, {
-        **{key: data[key] for key in ('responseId', 'modelVersion', 'createTime', 'promptFeedback', 'usageMetadata') if key in data},
+        **{key: data[key] for key in ('responseId', 'modelVersion', 'createTime', 'promptFeedback', 'usageMetadata', 'error') if key in data},
         'candidates': [{key: c[key] for key in ('index', 'finishReason', 'finishMessage', 'safetyRatings',
                         'citationMetadata', 'groundingMetadata', 'urlContextMetadata', 'avgLogprobs', 'logprobsResult') if key in c}
                        for c in candidates],

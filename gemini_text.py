@@ -24,6 +24,13 @@ from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 
+
+class GeminiRequestError(RuntimeError):
+    def __init__(self, message, data, *, secrets=()):
+        super().__init__(message)
+        self.result = {'reply': '', 'error': message, 'finishReason': 'HTTP_ERROR', 'usage': {},
+                       'response': generate_content_snapshot(data, secrets=secrets)}
+
 # Keep HTTP/error-category diagnostics; ordinary chat intentionally uses no tools.
 def safe_error_code(data: dict) -> str:
     """Only expose a machine-readable Google status, never message text."""
@@ -50,6 +57,8 @@ def build_payload(job: dict, message: dict) -> dict:
         job["model"], parts, thinking_level=options.get("thinkingLevel", ""),
         max_output_tokens=options["maxOutputTokens"],
     )
+    if not options.get('thinkingLevel'):
+        payload['generationConfig']['thinkingConfig'].pop('thinkingLevel', None)
     if job['model'].startswith(('gemini-2.5', 'gemini-3', 'gemini-4')):
         payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
     elif not options.get('thinkingLevel'):
@@ -132,6 +141,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
     provider = GeminiProvider()
     payload = build_payload(job, message)
     last_http_error = ''
+    last_data = {}
     for attempt in range(4):
         try:
             index, key, lease = await pool.acquire()
@@ -139,7 +149,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             # If every key was rejected, keep the actual HTTP code instead of
             # replacing it with the generic exhausted-pool exception.
             if last_http_error:
-                raise RuntimeError(last_http_error) from None
+                raise GeminiRequestError(last_http_error, last_data, secrets=pool.keys) from None
             raise
         try:
             async with asyncio.timeout(180):
@@ -170,6 +180,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         if status == 200:
             await pool.mark_success(index, lease)
             return parse_answer(data, secrets=pool.keys)
+        last_data = data
         error_code = safe_error_code(data)
         last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
                            "请检查模型、工具权限、密钥权限或项目额度")
@@ -186,10 +197,10 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             await pool.rate_limited(index, lease, provider.retry_after(headers, data),
                                     daily_exhausted=quota in {"rpd", "spend"}, quota_type=quota)
         elif status not in (500, 502, 503, 504):
-            raise RuntimeError(last_http_error)
+            raise GeminiRequestError(last_http_error, data, secrets=pool.keys)
         if attempt < 3 and not scope and status != 429:
             await sleep(min(30, max(2 ** (attempt + 1), provider.retry_after(headers, data) or 0)))
-    raise RuntimeError("Gemini 暂时不可用或请求额度不足，请稍后重新提交")
+    raise GeminiRequestError("Gemini 暂时不可用或请求额度不足，请稍后重新提交", last_data, secrets=pool.keys)
 
 
 async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work_dir: Path):
@@ -235,7 +246,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     for secret in secrets:
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
-                    result = {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
+                    result = getattr(error, "result", None) or {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
                 if isinstance(result.get('response'), dict):
                     result['response']['metadata']['execution'] = {
                         'startedAt': started_at, 'finishedAt': datetime.now(timezone.utc).isoformat(),

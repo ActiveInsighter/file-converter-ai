@@ -57,9 +57,16 @@ class CaptureTests(unittest.TestCase):
             'history': [{'role': 'user', 'text': 'old question'}, {'role': 'model', 'text': 'old answer'}],
             'options': {'maxOutputTokens': 8192, 'thinkingLevel': ''}}, {})
         self.assertTrue(payload['generationConfig']['thinkingConfig']['includeThoughts'])
+        self.assertNotIn('thinkingLevel', payload['generationConfig']['thinkingConfig'])
         self.assertEqual([t['role'] for t in payload['contents']], ['user', 'model', 'user'])
 
     def test_generation_is_non_streaming_and_agent_no_longer_observes_sse(self):
         from pathlib import Path
         self.assertNotIn('watch_interaction(', Path('gemini_agent.py').read_text())
         self.assertNotIn('streamGenerateContent', Path('gemini_text.py').read_text())
+
+    def test_rejected_requests_preserve_redacted_diagnostics(self):
+        from gemini_text import GeminiRequestError
+        error = GeminiRequestError('Rejected', {'error': {'code': 400, 'message': 'invalid field fixture-secret'}}, secrets=['fixture-secret'])
+        self.assertEqual(error.result['response']['metadata']['error']['code'], 400)
+        self.assertNotIn('fixture-secret', json.dumps(error.result))
