@@ -183,7 +183,7 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if path.endswith('/claim'): return value
                 if path.endswith('/start'): return {"send": True}
                 raise RuntimeError('PB offline')
-        async def answer(*_): return {"reply": 'unsaved reply', "error": '', "finishReason": 'STOP', "usage": {}}
+        async def answer(*_, **_kwargs): return {"reply": 'unsaved reply', "error": '', "finishReason": 'STOP', "usage": {}}
         logs = StringIO()
         with tempfile.TemporaryDirectory() as directory, patch('gemini_text.generate', side_effect=answer) as model:
             with redirect_stdout(logs):
@@ -194,11 +194,11 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(events.index('reply'), events.index('segment_error'))
             self.assertEqual(next(row for row in rows if row['event'] == 'reply')['text'], 'unsaved reply')
             error = next(row for row in rows if row['event'] == 'segment_error')
-            self.assertEqual(error['stage'], 'persistence')
+            self.assertEqual(error['stage'], 'progress_persistence')
             self.assertEqual(error['error'], 'PB offline')
             self.assertTrue(error['recovery_available'])
             self.assertEqual(model.call_count, 1)
-            paths = list(Path(directory).glob('*.json'))
+            paths = [path for path in Path(directory).glob('*.json') if not path.name.endswith('.progress.json')]
             self.assertEqual(len(paths), 1)
             self.assertEqual(json.loads(paths[0].read_text())['result']['reply'], 'unsaved reply')
             saved = []
@@ -217,7 +217,7 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if path.endswith('/claim'): return value
                 if path.endswith('/start'): return {'send': True}
                 return {}
-        async def answer(_client, _pool, _job, message):
+        async def answer(_client, _pool, _job, message, **_kwargs):
             failed = message['index'] == 2
             return {'reply': 'partial answer' if failed else 'answer',
                     'error': 'output limit' if failed else '', 'finishReason': 'MAX_TOKENS' if failed else 'STOP',

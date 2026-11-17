@@ -177,7 +177,7 @@ def upstream_error(status, data, key):
     return RuntimeError(f'Antigravity 请求失败（HTTP {status}）：{detail or "请检查 Agent、参数及 API Key 权限"}')
 
 
-async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic):
+async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None):
     from providers import GeminiProvider
     provider = GeminiProvider()
     payload = build_agent_payload(job, message)
@@ -259,8 +259,11 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
     url = f'{ROOT}/{quote(current["id"], safe="")}'
-    # Normal execution uses authoritative polling only. Detailed SSE/tool replay
-    # remains available through the explicit read-only trace- diagnostic mode.
+    # GET snapshots reconcile the optional event channel; neither can create a run.
+    observer = None
+    if progress is not None:
+        from agent_progress import observe_progress
+        observer = asyncio.create_task(observe_progress(client, url, key, progress))
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
@@ -268,6 +271,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     last_status = None
     try:
         while True:
+            if progress is not None:
+                progress.snapshot(current)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
@@ -336,3 +341,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         except Exception:
             pass
         raise
+    finally:
+        if observer is not None:
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)

@@ -19,6 +19,7 @@ from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 from agent_trace import AgentTrace
+from agent_progress import MessageProgress
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 TOKEN_FIELDS = {
@@ -133,11 +134,11 @@ class PocketBase:
             await asyncio.sleep(min(16, 2 ** attempt))
 
 
-async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None) -> dict:
+async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None) -> dict:
     if is_antigravity(job['model']):
         if checkpoint is None:
             raise RuntimeError('Agent requires durable execution state')
-        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep)
+        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress)
     provider = GeminiProvider()
     payload = build_payload(job, message)
     last_http_error = ''
@@ -153,18 +154,46 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         try:
             async with asyncio.timeout(180):
                 # Gemini responses are bounded too, even for a chunked HTTP response.
-                async with client.stream("POST", provider.endpoint(provider.default_base_url, job["model"]),
+                endpoint = provider.endpoint(provider.default_base_url, job["model"])
+                if progress is not None:
+                    endpoint = endpoint.replace(':generateContent', ':streamGenerateContent') + '?alt=sse'
+                async with client.stream("POST", endpoint,
                         headers=provider.build_headers(key), json=payload, timeout=180) as response:
-                    raw = bytearray()
-                    async for block in response.aiter_bytes():
-                        raw.extend(block)
-                        if len(raw) > 3 * MAX_REPLY_BYTES:
-                            raise RuntimeError("Gemini response exceeds 6 MiB")
                     status, headers = response.status_code, response.headers
-            try:
-                data = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                raise RuntimeError("Gemini returned invalid JSON") from None
+                    if status == 200 and 'text/event-stream' in headers.get('content-type', ''):
+                        from agent_trace import sse_events
+                        answer, summary, data = '', '', {}
+                        async for chunk, _, _ in sse_events(response):
+                            candidate = (chunk.get('candidates') or [{}])[0]
+                            for part in (candidate.get('content') or {}).get('parts', []):
+                                text = part.get('text')
+                                if isinstance(text, str):
+                                    if part.get('thought'):
+                                        summary += text
+                                    else:
+                                        answer += text
+                            if len(answer.encode()) > MAX_REPLY_BYTES or len(summary.encode()) > MAX_REPLY_BYTES:
+                                raise RuntimeError('Gemini streamed reply exceeds 2 MiB')
+                            data = {**data, **chunk}
+                            if progress is not None:
+                                if answer: progress.put('answer', 'text', answer, status='running')
+                                if summary: progress.put('reasoning', 'reasoning_summary', summary, status='running')
+                                progress.usage.update(parse_answer({**data, 'candidates': [{'content': {'parts': [{'text': answer}]}}]})['usage'])
+                        candidate = (data.get('candidates') or [{}])[0]
+                        data['candidates'] = [{**candidate, 'content': {'parts': [{'text': answer}]}}]
+                        if progress is not None:
+                            if answer: progress.put('answer', 'text', answer)
+                            if summary: progress.put('reasoning', 'reasoning_summary', summary)
+                    else:
+                        raw = bytearray()
+                        async for block in response.aiter_bytes():
+                            raw.extend(block)
+                            if len(raw) > 3 * MAX_REPLY_BYTES:
+                                raise RuntimeError("Gemini response exceeds 6 MiB")
+                        try:
+                            data = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError):
+                            raise RuntimeError("Gemini returned invalid JSON") from None
         except asyncio.CancelledError:
             await pool.mark_cancelled(index, lease)
             raise
@@ -232,14 +261,19 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     log.emit('segment_skipped', reason='no send permit')
                     continue
                 log.emit('segment_started', model=job['model'])
+                async def upload_progress(body):
+                    return await pb.post(f"{endpoint}/progress", body, retries=2)
+                progress = MessageProgress(secrets=pool.keys, post=upload_progress, identity=identity,
+                    target=work_dir / f"{message['id']}.progress.json", job_id=job_id, message_id=message['id'])
+                progress_task = asyncio.create_task(progress.pump())
                 stage = 'generation'
                 try:
                     if is_antigravity(job['model']):
                         async def checkpoint(state=None):
                             return await pb.post(f"{endpoint}/checkpoint", {**identity, **({'state': state} if state is not None else {})}, retries=3)
-                        result = await generate(client, pool, job, message, checkpoint=checkpoint)
+                        result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress)
                     else:
-                        result = await generate(client, pool, job, message)
+                        result = await generate(client, pool, job, message, progress=progress)
                 except AgentCanceled:
                     counts['canceled'] += 1
                     log.emit('segment_canceled')
@@ -251,7 +285,10 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     for secret in secrets:
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
-                    result = {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
+                    result = {"reply": '\n\n'.join(p['content'] for p in progress.parts.values() if p['type'] == 'text').encode('utf-8')[:MAX_REPLY_BYTES].decode('utf-8', errors='ignore'), "error": detail[:1800], "finishReason": "", "usage": progress.usage.copy()}
+                finally:
+                    progress_task.cancel()
+                    await asyncio.gather(progress_task, return_exceptions=True)
                 usages.append(result.get('usage') or {})
                 log_result(log, result)
                 stage = 'recovery_write'
@@ -260,10 +297,14 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 temporary = target.with_suffix(".tmp")
                 temporary.write_text(json.dumps({"jobId": job_id, "messageId": message["id"], "result": saved}, ensure_ascii=False), encoding="utf-8")
                 temporary.replace(target)
+                stage = 'progress_persistence'
+                progress.finalize(result)
+                await progress.flush()
                 stage = 'persistence'
                 # Retrying persistence cannot trigger another Gemini request.
                 await pb.post(f"{endpoint}/complete", saved, retries=5)
                 target.unlink()
+                if progress.target and progress.target.exists(): progress.target.unlink()
                 counts['saved'] += 1
                 log.emit('segment_saved', status='failed' if result['error'] else 'succeeded')
                 if result["error"]:
@@ -292,7 +333,20 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
 
 async def recover(pb, directory: Path):
     """Flush recovery artifacts using their original identity; never generate text."""
+    for path in sorted(directory.glob('*.progress.json')):
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not all(re.fullmatch(r'[a-z0-9]{15}', data.get(k, '')) for k in ('jobId', 'messageId')):
+            raise RuntimeError('Invalid progress recovery identity')
+        async def upload(body):
+            return await pb.post(f"jobs/{data['jobId']}/messages/{data['messageId']}/progress", body, retries=5)
+        progress = MessageProgress(post=upload, identity=data['identity'], target=path,
+                                   job_id=data['jobId'], message_id=data['messageId'])
+        progress.sequence, progress.parts, progress.usage, progress.pending = data['sequence'], data['parts'], data['usage'], data.get('pending')
+        progress.capture_bytes = sum(len(p['content'].encode()) for p in progress.parts.values())
+        progress.dirty = set(progress.parts)
+        await progress.flush()
     for path in sorted(directory.glob('*.json')):
+        if path.name.endswith('.progress.json'): continue
         data = json.loads(path.read_text(encoding='utf-8'))
         if not all(re.fullmatch(r'[a-z0-9]{15}', data.get(key, '')) for key in ('jobId', 'messageId')):
             raise RuntimeError('Invalid recovery artifact identity')

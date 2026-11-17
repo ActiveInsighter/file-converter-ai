@@ -1,0 +1,226 @@
+"""Provider-neutral, bounded message parts with retryable batched persistence.
+
+Only public reasoning summaries are retained. Provider thoughts/signatures and
+arbitrary interaction objects never enter the database. Poll snapshots reconcile
+SSE so losing the optional event connection does not lose completed steps.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+import json
+import re
+
+from agent_trace import AgentTrace, TERMINAL
+
+PART_BYTES = 60 * 1024
+MAX_CAPTURE_BYTES = 8 * 1024 * 1024
+USAGE = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candidatesTokenCount',
+         'total_thought_tokens': 'thoughtsTokenCount', 'total_tool_use_tokens': 'toolUseTokenCount',
+         'total_cached_tokens': 'cachedContentTokenCount', 'total_tokens': 'totalTokenCount'}
+
+
+class MessageProgress:
+    def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id=''):
+        self.redactor = AgentTrace(secrets=secrets, verbose=False)
+        self.parts, self.dirty, self.usage, self.steps = {}, set(), {}, {}
+        self.sequence = 0
+        self.capture_bytes = 0
+        self.post, self.identity, self.target = post, identity or {}, target
+        self.job_id, self.message_id = job_id, message_id
+        self.last_event_id = None
+        self.seen_events = set()
+        self.event_ids = deque()
+        self.pending = None
+        self.closed = False
+        self.lock = asyncio.Lock()
+
+    def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False):
+        previous = self.parts.get(key)
+        if previous is None and len(self.parts) >= 10000:
+            return
+        content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', self.redactor.redact(content))
+        raw = content.encode('utf-8')
+        old_bytes = len(previous['content'].encode()) if previous else 0
+        budget = max(0, MAX_CAPTURE_BYTES - self.capture_bytes + old_bytes)
+        limit = min(PART_BYTES, budget)
+        # Provider step order is stable even if an SSE summary arrives after a poll.
+        if key.startswith('step:'):
+            sequence = int(key.split(':')[1]) + 1
+            if sequence > 9998: return
+        elif key == 'agent-status': sequence = 10000
+        elif key == 'answer': sequence = 9999
+        elif key == 'reasoning': sequence = 1
+        else: sequence = previous['sequence'] if previous else len(self.parts) + 1
+        part = {'key': key, 'sequence': sequence,
+                'type': kind, 'content': raw[:limit].decode('utf-8', errors='ignore'), 'status': status,
+                'toolName': self.redactor.redact(tool_name)[:120], 'callId': self.redactor.redact(call_id)[:256],
+                'providerType': provider_type[:120], 'truncated': truncated or len(raw) > limit}
+        if part != previous:
+            self.parts[key] = part
+            self.capture_bytes += len(part['content'].encode()) - old_bytes
+            self.dirty.add(key)
+
+    def snapshot(self, data):
+        raw_usage = data.get('usage') or {}
+        self.usage.update({dst: max(self.usage.get(dst, 0), raw_usage[src]) for src, dst in USAGE.items()
+                           if type(raw_usage.get(src)) is int and raw_usage[src] >= 0})
+        steps = data.get('steps') or []
+        self.usage['agentStepCount'] = max(self.usage.get('agentStepCount', 0), len(steps))
+        for index, step in enumerate(steps):
+            if isinstance(step, dict):
+                self.step(index, step)
+        self.put('agent-status', 'status', str(data.get('status', 'in_progress')),
+                 status='completed' if data.get('status') in TERMINAL else 'running')
+        if data.get('output_text') and not any(p['type'] == 'text' and key != 'answer' for key, p in self.parts.items()):
+            self.put('answer', 'text', data['output_text'], status='completed' if data.get('status') in TERMINAL else 'running')
+
+    def step(self, index, step, status='completed'):
+        kind = step.get('type', '')
+        key = f'step:{index}'
+        if kind == 'thought':
+            # Explicit summary only. Never persist content/text or signatures of thought steps.
+            summary = step.get('summary') or []
+            if isinstance(summary, dict): summary = [summary]
+            if isinstance(summary, str):
+                text = summary
+            else:
+                text = '\n'.join(p.get('text', '') for p in summary if isinstance(p, dict) and p.get('type') == 'text')
+            if text:
+                self.put(key, 'reasoning_summary', text, status=status, provider_type=kind, truncated=bool(step.get('_truncated')))
+        elif kind in ('model_output', 'text'):
+            text = step.get('text', '') or '\n'.join(p.get('text', '') for p in step.get('content', [])
+                                                    if isinstance(p, dict) and p.get('type') == 'text')
+            if text:
+                self.put(key, 'text', text, status=status, provider_type=kind, truncated=bool(step.get('_truncated')))
+        elif kind.endswith(('_call', '_result')):
+            # Serialize only known tool fields; discard signatures and hidden provider state.
+            allowed = ('arguments', 'code', 'command', 'input', 'output', 'result', 'content', 'error', 'stdout', 'stderr', 'results', 'response')
+            payload = {k: step[k] for k in allowed if k in step}
+            def scrub(value):
+                if isinstance(value, dict):
+                    return {k: scrub(v) for k, v in value.items() if not any(s in k.lower() for s in ('signature', 'thought', 'secret', 'authorization', 'password', 'token', 'api_key'))}
+                if isinstance(value, list): return [scrub(v) for v in value]
+                return value
+            text = json.dumps(scrub(payload), ensure_ascii=False) if payload else ''
+            self.put(key, 'tool_call' if kind.endswith('_call') else 'tool_result', text,
+                     status='failed' if step.get('is_error') else status,
+                     tool_name=str(step.get('name') or step.get('tool_name') or kind),
+                     call_id=str(step.get('call_id') or step.get('id') or ''), provider_type=kind)
+
+    def consume(self, data, sse_type='', event_id=None):
+        if not isinstance(data, dict): return
+        event_id = event_id or data.get('event_id')
+        if not isinstance(event_id, str) or len(event_id) > 256:
+            event_id = None
+        if event_id:
+            if event_id in self.seen_events: return
+            self.seen_events.add(event_id)
+            self.event_ids.append(event_id)
+            if len(self.event_ids) > 20000:
+                self.seen_events.discard(self.event_ids.popleft())
+        kind = data.get('event_type') or sse_type
+        # SSE is an optional low-latency cache. Poll snapshots remain authoritative.
+        index = data.get('index')
+        if kind == 'step.start' and type(index) is int and 0 <= index < 10000:
+            step = data.get('step') or {}
+            self.step(index, step, 'running')
+            if len(self.steps) < 128:
+                self.steps[index] = {'type': step.get('type', ''), 'summary': '', 'text': ''}
+        elif kind == 'step.delta' and index in self.steps:
+            step, delta = self.steps[index], data.get('delta') or {}
+            if delta.get('type') == 'thought_summary':
+                content = delta.get('content') or {}
+                if isinstance(content, dict) and content.get('type') == 'text':
+                    previous = step.get('summary') or ''
+                    if not isinstance(previous, str): previous = ''
+                    combined = previous + content.get('text', '')
+                    step['_truncated'] = bool(step.get('_truncated')) or len(combined.encode()) > PART_BYTES
+                    step['summary'] = combined.encode()[:PART_BYTES].decode('utf-8', errors='ignore')
+            elif step.get('type') == 'model_output' and delta.get('type') == 'text':
+                combined = step.get('text', '') + delta.get('text', '')
+                step['_truncated'] = bool(step.get('_truncated')) or len(combined.encode()) > PART_BYTES
+                step['text'] = combined.encode()[:PART_BYTES].decode('utf-8', errors='ignore')
+            self.step(index, step, 'running')
+        elif kind == 'step.stop' and index in self.steps:
+            self.step(index, data.get('step') or self.steps.pop(index))
+            self.steps.pop(index, None)
+        elif kind and kind.startswith('interaction.') and isinstance(data.get('interaction'), dict):
+            self.snapshot(data['interaction'])
+        if event_id:
+            self.last_event_id = event_id
+
+    def save_spool(self):
+        if not self.target: return
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.target.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'jobId': self.job_id, 'messageId': self.message_id,
+            'sequence': self.sequence, 'parts': self.parts, 'usage': self.usage, 'pending': self.pending,
+            'identity': self.identity}, ensure_ascii=False), encoding='utf-8')
+        temporary.replace(self.target)
+
+    async def flush(self):
+        if self.closed or not self.post: return
+        async with self.lock:
+            # At most four 60 KiB parts per request, below the server's 256 KiB limit.
+            keys = sorted(self.dirty, key=lambda key: self.parts[key]['sequence'])
+            if not keys and self.pending is None:
+                keys = []  # A usage-only heartbeat still advances uploadSequence.
+            while True:
+                if self.pending is None:
+                    batch = []
+                    body = {**self.identity, 'sequence': self.sequence + 1, 'parts': batch, 'usage': self.usage.copy()}
+                    for key in keys[:4]:
+                        batch.append(self.parts[key].copy())
+                        if len(json.dumps(body, ensure_ascii=False).encode()) > 250 * 1024:
+                            batch.pop()
+                            break
+                    self.pending = body
+                self.save_spool()
+                response = await self.post(self.pending)
+                self.sequence = self.pending['sequence']
+                for saved in self.pending['parts']:
+                    if self.parts.get(saved['key']) == saved:
+                        self.dirty.discard(saved['key'])
+                self.pending = None
+                self.closed = bool((response or {}).get('closed'))
+                self.save_spool()
+                if self.closed: return
+                keys = sorted(self.dirty, key=lambda key: self.parts[key]['sequence'])
+                if not keys: break
+
+    async def pump(self):
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await self.flush()
+            except Exception as error:
+                print(f'[agent.progress] upload deferred error_type={type(error).__name__}', flush=True)
+
+    def finalize(self, result):
+        usage = result.get('usage') or {}
+        self.usage.update({key: value for key, value in usage.items() if type(value) is int and value >= 0})
+        if result.get('reply') and not any(p['type'] == 'text' for p in self.parts.values()):
+            self.put('answer', 'text', result['reply'], truncated=len(result['reply'].encode()) > PART_BYTES)
+        self.put('agent-status', 'status', result.get('error') or result.get('finishReason') or 'completed',
+                 status='failed' if result.get('error') else 'completed')
+
+
+async def observe_progress(client, url, key, progress):
+    from agent_trace import sse_events
+    import httpx
+    # Reconnect only with an acknowledged event cursor, otherwise rely on snapshots.
+    for attempt in range(6):
+        params = {'stream': 'true'}
+        if progress.last_event_id: params['last_event_id'] = progress.last_event_id
+        try:
+            async with client.stream('GET', url, params=params, headers={'x-goog-api-key': key, 'Accept': 'text/event-stream'},
+                                     timeout=httpx.Timeout(45, connect=15)) as response:
+                if response.status_code != 200 or 'text/event-stream' not in response.headers.get('content-type', ''): return
+                async for data, kind, event_id in sse_events(response):
+                    progress.consume(data, kind, event_id)
+                    if kind in ('interaction.completed', 'interaction.failed', 'interaction.cancelled'): return
+        except (httpx.HTTPError, ValueError, UnicodeError):
+            pass
+        if not progress.last_event_id: return
+        await asyncio.sleep(min(2 ** attempt, 20))
