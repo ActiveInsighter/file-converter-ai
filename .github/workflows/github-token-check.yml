@@ -1,0 +1,62 @@
+name: Agent GitHub token permissions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.ANTIGRAVITY_GITHUB_TOKEN }}
+    steps:
+      - name: Verify deployed Agent credentials without modifying repositories
+        shell: python
+        run: |
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ.get('GH_TOKEN', '').strip()
+          if not token:
+              raise SystemExit('ANTIGRAVITY_GITHUB_TOKEN is missing')
+
+          def get(path):
+              request = urllib.request.Request(
+                  'https://api.github.com' + path,
+                  headers={
+                      'Authorization': 'Bearer ' + token,
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response), response.headers
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f'GitHub permission check failed: HTTP {error.code}') from None
+
+          user, headers = get('/user')
+          scopes = {value.strip() for value in headers.get('X-OAuth-Scopes', '').split(',') if value.strip()}
+          repository = os.environ['GITHUB_REPOSITORY']
+          repo, _ = get('/repos/' + repository)
+          workflows, _ = get('/repos/' + repository + '/actions/workflows?per_page=1')
+          can_push = repo.get('permissions', {}).get('push', False)
+          print('Authenticated account:', user['login'])
+          print('Repository:', repo['full_name'])
+          print('Repository push permission:', can_push)
+          print('Actions workflows readable:', workflows['total_count'])
+          print('OAuth/classic token scopes:', ', '.join(sorted(scopes)) or 'not reported')
+          if not can_push:
+              raise SystemExit('The Agent token does not have repository push permission')
+          if scopes:
+              missing = {'repo', 'workflow'} - scopes
+              if missing:
+                  raise SystemExit('Missing required token scopes: ' + ', '.join(sorted(missing)))
+              print('Repository and workflow-file write scopes verified')
+          else:
+              print('Fine-grained token: workflow-file write permission cannot be inferred from OAuth scope headers')
