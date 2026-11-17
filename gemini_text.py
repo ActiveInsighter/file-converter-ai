@@ -19,7 +19,7 @@ import httpx
 
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
-from response_capture import generate_content_snapshot
+from response_capture import extract_structured_payload, generate_content_snapshot
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 from agent_trace import AgentTrace
 from agent_progress import MessageProgress
@@ -39,10 +39,20 @@ def log_result(log, result):
     reply = log.redact(result.get('reply') or '')
     parts = [reply[i:i + 4000] for i in range(0, len(reply), 4000)]
     log.emit('segment_result', status='failed' if result.get('error') else 'succeeded',
+             protocol=result.get('protocol', ''),
              finish_reason=result.get('finishReason', ''), error=result.get('error', ''),
              reply_chars=len(result.get('reply') or ''), reply_parts=len(parts),
+             ui_parts=len(result.get('parts') or []),
+             tool_calls=len(result.get('toolCalls') or []),
+             code_executions=len(result.get('codeExecutions') or []),
+             annotations=len(result.get('annotations') or []),
+             has_thinking=bool(result.get('thinkingSummary')),
+             has_structured_output=result.get('structuredOutput') is not None,
              **{name: usage.get(key) for name, key in TOKEN_FIELDS.items()},
              steps=usage.get('agentStepCount'))
+    for tc in (result.get('toolCalls') or [])[:30]:
+        log.emit('tool_summary', tool_name=tc.get('toolName', ''), kind=tc.get('kind', ''),
+                 status=tc.get('status', ''), call_id=tc.get('callId', ''))
     for index, text in enumerate(parts, 1):
         # JSON keeps arbitrary model text from becoming GitHub workflow commands.
         log.emit('reply', part=index, parts=len(parts), text=text)
@@ -86,6 +96,14 @@ def build_payload(job: dict, message: dict) -> dict:
         payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
     elif not options.get('thinkingLevel'):
         payload['generationConfig'].pop('thinkingConfig', None)
+    if options.get('responseMimeType'):
+        payload['generationConfig']['responseMimeType'] = str(options['responseMimeType'])
+    if isinstance(options.get('responseSchema'), dict):
+        payload['generationConfig']['responseSchema'] = options['responseSchema']
+    elif isinstance(options.get('responseJsonSchema'), dict):
+        payload['generationConfig']['responseJsonSchema'] = options['responseJsonSchema']
+    if isinstance(options.get('tools'), list) and options['tools']:
+        payload['tools'] = options['tools']
     if job.get('history'):
         payload['contents'] = [
             {'role': turn['role'], 'parts': [{'text': turn['text']}]}
@@ -116,7 +134,15 @@ def parse_answer(payload: dict, *, secrets=()) -> dict:
     if 'toolUsePromptTokenCount' in usage:
         usage['toolUseTokenCount'] = usage['toolUsePromptTokenCount']
     response = generate_content_snapshot(payload, secrets=secrets)
-    return {"reply": reply, "error": error, "finishReason": reason, "usage": usage, "response": response}
+    structured = extract_structured_payload('generateContent', payload, secrets=secrets, reply_text=reply)
+    return {
+        "reply": reply,
+        "error": error,
+        "finishReason": reason,
+        "usage": usage,
+        "response": response,
+        **structured,
+    }
 
 
 class PocketBase:
@@ -186,24 +212,106 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
                     if status == 200 and 'text/event-stream' in headers.get('content-type', ''):
                         from agent_trace import sse_events
                         answer, summary, data = '', '', {}
+                        accumulated_parts = []
+                        merged_candidate = {}
+                        step_seq = 0
                         async for chunk, _, _ in sse_events(response):
                             candidate = (chunk.get('candidates') or [{}])[0]
+                            for mkey in ('index', 'finishReason', 'finishMessage', 'safetyRatings',
+                                         'citationMetadata', 'groundingMetadata', 'urlContextMetadata',
+                                         'avgLogprobs', 'logprobsResult'):
+                                if mkey in candidate and candidate[mkey] is not None:
+                                    if mkey == 'groundingMetadata' and isinstance(merged_candidate.get(mkey), dict) and isinstance(candidate[mkey], dict):
+                                        prev_gm = merged_candidate[mkey]
+                                        cur_gm = candidate[mkey]
+                                        merged_gm = {**prev_gm, **cur_gm}
+                                        if prev_gm.get('groundingChunks') and cur_gm.get('groundingChunks'):
+                                            merged_gm['groundingChunks'] = prev_gm['groundingChunks'] + cur_gm['groundingChunks']
+                                        merged_candidate[mkey] = merged_gm
+                                    else:
+                                        merged_candidate[mkey] = candidate[mkey]
                             for part in (candidate.get('content') or {}).get('parts', []):
+                                if not isinstance(part, dict):
+                                    continue
                                 text = part.get('text')
                                 if isinstance(text, str):
                                     if part.get('thought'):
                                         summary += text
+                                        if accumulated_parts and isinstance(accumulated_parts[-1].get('text'), str) and accumulated_parts[-1].get('thought'):
+                                            accumulated_parts[-1]['text'] += text
+                                        else:
+                                            accumulated_parts.append({**part})
                                     else:
                                         answer += text
+                                        if accumulated_parts and isinstance(accumulated_parts[-1].get('text'), str) and not accumulated_parts[-1].get('thought'):
+                                            accumulated_parts[-1]['text'] += text
+                                        else:
+                                            accumulated_parts.append({**part})
+                                else:
+                                    accumulated_parts.append(part)
+                                    if progress is not None:
+                                        if isinstance(part.get('executableCode'), dict):
+                                            ec = part['executableCode']
+                                            progress.put(f'step:{step_seq}', 'tool_call',
+                                                         json.dumps({'language': ec.get('language', 'PYTHON'), 'code': ec.get('code', '')}, ensure_ascii=False),
+                                                         status='running', tool_name='code_execution',
+                                                         call_id=str(ec.get('id') or ''), provider_type='executableCode',
+                                                         tool_kind='server')
+                                            step_seq += 1
+                                        elif isinstance(part.get('codeExecutionResult'), dict):
+                                            cer = part['codeExecutionResult']
+                                            err = str(cer.get('outcome') or '') not in ('', 'OUTCOME_OK')
+                                            progress.put(f'step:{step_seq}', 'tool_result',
+                                                         json.dumps({'outcome': cer.get('outcome', ''), 'output': cer.get('output', '')}, ensure_ascii=False),
+                                                         status='failed' if err else 'completed', tool_name='code_execution',
+                                                         call_id=str(cer.get('id') or ''), provider_type='codeExecutionResult',
+                                                         tool_kind='server')
+                                            step_seq += 1
+                                        elif isinstance(part.get('functionCall'), dict):
+                                            fc = part['functionCall']
+                                            progress.put(f'step:{step_seq}', 'tool_call',
+                                                         json.dumps({'arguments': fc.get('args') or {}}, ensure_ascii=False),
+                                                         status='running', tool_name=str(fc.get('name') or 'function'),
+                                                         call_id=str(fc.get('id') or ''), provider_type='functionCall',
+                                                         tool_kind='client')
+                                            step_seq += 1
+                                        elif isinstance(part.get('functionResponse'), dict):
+                                            fr = part['functionResponse']
+                                            progress.put(f'step:{step_seq}', 'tool_result',
+                                                         json.dumps({'response': fr.get('response') or {}}, ensure_ascii=False),
+                                                         status='completed', tool_name=str(fr.get('name') or 'function'),
+                                                         call_id=str(fr.get('id') or ''), provider_type='functionResponse',
+                                                         tool_kind='client')
+                                            step_seq += 1
+                                        elif isinstance(part.get('toolCall'), dict):
+                                            tc = part['toolCall']
+                                            progress.put(f'step:{step_seq}', 'tool_call',
+                                                         json.dumps({'arguments': tc.get('args') or {}}, ensure_ascii=False),
+                                                         status='running', tool_name=str(tc.get('toolType') or tc.get('name') or 'server_tool'),
+                                                         call_id=str(tc.get('id') or ''), provider_type='toolCall',
+                                                         tool_kind='server')
+                                            step_seq += 1
+                                        elif isinstance(part.get('toolResponse'), dict):
+                                            tr = part['toolResponse']
+                                            progress.put(f'step:{step_seq}', 'tool_result',
+                                                         json.dumps({'response': tr.get('response') or {}}, ensure_ascii=False),
+                                                         status='completed', tool_name=str(tr.get('toolType') or tr.get('name') or 'server_tool'),
+                                                         call_id=str(tr.get('id') or ''), provider_type='toolResponse',
+                                                         tool_kind='server')
+                                            step_seq += 1
                             if len(answer.encode()) > MAX_REPLY_BYTES or len(summary.encode()) > MAX_REPLY_BYTES:
                                 raise RuntimeError('Gemini streamed reply exceeds 2 MiB')
                             data = {**data, **chunk}
                             if progress is not None:
                                 if answer: progress.put('answer', 'text', answer, status='running')
                                 if summary: progress.put('reasoning', 'reasoning_summary', summary, status='running')
-                                progress.usage.update({name: value for name, value in parse_answer({**data, 'candidates': [{'content': {'parts': [{'text': answer}]}}]})['usage'].items() if name in TOKEN_FIELDS.values()})
-                        candidate = (data.get('candidates') or [{}])[0]
-                        data['candidates'] = [{**candidate, 'content': {'parts': ([{'text': summary, 'thought': True}] if summary else []) + [{'text': answer}]}}]
+                                um = chunk.get('usageMetadata') or {}
+                                if isinstance(um, dict):
+                                    for k, v in um.items():
+                                        mapped = 'toolUseTokenCount' if k == 'toolUsePromptTokenCount' else k
+                                        if mapped in TOKEN_FIELDS.values() and isinstance(v, int) and v >= 0:
+                                            progress.usage[mapped] = v
+                        data['candidates'] = [{**merged_candidate, 'content': {'parts': accumulated_parts}}]
                         if progress is not None:
                             if answer: progress.put('answer', 'text', answer)
                             if summary: progress.put('reasoning', 'reasoning_summary', summary)
@@ -260,8 +368,9 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     job = await pb.post(f"{path}/claim", identity, retries=3)
     pool = await pool_factory(job["options"])
     job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
-    job_log.emit('job_started', model=job['model'], segments=len(job['messages']),
-                 concurrency=job['options']['concurrency'])
+    protocol = 'interactions' if is_antigravity(job['model']) else 'generateContent'
+    job_log.emit('job_started', model=job['model'], protocol=protocol,
+                 segments=len(job['messages']), concurrency=job['options']['concurrency'])
     queue = asyncio.Queue()
     for message in job["messages"]:
         if message["status"] == "queued":
@@ -286,7 +395,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     counts['skipped'] += 1
                     log.emit('segment_skipped', reason='no send permit')
                     continue
-                log.emit('segment_started', model=job['model'])
+                log.emit('segment_started', model=job['model'], protocol=protocol, message_id=message['id'])
                 async def upload_progress(body):
                     return await pb.post(f"{endpoint}/progress", body, retries=2)
                 progress = MessageProgress(secrets=pool.keys, post=upload_progress, identity=identity,
@@ -318,12 +427,13 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 usages.append(result.get('usage') or {})
                 log_result(log, result)
                 stage = 'recovery_write'
+                execution_meta = {
+                    'startedAt': started_at, 'finishedAt': datetime.now(timezone.utc).isoformat(),
+                    'durationSeconds': round(time.monotonic() - begun, 3), 'timingBasis': 'Actions runner wall clock',
+                }
                 if isinstance(result.get('response'), dict):
-                    result['response']['metadata']['execution'] = {
-                        'startedAt': started_at, 'finishedAt': datetime.now(timezone.utc).isoformat(),
-                        'durationSeconds': round(time.monotonic() - begun, 3), 'timingBasis': 'Actions runner wall clock',
-                    }
-                saved = {**identity, **result}
+                    result['response']['metadata']['execution'] = execution_meta
+                saved = {**identity, 'execution': execution_meta, **result}
                 target = work_dir / f"{message['id']}.json"
                 temporary = target.with_suffix(".tmp")
                 temporary.write_text(json.dumps({"jobId": job_id, "messageId": message["id"], "result": saved}, ensure_ascii=False), encoding="utf-8")
@@ -337,7 +447,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 target.unlink()
                 if progress.target and progress.target.exists(): progress.target.unlink()
                 counts['saved'] += 1
-                log.emit('segment_saved', status='failed' if result['error'] else 'succeeded')
+                log.emit('segment_saved', status='failed' if result['error'] else 'succeeded',
+                         duration_seconds=execution_meta['durationSeconds'])
                 if result["error"]:
                     failures.append(message["id"])
             except Exception as error:
