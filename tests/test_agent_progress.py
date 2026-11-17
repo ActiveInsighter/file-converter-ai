@@ -129,5 +129,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             result = await generate(client, KeyPool(['key'], rpm_per_key=1e6, rpd_per_key=100),
                 {'model': 'gemini-test', 'options': {'maxOutputTokens': 8192}}, {'inputText': 'hi'}, progress=p)
         self.assertEqual(result['reply'], 'hello world')
+        self.assertEqual(result['response']['parts'][0]['text'], 'hello world')
+        self.assertEqual(result['response']['metadata']['usageMetadata']['totalTokenCount'], 10)
         self.assertEqual(p.parts['answer']['status'], 'completed')
         self.assertEqual(p.usage['totalTokenCount'], 10)

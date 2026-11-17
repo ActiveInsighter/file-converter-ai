@@ -199,7 +199,7 @@ class MessageProgress:
 
     def finalize(self, result):
         usage = result.get('usage') or {}
-        self.usage.update({key: value for key, value in usage.items() if type(value) is int and value >= 0})
+        self.usage.update({key: value for key, value in usage.items() if key in {*USAGE.values(), 'agentStepCount'} and type(value) is int and value >= 0})
         if result.get('reply') and not any(p['type'] == 'text' for p in self.parts.values()):
             self.put('answer', 'text', result['reply'], truncated=len(result['reply'].encode()) > PART_BYTES)
         self.put('agent-status', 'status', result.get('error') or result.get('finishReason') or 'completed',

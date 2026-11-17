@@ -201,7 +201,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
                             if progress is not None:
                                 if answer: progress.put('answer', 'text', answer, status='running')
                                 if summary: progress.put('reasoning', 'reasoning_summary', summary, status='running')
-                                progress.usage.update(parse_answer({**data, 'candidates': [{'content': {'parts': [{'text': answer}]}}]})['usage'])
+                                progress.usage.update({name: value for name, value in parse_answer({**data, 'candidates': [{'content': {'parts': [{'text': answer}]}}]})['usage'].items() if name in TOKEN_FIELDS.values()})
                         candidate = (data.get('candidates') or [{}])[0]
                         data['candidates'] = [{**candidate, 'content': {'parts': ([{'text': summary, 'thought': True}] if summary else []) + [{'text': answer}]}}]
                         if progress is not None:
@@ -311,7 +311,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     for secret in secrets:
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
-                    result = getattr(error, "result", None) or {"reply": '\n\n'.join(p['content'] for p in progress.parts.values() if p['type'] == 'text').encode('utf-8')[:MAX_REPLY_BYTES].decode('utf-8', errors='ignore'), "error": detail[:1800], "finishReason": "", "usage": progress.usage.copy()}
+                    result = getattr(error, "result", None) or {"reply": '\n\n'.join(p['content'] for p in sorted(progress.parts.values(), key=lambda part: part['sequence']) if p['type'] == 'text').encode('utf-8')[:MAX_REPLY_BYTES].decode('utf-8', errors='ignore'), "error": detail[:1800], "finishReason": "", "usage": progress.usage.copy()}
                 finally:
                     progress_task.cancel()
                     await asyncio.gather(progress_task, return_exceptions=True)
