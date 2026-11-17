@@ -21,7 +21,8 @@ concurrency:
 jobs:
   messages:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # No application-defined job timeout. GitHub-hosted runners still enforce
+    # their platform maximum (currently 6 hours).
     env:
       REQUEST_ID: ${{ inputs.request_id }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}

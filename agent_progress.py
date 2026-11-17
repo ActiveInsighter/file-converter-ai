@@ -10,6 +10,7 @@ import asyncio
 from collections import deque
 import json
 import re
+import time
 
 from agent_trace import AgentTrace, TERMINAL
 from response_capture import sanitize
@@ -22,7 +23,7 @@ USAGE = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candi
 
 
 class MessageProgress:
-    def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id=''):
+    def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id='', clock=time.monotonic):
         self.redactor = AgentTrace(secrets=secrets, verbose=False)
         self.parts, self.dirty, self.usage, self.steps = {}, set(), {}, {}
         self._last_flushed_usage = {}
@@ -36,6 +37,8 @@ class MessageProgress:
         self.pending = None
         self.closed = False
         self.lock = asyncio.Lock()
+        self.clock = clock
+        self.last_flushed_at = clock()
 
     def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False, payload=None, tool_kind=''):
         previous = self.parts.get(key)
@@ -164,6 +167,8 @@ class MessageProgress:
         kind = data.get('event_type') or sse_type
         # SSE is an optional low-latency cache. Poll snapshots remain authoritative.
         index = data.get('index')
+        if kind in ('step.start', 'step.delta', 'step.stop') and type(index) is int and 0 <= index < 10000:
+            self.usage['agentStepCount'] = max(self.usage.get('agentStepCount', 0), index + 1)
         if kind == 'step.start' and type(index) is int and 0 <= index < 10000:
             step = data.get('step') or {}
             self.step(index, step, 'running')
@@ -242,6 +247,7 @@ class MessageProgress:
                     self.pending = body
                 self.save_spool()
                 response = await self.post(self.pending)
+                self.last_flushed_at = self.clock()
                 self.sequence = self.pending['sequence']
                 self._last_flushed_usage = self.pending['usage'].copy()
                 for saved in self.pending['parts']:
@@ -258,7 +264,9 @@ class MessageProgress:
         while True:
             await asyncio.sleep(5)
             try:
-                await self.flush()
+                # A quiet agent still needs a real executor heartbeat. Scheduler
+                # reconciliation updates the job timestamp without runner contact.
+                await self.flush(force=self.clock() - self.last_flushed_at >= 30)
             except Exception as error:
                 detail = self.redactor.redact(str(error))[:240]
                 print(f'[agent.progress] upload deferred job={self.job_id} msg={self.message_id} '
@@ -275,21 +283,50 @@ class MessageProgress:
                  status='failed' if result.get('error') else 'completed')
 
 
-async def observe_progress(client, url, key, progress):
+async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
     from agent_trace import sse_events
     import httpx
-    # Reconnect only with an acknowledged event cursor, otherwise rely on snapshots.
-    for attempt in range(6):
+    # The owner cancels this observer when polling reaches a terminal state. A
+    # lifetime reconnect budget silently drops all later steps of long agents:
+    # nonterminal GET snapshots may contain only status, without steps or usage.
+    failures = 0
+    while not progress.closed:
         params = {'stream': 'true'}
         if progress.last_event_id: params['last_event_id'] = progress.last_event_id
+        received = False
         try:
             async with client.stream('GET', url, params=params, headers={'x-goog-api-key': key, 'Accept': 'text/event-stream'},
                                      timeout=httpx.Timeout(45, connect=15)) as response:
-                if response.status_code != 200 or 'text/event-stream' not in response.headers.get('content-type', ''): return
-                async for data, kind, event_id in sse_events(response):
-                    progress.consume(data, kind, event_id)
-                    if kind in ('interaction.completed', 'interaction.failed', 'interaction.cancelled'): return
-        except (httpx.HTTPError, ValueError, UnicodeError):
-            pass
-        if not progress.last_event_id: return
-        await asyncio.sleep(min(2 ** attempt, 20))
+                if response.status_code != 200:
+                    if response.status_code not in (408, 429, 500, 502, 503, 504):
+                        print(f'[agent.progress] stream unavailable job={progress.job_id} '
+                              f'msg={progress.message_id} http={response.status_code}', flush=True)
+                        return
+                elif 'text/event-stream' not in response.headers.get('content-type', ''):
+                    print(f'[agent.progress] stream unavailable job={progress.job_id} '
+                          f'msg={progress.message_id} reason=non_sse_response', flush=True)
+                    return
+                else:
+                    async for data, kind, event_id in sse_events(response):
+                        received = True
+                        progress.consume(data, kind, event_id)
+                        failures = 0
+                        event_type = (data.get('event_type') or kind) if isinstance(data, dict) else kind
+                        if event_type in ('interaction.completed', 'interaction.failed', 'interaction.cancelled',
+                                          'interaction.canceled', 'interaction.incomplete', 'interaction.requires_action'):
+                            return
+        except (httpx.HTTPError, ValueError, UnicodeError) as error:
+            # Exception text/URLs can contain credentials; log the type only.
+            print(f'[agent.progress] stream interrupted job={progress.job_id} '
+                  f'msg={progress.message_id} error_type={type(error).__name__}', flush=True)
+        if received and not progress.last_event_id:
+            # Replaying cursorless deltas could duplicate content. An initial
+            # connection failure with no events, however, is safe to retry.
+            print(f'[agent.progress] stream unavailable job={progress.job_id} '
+                  f'msg={progress.message_id} reason=missing_event_cursor', flush=True)
+            return
+        failures = min(failures + 1, 5)
+        delay = min(2 ** failures, 30)
+        print(f'[agent.progress] stream reconnecting job={progress.job_id} '
+              f'msg={progress.message_id} delay_seconds={delay} resumed={bool(progress.last_event_id)}', flush=True)
+        await sleep(delay)
