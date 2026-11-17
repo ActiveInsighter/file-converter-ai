@@ -80,6 +80,48 @@ class TextPayloadTests(unittest.TestCase):
 
 
 class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_checkpoint_outage_recovers_without_recreating_or_canceling(self):
+        from gemini_agent import generate_agent
+        state, requests, delays = {}, [], []
+        created, failures = False, 0
+        async def outbound(request):
+            nonlocal created, failures
+            requests.append(request)
+            if request.url.host == 'pb.example':
+                body = json.loads(request.content)
+                if created and 'state' not in body and failures < 10:
+                    failures += 1
+                    return httpx.Response(502)
+                state.update(body.get('state') or {})
+                return httpx.Response(200, json={'state': state, 'canceled': False})
+            if request.method == 'POST':
+                self.assertFalse(request.url.path.endswith(':cancel'))
+                created = True
+                return httpx.Response(200, json={'id': 'agent-existing', 'status': 'in_progress'})
+            return httpx.Response(200, json={'id': 'agent-existing', 'status': 'completed', 'output_text': 'finished'})
+        async def sleep(seconds): delays.append(seconds)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = PocketBase(client, 'https://pb.example')
+            async def checkpoint(update=None): return await pb.checkpoint('jobs/a/messages/b/checkpoint', {'executionId': '123:1'}, update)
+            with patch('gemini_text.asyncio.sleep', new=sleep):
+                result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                    {'model': 'Antigravity', 'options': {}}, {}, checkpoint=checkpoint, sleep=sleep)
+        self.assertEqual(result['reply'], 'finished')
+        self.assertEqual(failures, 10)
+        self.assertGreater(sum(delays), 90)
+        self.assertEqual(sum(r.method == 'POST' and r.url.host != 'pb.example' for r in requests), 1)
+        for r in requests:
+            if r.url.host == 'pb.example': self.assertEqual(json.loads(r.content)['executionId'], '123:1')
+
+    async def test_agent_checkpoint_rejects_permanent_auth_failure_without_retry(self):
+        requests = []
+        async def outbound(request): requests.append(request); return httpx.Response(403)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = PocketBase(client, 'https://pb.example')
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 403'):
+                await pb.checkpoint('jobs/a/messages/b/checkpoint', {'executionId': '123:1'})
+        self.assertEqual(len(requests), 1)
+
     async def test_real_executor_startup_accepts_empty_and_shared_project_groups(self):
         options = {"rpmPerKey": 15, "rpdPerKey": 500}
         default = await create_key_pool(["fixture-a", "fixture-b"], options)

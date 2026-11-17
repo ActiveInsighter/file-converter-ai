@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -25,10 +26,12 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict('os.environ', {'GEMINI_PB_URL': 'https://pb.fixture', 'GEMINI_API_KEYS': 'fixture-key',
                                       'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-pat', 'POCKETBASE_SERVER_TOKEN': 'fixture-pb'}), \
              patch('agent_maintenance.httpx.AsyncClient', return_value=client), \
+             patch('agent_maintenance.asyncio.timeout', wraps=asyncio.timeout) as timeout, \
              patch('gemini_agent.generate_agent', new_callable=AsyncMock,
                    return_value={'reply': 'AW_RUNTIME_OK owner', 'error': '', 'usage': {}}) as generate:
             self.assertEqual(await main('probe', 'j' * 15), 0)
             probe_job = generate.call_args.args[2]
             self.assertIn('owner/remote', probe_job['prompt'])
-            self.assertEqual(probe_job['options']['agent']['timeoutMinutes'], 3)
+            self.assertNotIn('agent', probe_job['options'])
+            timeout.assert_called_once_with(180)
         self.assertEqual(len(calls), 4)

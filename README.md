@@ -362,5 +362,8 @@ Actions 每分钟的状态日志同时记录事件观察器是否仍运行及已
 无新内容时执行器每 30 秒发送一次无内容心跳，刷新 `progressAt`，不重复写入步骤。
 Remote 以此显示执行器在线状态，以最后一个非状态分段的时间显示最近步骤；任务行的
 `updated` 由调度器也会刷新，不能用来推断执行器仍在线。
+checkpoint 使用同一 executionId 和 interaction 身份重试短暂的 PB 5xx/连接故障，
+指数退避最多 16 秒、最多重试 12 次，为短暂发布提供比原先 7 秒更长的恢复窗口。
+权限等明确 4xx 错误仍立即报告，不重发模型创建请求。
 先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
 完整接口及发布设计见后端 `docs/agent-message-stream.md`。

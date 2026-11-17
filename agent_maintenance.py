@@ -66,14 +66,15 @@ async def main(mode, job_id):
                     probe_state.update(update)
                 return {'state': probe_state, 'canceled': False}
             try:
-                result = await generate_agent(client, pool, {
-                    'id': 'probe-' + job_id, 'model': 'Antigravity',
-                    'prompt': 'Read-only runtime check for ' + context['selected']['full_name'] + '. '
-                        'Read /workspace/.anyworkflow/github.py and /.agents/hooks.json. '
-                        'Run python3 /workspace/.anyworkflow/github.py identity. '
-                        'Only inspect those files and identity; no repository clone or changes. '
-                        'If all succeed reply AW_RUNTIME_OK and the authenticated login.',
-                    'options': {'agent': {'timeoutMinutes': 3}}}, {'index': 1}, checkpoint=checkpoint)
+                async with asyncio.timeout(180):
+                    result = await generate_agent(client, pool, {
+                        'id': 'probe-' + job_id, 'model': 'Antigravity',
+                        'prompt': 'Read-only runtime check for ' + context['selected']['full_name'] + '. '
+                            'Read /workspace/.anyworkflow/github.py and /.agents/hooks.json. '
+                            'Run python3 /workspace/.anyworkflow/github.py identity. '
+                            'Only inspect those files and identity; no repository clone or changes. '
+                            'If all succeed reply AW_RUNTIME_OK and the authenticated login.',
+                        'options': {}}, {'index': 1}, checkpoint=checkpoint)
                 trace.emit('runtime_probe_result', error=result['error'], reply=result['reply'][:800], usage=result['usage'])
                 return 0 if not result['error'] and 'AW_RUNTIME_OK' in result['reply'] else 2
             finally:
