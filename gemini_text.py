@@ -513,6 +513,9 @@ async def main():
         return await maintenance_main(*maintenance.groups())
     # Manual diagnostics use the existing workflow, with an isolated concurrency
     # identity. No real PB job ID has this prefix; never claim or mutate that job.
+    if not args.recover_dir and re.fullmatch(r'sync-[a-z0-9]{15}', job_id):
+        from agent_progress_sync import main as sync_main
+        return await sync_main(job_id.removeprefix('sync-'))
     if not args.recover_dir and re.fullmatch(r'trace-[a-z0-9]{15}', job_id):
         from agent_diagnostics import main as diagnose_main
         return await diagnose_main(job_id.removeprefix('trace-'))

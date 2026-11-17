@@ -8,6 +8,11 @@ on:
         description: PocketBase Gemini job ID (inputs are read from PB)
         required: true
         type: string
+      diagnostic_seconds:
+        description: Read-only trace window in seconds (10–900; ignored by normal tasks)
+        required: false
+        default: "180"
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +30,7 @@ jobs:
     # their platform maximum (currently 6 hours).
     env:
       REQUEST_ID: ${{ inputs.request_id }}
+      AGENT_TRACE_SECONDS: ${{ inputs.diagnostic_seconds || '180' }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
       ANTIGRAVITY_GITHUB_TOKEN: ${{ secrets.ANTIGRAVITY_GITHUB_TOKEN }}

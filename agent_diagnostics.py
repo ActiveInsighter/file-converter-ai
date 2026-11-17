@@ -46,7 +46,12 @@ async def diagnose(client, root, token, job_id, keys, seconds):
         try:
             # Stream historical and live events, even if the saved interaction completed.
             async with asyncio.timeout(seconds):
-                await watch_interaction(client, url, key, trace)
+                try:
+                    async with asyncio.timeout(min(10, seconds / 2)):
+                        await watch_interaction(client, url, key, trace)
+                except TimeoutError:
+                    trace.emit('diagnostic_reconnect', cursor_chars=len(trace.last_event_id or ''), remote_canceled=False)
+                    await watch_interaction(client, url, key, trace)
         except TimeoutError:
             trace.emit('observation_window_ended', remote_canceled=False)
         finally:

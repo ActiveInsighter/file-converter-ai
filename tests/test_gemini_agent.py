@@ -9,7 +9,7 @@ from io import StringIO
 import httpx
 
 from gemini_agent import (AgentCanceled, DEFAULT_AGENT,
-                          agent_usage_diagnostics, build_agent_payload, generate_agent,
+                          agent_usage_diagnostics, build_agent_payload, cancel_interaction, generate_agent,
                           parse_interaction, upstream_error)
 from key_pool import KeyPool
 
@@ -134,6 +134,21 @@ class AgentPayloadTests(unittest.TestCase):
 
 
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_checks_official_endpoint_and_does_not_accept_http_errors(self):
+        for status in [200, 404]:
+            requests = []
+            async def outbound(request):
+                requests.append(request)
+                self.assertEqual(request.url.path, '/v1beta/interactions/agent-id/cancel')
+                return httpx.Response(status, json={'status': 'cancelled'} if status == 200 else {'error': {'message': 'missing endpoint'}})
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                if status == 200:
+                    await cancel_interaction(client, 'https://fixture/v1beta/interactions/agent-id', 'fixture-key')
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'HTTP 404'):
+                        await cancel_interaction(client, 'https://fixture/v1beta/interactions/agent-id', 'fixture-key')
+            self.assertEqual(len(requests), 1)
+
     async def test_legacy_timeout_does_not_cancel_long_running_agent(self):
         now, polls, requests, state = [0.0], 0, [], {}
         task = job()
@@ -146,7 +161,7 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             nonlocal polls
             requests.append(request)
             if request.method == 'POST':
-                self.assertFalse(request.url.path.endswith(':cancel'))
+                self.assertFalse(request.url.path.endswith('/cancel'))
                 return httpx.Response(200, json={'id': 'agent-long', 'status': 'in_progress'})
             polls += 1
             return httpx.Response(200, json={'id': 'agent-long', 'status': 'completed' if polls == 2 else 'in_progress',
@@ -263,14 +278,14 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             if update: state.update(update)
             return {'state': state, 'canceled': bool(state.get('id'))}
         async def outbound(request):
-            if request.url.path.endswith(':cancel'):
+            if request.url.path.endswith('/cancel'):
                 canceled.append(request.url.path)
                 return httpx.Response(200, json={'id': 'v1_cancel', 'status': 'cancelled'})
             return httpx.Response(200, json={'id': 'v1_cancel', 'status': 'in_progress'})
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
             with self.assertRaises(AgentCanceled):
                 await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
-        self.assertEqual(canceled, ['/v1beta/interactions/v1_cancel:cancel'])
+        self.assertEqual(canceled, ['/v1beta/interactions/v1_cancel/cancel'])
 
     async def test_ambiguous_create_is_not_retried(self):
         calls = 0

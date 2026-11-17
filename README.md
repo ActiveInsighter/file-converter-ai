@@ -207,7 +207,7 @@ Antigravity 请求**不发送** `agent_config.max_total_tokens`，也不再设�
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
 和凭据的 SHA-256（不保存 API Key），之后只轮询同一 ID；中断的创建不盲目重发。
-取消会调用远程 `:cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
+取消会调用远程 `/cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
 `timeoutMinutes` 同样忽略；workflow 不再自设 180 分钟超时。GitHub 托管 Runner 仍有
 [每个 job 最长 6 小时的平台限制](https://docs.github.com/en/actions/reference/limits)，不能通过仓库配置取消。
 PB 必须先部署 `1794740000_gemini_agent_state.js`
@@ -351,12 +351,14 @@ CLI 也支持 `--svg-enabled --svg-provider gemini --svg-model <模型>`，以�
 
 ## Agent / Chat 过程同步
 
-Gemini 消息执行器现在每 5 秒将变化内容和累计 Token 写入 PocketBase，Antigravity 的工具调用、
+Gemini 消息执行器在每个 Antigravity `step.stop` 后立即写入 PocketBase 并等待确认，
+收到确认前不继续消费后续步骤；正文增量和累计 Token 仍由每 5 秒的刷新兜底。Antigravity 的工具调用、
 工具结果和公开思考摘要按序保存；普通 Gemini 使用流式文本写相同内容分段。Remote 从数据库
 增量读取，刷新页面可恢复已保存过程。SSE 断开后，在任务整个生命周期内使用事件游标继续重连，
 并持续轮询 interaction 状态，不重新创建执行。非终态快照可能只返回状态、不含步骤或用量，
-不能靠快照补齐事件流；重连失败会记录原因与退避时间。暂时故障在收到首个事件前也会重试，
-永久拒绝或没有事件游标的内容流会明确记录降级原因，避免重放增量造成重复内容。
+不能靠快照补齐事件流；重连失败会记录原因与退避时间。暂时故障在收到首个事件前也会重试。
+部分实际响应没有事件游标，此时从头重放并按步骤编号重建增量，已经完成且内容相同的步骤不重复写入。
+已确认的 `400 invalid_request / Precondition check failed.` 会退避重试；其他明确的参数或权限错误保留失败日志。
 Actions 每分钟的状态日志同时记录事件观察器是否仍运行及已观察步骤数，区分快照步骤数与事件步骤数。
 上传失败保留恢复文件，最终完成前补传；Actions recovery artifact 同时包含 `*.progress.json` 过程恢复文件。
 无新内容时执行器每 30 秒发送一次无内容心跳，刷新 `progressAt`，不重复写入步骤。
@@ -367,3 +369,9 @@ checkpoint 使用同一 executionId 和 interaction 身份重试短暂的 PB 5xx
 权限等明确 4xx 错误仍立即报告，不重发模型创建请求。
 先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
 完整接口及发布设计见后端 `docs/agent-message-stream.md`。
+
+对仍在执行、过程同步已停止的单段任务，可显式运行 `sync-<原任务ID>`。
+它只 GET 原 interaction 并写进度，不领取任务、不创建模型请求、不完成或取消原执行。
+每个写入批次都回读数据库核对内容，防止旧 Runner 的心跳抢占批次号后被误当作已保存；
+执行身份变化或任务结束后停止。原 Runner 继续负责最终回复和用量。
+只读 trace 可通过 workflow 的 `diagnostic_seconds` 选择 10–900 秒窗口（默认 180）。

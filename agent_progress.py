@@ -39,6 +39,14 @@ class MessageProgress:
         self.lock = asyncio.Lock()
         self.clock = clock
         self.last_flushed_at = clock()
+        self.replay_completed = set()
+
+    def begin_stream(self):
+        if not self.last_event_id:
+            # Some Agent streams have no event IDs. Rebuild each indexed step
+            # from its start on replay instead of appending to old delta buffers.
+            self.steps.clear()
+            self.replay_completed = {key for key, part in self.parts.items() if part['status'] in ('completed', 'failed')}
 
     def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False, payload=None, tool_kind=''):
         previous = self.parts.get(key)
@@ -101,6 +109,8 @@ class MessageProgress:
     def step(self, index, step, status='completed'):
         kind = step.get('type', '')
         key = f'step:{index}'
+        if status == 'running' and key in self.replay_completed:
+            return
         if kind == 'thought':
             # Explicit summary only. Never persist content/text or signatures of thought steps.
             summary = step.get('summary') or []
@@ -210,8 +220,8 @@ class MessageProgress:
                     if k != 'type':
                         step[k] = v
             self.step(index, step, 'running')
-        elif kind == 'step.stop' and index in self.steps:
-            self.step(index, data.get('step') or self.steps.pop(index))
+        elif kind == 'step.stop' and (index in self.steps or isinstance(data.get('step'), dict)):
+            self.step(index, data.get('step') or self.steps[index])
             self.steps.pop(index, None)
         elif kind and kind.startswith('interaction.') and isinstance(data.get('interaction'), dict):
             self.snapshot(data['interaction'])
@@ -224,7 +234,7 @@ class MessageProgress:
         temporary = self.target.with_suffix('.tmp')
         temporary.write_text(json.dumps({'jobId': self.job_id, 'messageId': self.message_id,
             'sequence': self.sequence, 'parts': self.parts, 'usage': self.usage, 'pending': self.pending,
-            'identity': self.identity}, ensure_ascii=False), encoding='utf-8')
+            'identity': self.identity, 'lastEventId': self.last_event_id}, ensure_ascii=False), encoding='utf-8')
         temporary.replace(self.target)
 
     async def flush(self, *, force=False):
@@ -247,6 +257,10 @@ class MessageProgress:
                     self.pending = body
                 self.save_spool()
                 response = await self.post(self.pending)
+                if (response or {}).get('closed'):
+                    self.closed = True
+                    self.save_spool()
+                    return
                 self.last_flushed_at = self.clock()
                 self.sequence = self.pending['sequence']
                 self._last_flushed_usage = self.pending['usage'].copy()
@@ -272,6 +286,23 @@ class MessageProgress:
                 print(f'[agent.progress] upload deferred job={self.job_id} msg={self.message_id} '
                       f'seq={self.sequence} dirty={len(self.dirty)} error_type={type(error).__name__} detail={detail}', flush=True)
 
+    async def persist_step(self, index, *, sleep=asyncio.sleep):
+        """Backpressure: do not consume the next completed step before this ACK."""
+        self.save_spool()
+        failures = 0
+        while not self.closed:
+            try:
+                await self.flush()
+                if not self.closed and self.post:
+                    print(f'[agent.progress] step_saved job={self.job_id} msg={self.message_id} '
+                          f'step={index} seq={self.sequence}', flush=True)
+                return
+            except Exception as error:
+                failures = min(failures + 1, 5)
+                print(f'[agent.progress] step_save_retry job={self.job_id} msg={self.message_id} '
+                      f'step={index} error_type={type(error).__name__}', flush=True)
+                await sleep(min(2 ** failures, 30))
+
     def finalize(self, result):
         usage = result.get('usage') or {}
         self.usage.update({key: value for key, value in usage.items() if key in {*USAGE.values(), 'agentStepCount'} and type(value) is int and value >= 0})
@@ -291,6 +322,7 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
     # nonterminal GET snapshots may contain only status, without steps or usage.
     failures = 0
     while not progress.closed:
+        progress.begin_stream()
         params = {'stream': 'true'}
         if progress.last_event_id: params['last_event_id'] = progress.last_event_id
         received = False
@@ -298,7 +330,19 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
             async with client.stream('GET', url, params=params, headers={'x-goog-api-key': key, 'Accept': 'text/event-stream'},
                                      timeout=httpx.Timeout(45, connect=15)) as response:
                 if response.status_code != 200:
-                    if response.status_code not in (408, 429, 500, 502, 503, 504):
+                    # Google can briefly reject a reconnect while the previous
+                    # subscription is being released. Match this error exactly;
+                    # authentication/other invalid requests stay permanent.
+                    precondition = False
+                    if response.status_code == 400:
+                        raw = await response.aread()
+                        try:
+                            detail = json.loads(raw).get('error', {})
+                            precondition = (isinstance(detail, dict) and detail.get('code') == 'invalid_request'
+                                            and detail.get('message') == 'Precondition check failed.')
+                        except (ValueError, AttributeError):
+                            pass
+                    if response.status_code not in (408, 429, 500, 502, 503, 504) and not precondition:
                         print(f'[agent.progress] stream unavailable job={progress.job_id} '
                               f'msg={progress.message_id} http={response.status_code}', flush=True)
                         return
@@ -310,8 +354,17 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
                     async for data, kind, event_id in sse_events(response):
                         received = True
                         progress.consume(data, kind, event_id)
-                        failures = 0
                         event_type = (data.get('event_type') or kind) if isinstance(data, dict) else kind
+                        if event_type == 'error':
+                            detail = progress.redactor.preview(data.get('error') or {})
+                            print(f'[agent.progress] stream event error job={progress.job_id} '
+                                  f'msg={progress.message_id} detail={json.dumps(detail, ensure_ascii=False)}', flush=True)
+                            break
+                        failures = 0
+                        if event_type == 'step.stop' and type(data.get('index')) is int:
+                            await progress.persist_step(data.get('index'), sleep=sleep)
+                            if progress.closed:
+                                return
                         if event_type in ('interaction.completed', 'interaction.failed', 'interaction.cancelled',
                                           'interaction.canceled', 'interaction.incomplete', 'interaction.requires_action'):
                             return
@@ -319,12 +372,6 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
             # Exception text/URLs can contain credentials; log the type only.
             print(f'[agent.progress] stream interrupted job={progress.job_id} '
                   f'msg={progress.message_id} error_type={type(error).__name__}', flush=True)
-        if received and not progress.last_event_id:
-            # Replaying cursorless deltas could duplicate content. An initial
-            # connection failure with no events, however, is safe to retry.
-            print(f'[agent.progress] stream unavailable job={progress.job_id} '
-                  f'msg={progress.message_id} reason=missing_event_cursor', flush=True)
-            return
         failures = min(failures + 1, 5)
         delay = min(2 ** failures, 30)
         print(f'[agent.progress] stream reconnecting job={progress.job_id} '

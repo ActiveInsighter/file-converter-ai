@@ -285,6 +285,16 @@ async def observe_stream(client, url, key, trace, *, sleep=asyncio.sleep):
                            connect_seconds=round(trace.clock() - began, 3),
                            resumed=bool(trace.last_event_id), content_type=content_type)
                 if response.status_code != 200:
+                    raw = bytearray()
+                    async for block in response.aiter_bytes():
+                        raw.extend(block[:max(0, 16384 - len(raw))])
+                        if len(raw) >= 16384:
+                            break
+                    try:
+                        detail = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        detail = raw.decode('utf-8', errors='replace')
+                    trace.emit('stream_http_error', http=response.status_code, error=trace.preview(detail))
                     if response.status_code not in (429, 500, 502, 503, 504):
                         return
                 elif 'text/event-stream' not in content_type:
