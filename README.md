@@ -207,8 +207,10 @@ Antigravity 请求**不发送** `agent_config.max_total_tokens`，也不再设�
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
 和凭据的 SHA-256（不保存 API Key），之后只轮询同一 ID；中断的创建不盲目重发。
-取消会调用远程 `:cancel`；读取失败重试 GET。最大时限 175 分钟，为现有 180 分钟
-GitHub job 留出安装和收尾时间。PB 必须先部署 `1794740000_gemini_agent_state.js`
+取消会调用远程 `:cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
+`timeoutMinutes` 同样忽略；workflow 不再自设 180 分钟超时。GitHub 托管 Runner 仍有
+[每个 job 最长 6 小时的平台限制](https://docs.github.com/en/actions/reference/limits)，不能通过仓库配置取消。
+PB 必须先部署 `1794740000_gemini_agent_state.js`
 与 checkpoint 路由。使用现有 `GEMINI_API_KEYS`，无需把任何服务器凭据挂入沙盒。
 
 ### Antigravity GitHub 仓库集成（仅需 Actions Secret）
@@ -357,5 +359,8 @@ Gemini 消息执行器现在每 5 秒将变化内容和累计 Token 写入 Pocke
 永久拒绝或没有事件游标的内容流会明确记录降级原因，避免重放增量造成重复内容。
 Actions 每分钟的状态日志同时记录事件观察器是否仍运行及已观察步骤数，区分快照步骤数与事件步骤数。
 上传失败保留恢复文件，最终完成前补传；Actions recovery artifact 同时包含 `*.progress.json` 过程恢复文件。
+无新内容时执行器每 30 秒发送一次无内容心跳，刷新 `progressAt`，不重复写入步骤。
+Remote 以此显示执行器在线状态，以最后一个非状态分段的时间显示最近步骤；任务行的
+`updated` 由调度器也会刷新，不能用来推断执行器仍在线。
 先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
 完整接口及发布设计见后端 `docs/agent-message-stream.md`。

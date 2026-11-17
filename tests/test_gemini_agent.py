@@ -134,6 +134,30 @@ class AgentPayloadTests(unittest.TestCase):
 
 
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_timeout_does_not_cancel_long_running_agent(self):
+        now, polls, requests, state = [0.0], 0, [], {}
+        task = job()
+        task['options']['agent'] = {'timeoutMinutes': 1}
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(_): now[0] += 4 * 60 * 60
+        async def outbound(request):
+            nonlocal polls
+            requests.append(request)
+            if request.method == 'POST':
+                self.assertFalse(request.url.path.endswith(':cancel'))
+                return httpx.Response(200, json={'id': 'agent-long', 'status': 'in_progress'})
+            polls += 1
+            return httpx.Response(200, json={'id': 'agent-long', 'status': 'completed' if polls == 2 else 'in_progress',
+                'output_text': 'finished' if polls == 2 else ''})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                task, {}, checkpoint=checkpoint, sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(result['reply'], 'finished')
+        self.assertEqual(sum(request.method == 'POST' for request in requests), 1)
+        self.assertGreater(now[0], 6 * 60 * 60)
+
     async def test_progress_is_throttled_and_terminal_usage_is_reported_once(self):
         now, polls = [0.0], 0
         state = {}

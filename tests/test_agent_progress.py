@@ -14,6 +14,20 @@ from key_pool import KeyPool
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quiet_agent_sends_heartbeat_without_rewriting_content(self):
+        now, writes = [0.0], []
+        async def post(body): writes.append((now[0], json.loads(json.dumps(body)))); return {}
+        async def sleep(seconds):
+            now[0] += seconds
+            if now[0] >= 40: raise asyncio.CancelledError()
+        p = MessageProgress(post=post, clock=lambda: now[0])
+        p.put('agent-status', 'status', 'in_progress', status='running')
+        with patch('agent_progress.asyncio.sleep', new=sleep):
+            with self.assertRaises(asyncio.CancelledError): await p.pump()
+        self.assertEqual([at for at, _ in writes], [5, 35])
+        self.assertEqual([body['sequence'] for _, body in writes], [1, 2])
+        self.assertEqual(writes[1][1]['parts'], [])
+
     async def test_long_agent_reconnects_past_six_streams_and_keeps_cursor(self):
         p = MessageProgress()
         requests, delays = [], []

@@ -278,7 +278,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     if progress is not None:
         from agent_progress import observe_progress
         observer = asyncio.create_task(observe_progress(client, url, key, progress))
-    deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
     last_report = started
@@ -320,10 +319,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await checkpoint({'status': 'cancelled'})
                 await pool.mark_cancelled(index, lease)
                 raise AgentCanceled('Agent 已取消')
-            if clock() >= deadline:
-                await request_json(client, 'POST', url + ':cancel', key)
-                await checkpoint({'status': 'cancelled'})
-                raise RuntimeError('Agent 达到执行时限，已取消远程执行。')
             await sleep(3)
             try:
                 poll_started = clock()
