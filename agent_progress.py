@@ -24,6 +24,7 @@ class MessageProgress:
     def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id=''):
         self.redactor = AgentTrace(secrets=secrets, verbose=False)
         self.parts, self.dirty, self.usage, self.steps = {}, set(), {}, {}
+        self._last_flushed_usage = {}
         self.sequence = 0
         self.capture_bytes = 0
         self.post, self.identity, self.target = post, identity or {}, target
@@ -35,7 +36,7 @@ class MessageProgress:
         self.closed = False
         self.lock = asyncio.Lock()
 
-    def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False):
+    def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False, payload=None, tool_kind=''):
         previous = self.parts.get(key)
         if previous is None and len(self.parts) >= 10000:
             return
@@ -56,6 +57,10 @@ class MessageProgress:
                 'type': kind, 'content': raw[:limit].decode('utf-8', errors='ignore'), 'status': status,
                 'toolName': self.redactor.redact(tool_name)[:120], 'callId': self.redactor.redact(call_id)[:256],
                 'providerType': provider_type[:120], 'truncated': truncated or len(raw) > limit}
+        if tool_kind:
+            part['toolKind'] = tool_kind
+        if payload is not None:
+            part['payload'] = payload
         if part != previous:
             self.parts[key] = part
             self.capture_bytes += len(part['content'].encode()) - old_bytes
@@ -65,7 +70,7 @@ class MessageProgress:
         raw_usage = data.get('usage') or {}
         self.usage.update({dst: max(self.usage.get(dst, 0), raw_usage[src]) for src, dst in USAGE.items()
                            if type(raw_usage.get(src)) is int and raw_usage[src] >= 0})
-        steps = data.get('steps') or []
+        steps = data.get('steps') or data.get('outputs') or []
         self.usage['agentStepCount'] = max(self.usage.get('agentStepCount', 0), len(steps))
         for index, step in enumerate(steps):
             if isinstance(step, dict):
@@ -89,24 +94,46 @@ class MessageProgress:
             if text:
                 self.put(key, 'reasoning_summary', text, status=status, provider_type=kind, truncated=bool(step.get('_truncated')))
         elif kind in ('model_output', 'text'):
-            text = step.get('text', '') or '\n'.join(p.get('text', '') for p in step.get('content', [])
+            blocks = step.get('content', []) if kind == 'model_output' else [step]
+            text = step.get('text', '') or '\n'.join(p.get('text', '') for p in blocks
                                                     if isinstance(p, dict) and p.get('type') == 'text')
             if text:
                 self.put(key, 'text', text, status=status, provider_type=kind, truncated=bool(step.get('_truncated')))
+            annotations = []
+            for p in blocks:
+                if isinstance(p, dict):
+                    for ann in p.get('annotations') or []:
+                        if isinstance(ann, dict) and ann.get('url'):
+                            annotations.append({'title': ann.get('title', ''), 'url': ann.get('url', '')})
+                    if p.get('type') == 'image':
+                        self.put(f'{key}:img', 'image', json.dumps({'mimeType': p.get('mime_type') or p.get('mimeType') or 'image/png',
+                                                                    'uri': p.get('uri') or '', 'inline': bool(p.get('data'))}, ensure_ascii=False),
+                                 status=status, provider_type='image')
+            if annotations:
+                self.put(f'{key}:annotations', 'annotations', json.dumps(annotations, ensure_ascii=False),
+                         status=status, provider_type='annotations')
         elif kind.endswith(('_call', '_result')):
             # Serialize only known tool fields; discard signatures and hidden provider state.
-            allowed = ('arguments', 'code', 'command', 'input', 'output', 'result', 'content', 'error', 'stdout', 'stderr', 'results', 'response')
+            allowed = ('language', 'arguments', 'code', 'command', 'input', 'output', 'result', 'content',
+                       'error', 'stdout', 'stderr', 'results', 'response', 'outcome', 'exit_code',
+                       'server_name', 'queries', 'urls')
             payload = {k: step[k] for k in allowed if k in step}
+            sensitive_key = re.compile(r'(?i)^(?:.*signature|secret|authorization|password|api[_-]?key|access[_-]?token|token|headers|environment)$')
             def scrub(value):
                 if isinstance(value, dict):
-                    return {k: scrub(v) for k, v in value.items() if not any(s in k.lower() for s in ('signature', 'thought', 'secret', 'authorization', 'password', 'token', 'api_key'))}
+                    return {k: scrub(v) for k, v in value.items() if not sensitive_key.search(str(k))}
                 if isinstance(value, list): return [scrub(v) for v in value]
+                if isinstance(value, str): return self.redactor.redact(value)
                 return value
-            text = json.dumps(scrub(payload), ensure_ascii=False) if payload else ''
+            clean_payload = scrub(payload) if payload else None
+            text = json.dumps(clean_payload, ensure_ascii=False) if clean_payload else ''
+            is_err = bool(step.get('is_error')) or (isinstance(step.get('exit_code'), int) and step['exit_code'] != 0)
+            tool_kind = 'client' if kind in ('function_call', 'function_result') else 'server'
             self.put(key, 'tool_call' if kind.endswith('_call') else 'tool_result', text,
-                     status='failed' if step.get('is_error') else status,
-                     tool_name=str(step.get('name') or step.get('tool_name') or kind),
-                     call_id=str(step.get('call_id') or step.get('id') or ''), provider_type=kind)
+                     status='failed' if is_err else status,
+                     tool_name=str(step.get('server_name') or step.get('name') or step.get('tool_name') or kind),
+                     call_id=str(step.get('call_id') or step.get('id') or ''), provider_type=kind,
+                     payload=clean_payload, tool_kind=tool_kind)
 
     def consume(self, data, sse_type='', event_id=None):
         if not isinstance(data, dict): return
@@ -126,10 +153,20 @@ class MessageProgress:
             step = data.get('step') or {}
             self.step(index, step, 'running')
             if len(self.steps) < 128:
-                self.steps[index] = {'type': step.get('type', ''), 'summary': '', 'text': ''}
-        elif kind == 'step.delta' and index in self.steps:
-            step, delta = self.steps[index], data.get('delta') or {}
-            if delta.get('type') == 'thought_summary':
+                self.steps[index] = {**step, 'type': step.get('type', ''), 'summary': '', 'text': ''}
+        elif kind == 'step.delta' and type(index) is int and 0 <= index < 10000:
+            delta = data.get('delta') or {}
+            delta_type = delta.get('type', '')
+            if index not in self.steps:
+                if len(self.steps) >= 128:
+                    return
+                inferred = ('thought' if delta_type in ('thought_summary', 'thought_signature')
+                            else 'function_call' if delta_type == 'arguments_delta'
+                            else 'model_output' if delta_type in ('text', 'image', 'text_annotation_delta')
+                            else delta_type)
+                self.steps[index] = {'type': inferred, 'summary': '', 'text': ''}
+            step = self.steps[index]
+            if delta_type == 'thought_summary':
                 content = delta.get('content') or {}
                 if isinstance(content, dict) and content.get('type') == 'text':
                     previous = step.get('summary') or ''
@@ -137,10 +174,21 @@ class MessageProgress:
                     combined = previous + content.get('text', '')
                     step['_truncated'] = bool(step.get('_truncated')) or len(combined.encode()) > PART_BYTES
                     step['summary'] = combined.encode()[:PART_BYTES].decode('utf-8', errors='ignore')
-            elif step.get('type') == 'model_output' and delta.get('type') == 'text':
+            elif step.get('type') == 'model_output' and delta_type == 'text':
                 combined = step.get('text', '') + delta.get('text', '')
                 step['_truncated'] = bool(step.get('_truncated')) or len(combined.encode()) > PART_BYTES
                 step['text'] = combined.encode()[:PART_BYTES].decode('utf-8', errors='ignore')
+            elif delta_type == 'arguments_delta':
+                combined = (step.get('arguments') if isinstance(step.get('arguments'), str) else '') + delta.get('arguments', '')
+                step['arguments'] = combined.encode()[:PART_BYTES].decode('utf-8', errors='ignore')
+            elif delta_type == 'text_annotation_delta' and isinstance(delta.get('annotations'), list):
+                anns = [{'title': a.get('title', ''), 'url': a.get('url', '')} for a in delta['annotations'] if isinstance(a, dict) and a.get('url')]
+                if anns:
+                    self.put(f'step:{index}:annotations', 'annotations', json.dumps(anns, ensure_ascii=False), status='running', provider_type='annotations')
+            elif step.get('type', '').endswith(('_call', '_result')):
+                for k, v in delta.items():
+                    if k != 'type':
+                        step[k] = v
             self.step(index, step, 'running')
         elif kind == 'step.stop' and index in self.steps:
             self.step(index, data.get('step') or self.steps.pop(index))
@@ -159,13 +207,14 @@ class MessageProgress:
             'identity': self.identity}, ensure_ascii=False), encoding='utf-8')
         temporary.replace(self.target)
 
-    async def flush(self):
+    async def flush(self, *, force=False):
         if self.closed or not self.post: return
         async with self.lock:
             # At most four 60 KiB parts per request, below the server's 256 KiB limit.
             keys = sorted(self.dirty, key=lambda key: self.parts[key]['sequence'])
-            if not keys and self.pending is None:
-                keys = []  # A usage-only heartbeat still advances uploadSequence.
+            usage_changed = self.usage != self._last_flushed_usage
+            if not keys and self.pending is None and not usage_changed and not force:
+                return
             while True:
                 if self.pending is None:
                     batch = []
@@ -179,6 +228,7 @@ class MessageProgress:
                 self.save_spool()
                 response = await self.post(self.pending)
                 self.sequence = self.pending['sequence']
+                self._last_flushed_usage = self.pending['usage'].copy()
                 for saved in self.pending['parts']:
                     if self.parts.get(saved['key']) == saved:
                         self.dirty.discard(saved['key'])
@@ -195,13 +245,17 @@ class MessageProgress:
             try:
                 await self.flush()
             except Exception as error:
-                print(f'[agent.progress] upload deferred error_type={type(error).__name__}', flush=True)
+                detail = self.redactor.redact(str(error))[:240]
+                print(f'[agent.progress] upload deferred job={self.job_id} msg={self.message_id} '
+                      f'seq={self.sequence} dirty={len(self.dirty)} error_type={type(error).__name__} detail={detail}', flush=True)
 
     def finalize(self, result):
         usage = result.get('usage') or {}
         self.usage.update({key: value for key, value in usage.items() if key in {*USAGE.values(), 'agentStepCount'} and type(value) is int and value >= 0})
         if result.get('reply') and not any(p['type'] == 'text' for p in self.parts.values()):
             self.put('answer', 'text', result['reply'], truncated=len(result['reply'].encode()) > PART_BYTES)
+        if result.get('annotations'):
+            self.put('annotations', 'annotations', json.dumps(result['annotations'], ensure_ascii=False), provider_type='annotations')
         self.put('agent-status', 'status', result.get('error') or result.get('finishReason') or 'completed',
                  status='failed' if result.get('error') else 'completed')
 

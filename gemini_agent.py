@@ -18,7 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from agent_trace import AgentTrace, TERMINAL
-from response_capture import interaction_snapshot
+from response_capture import extract_structured_payload, interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, prepare_github_context, task_text
 
@@ -137,18 +137,28 @@ def parse_interaction(data, *, secrets=()):
     mapping = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candidatesTokenCount',
                'total_thought_tokens': 'thoughtsTokenCount', 'total_cached_tokens': 'cachedContentTokenCount', 'total_tokens': 'totalTokenCount'}
     normalized = {target: usage[source] for source, target in mapping.items() if isinstance(usage.get(source), int) and usage[source] >= 0}
+    steps = data.get('steps') or data.get('outputs') or []
     calls = {}
-    for step in data.get('steps', []):
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
         kind = step.get('type', '')
         if isinstance(kind, str) and kind.endswith('_call') and len(kind) <= 80:
             calls[kind] = calls.get(kind, 0) + 1
     if calls:
         normalized['agentToolCalls'] = calls
-    normalized['agentStepCount'] = len(data.get('steps', []))
+    normalized['agentStepCount'] = len(steps)
     if type(usage.get('total_tool_use_tokens')) is int and usage['total_tool_use_tokens'] >= 0:
         normalized['toolUseTokenCount'] = usage['total_tool_use_tokens']
-    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized,
-            'response': interaction_snapshot(data, secrets=secrets)}
+    structured = extract_structured_payload('interactions', data, secrets=secrets, reply_text=reply)
+    return {
+        'reply': reply,
+        'error': error,
+        'finishReason': status.upper()[:64],
+        'usage': normalized,
+        'response': interaction_snapshot(data, secrets=secrets),
+        **structured,
+    }
 
 
 async def request_json(client, method, url, key, payload=None):
@@ -273,8 +283,20 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     poll_count = 0
     last_report = started
     last_status = None
+    seen_steps = set()
     try:
         while True:
+            for idx, step in enumerate(current.get('steps') or current.get('outputs') or []):
+                if not isinstance(step, dict):
+                    continue
+                step_sig = (idx, str(step.get('type') or ''), bool(step.get('is_error')))
+                if step_sig not in seen_steps:
+                    seen_steps.add(step_sig)
+                    step_type = str(step.get('type') or 'unknown')[:80]
+                    step_name = str(step.get('server_name') or step.get('name') or step.get('tool_name') or '')[:80]
+                    telemetry('step', step_index=idx, step_type=step_type,
+                              **({'tool_name': step_name} if step_name else {}),
+                              **({'is_error': True} if step.get('is_error') else {}))
             if progress is not None:
                 progress.snapshot(current)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
@@ -286,6 +308,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     elapsed_seconds=round(clock() - started, 2),
                     polls=poll_count,
                     reply_chars=len(result['reply']),
+                    parts_count=len(result.get('parts') or []),
+                    tool_calls_count=len(result.get('toolCalls') or []),
+                    code_executions_count=len(result.get('codeExecutions') or []),
+                    annotations_count=len(result.get('annotations') or []),
                     **agent_usage_diagnostics(current))
                 return result
             control = await checkpoint()
