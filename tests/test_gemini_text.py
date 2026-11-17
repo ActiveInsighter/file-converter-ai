@@ -95,7 +95,7 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 state.update(body.get('state') or {})
                 return httpx.Response(200, json={'state': state, 'canceled': False})
             if request.method == 'POST':
-                self.assertFalse(request.url.path.endswith(':cancel'))
+                self.assertFalse(request.url.path.endswith('/cancel'))
                 created = True
                 return httpx.Response(200, json={'id': 'agent-existing', 'status': 'in_progress'})
             return httpx.Response(200, json={'id': 'agent-existing', 'status': 'completed', 'output_text': 'finished'})

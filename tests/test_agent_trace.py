@@ -195,12 +195,18 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('fixture-key', ''.join(rows))
 
     async def test_stream_rejection_is_best_effort(self):
-        trace = AgentTrace(sink=lambda *_args, **_kwargs: None)
+        rows = []
+        trace = AgentTrace(secrets=['fixture-key'], sink=lambda line, **_: rows.append(line))
         async def outbound(request):
-            return httpx.Response(400, json={'error': 'unsupported'})
+            return httpx.Response(400, json={'error': {'message': 'unsupported fixture-key', 'authorization': 'private-value'}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
             await observe_stream(client, 'https://fixture/id', 'fixture-key', trace)
         self.assertEqual(trace.status, 'unknown')
+        rejection = next(json.loads(row.split(' ', 1)[1]) for row in rows if '"event":"stream_http_error"' in row)
+        self.assertEqual(rejection['http'], 400)
+        self.assertIn('unsupported', rejection['error']['preview'])
+        self.assertNotIn('fixture-key', ''.join(rows))
+        self.assertNotIn('private-value', ''.join(rows))
 
     async def test_diagnostic_lookup_and_trace_are_read_only(self):
         methods = []

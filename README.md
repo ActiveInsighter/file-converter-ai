@@ -207,7 +207,7 @@ Antigravity 请求**不发送** `agent_config.max_total_tokens`，也不再设�
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
 和凭据的 SHA-256（不保存 API Key），之后只轮询同一 ID；中断的创建不盲目重发。
-取消会调用远程 `:cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
+取消会调用远程 `/cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
 `timeoutMinutes` 同样忽略；workflow 不再自设 180 分钟超时。GitHub 托管 Runner 仍有
 [每个 job 最长 6 小时的平台限制](https://docs.github.com/en/actions/reference/limits)，不能通过仓库配置取消。
 PB 必须先部署 `1794740000_gemini_agent_state.js`

@@ -191,6 +191,12 @@ def upstream_error(status, data, key):
     return RuntimeError(f'Antigravity 请求失败（HTTP {status}）：{detail or "请检查 Agent、参数及 API Key 权限"}')
 
 
+async def cancel_interaction(client, url, key):
+    status, _, data = await request_json(client, 'POST', url + '/cancel', key)
+    if status not in (200, 202):
+        raise upstream_error(status, data, key)
+
+
 async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None):
     from providers import GeminiProvider
     provider = GeminiProvider()
@@ -254,7 +260,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await checkpoint(state)
             except Exception:
                 # Stop a remote run whose identity cannot be durably recorded.
-                await request_json(client, 'POST', f'{ROOT}/{quote(data["id"], safe="")}:cancel', key)
+                await cancel_interaction(client, f'{ROOT}/{quote(data["id"], safe="")}', key)
                 raise
             break
         await pool.mark_error(index, lease, http_status=status)
@@ -315,7 +321,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 return result
             control = await checkpoint()
             if control.get('canceled'):
-                await request_json(client, 'POST', url + ':cancel', key)
+                await cancel_interaction(client, url, key)
                 await checkpoint({'status': 'cancelled'})
                 await pool.mark_cancelled(index, lease)
                 raise AgentCanceled('Agent 已取消')
@@ -356,7 +362,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await sleep(min(failures * 2, 30))
     except asyncio.CancelledError:
         try:
-            await asyncio.shield(request_json(client, 'POST', url + ':cancel', key))
+            await asyncio.shield(cancel_interaction(client, url, key))
         finally:
             await pool.mark_cancelled(index, lease)
         raise
@@ -365,9 +371,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     except Exception:
         # Do not leave an unmonitored agent spending tokens after a local failure.
         try:
-            await request_json(client, 'POST', url + ':cancel', key)
-        except Exception:
-            pass
+            await cancel_interaction(client, url, key)
+        except Exception as cancel_error:
+            telemetry('cancel_failed', error_type=type(cancel_error).__name__)
         raise
     finally:
         if observer is not None:
