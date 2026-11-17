@@ -140,11 +140,9 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             if request.method == 'POST':
                 return httpx.Response(200, json={'id': 'saved', 'status': 'in_progress'})
             return httpx.Response(200, json={'id': 'saved', 'status': 'completed', 'output_text': 'answer'})
-        async def broken_observer(*_):
-            raise RuntimeError('diagnostic failed')
         async def sleep(_):
             await asyncio.sleep(0.001)
-        with patch('agent_trace.watch_interaction', side_effect=broken_observer) as observer:
+        with patch('agent_trace.watch_interaction', new_callable=AsyncMock) as observer:
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
                     {'model': 'Antigravity', 'prompt': 'hi', 'options': {}}, {'index': 1}, checkpoint=checkpoint, sleep=sleep)

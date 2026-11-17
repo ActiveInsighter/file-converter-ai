@@ -1,0 +1,135 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+
+from agent_progress import MessageProgress, MAX_CAPTURE_BYTES
+from gemini_agent import generate_agent
+from gemini_text import generate
+from key_pool import KeyPool
+
+
+class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    def test_snapshot_retains_only_public_summaries_and_redacts_tools(self):
+        progress = MessageProgress(secrets=['fixture-api-key'])
+        source = {'status': 'in_progress', 'steps': [
+            {'type': 'thought', 'content': [{'type': 'text', 'text': 'hidden raw thought'}],
+             'signature': 'hidden signature', 'summary': [{'type': 'text', 'text': '检查现有实现'}]},
+            {'type': 'code_execution_call', 'call_id': 'call-1', 'code': 'echo fixture-api-key', 'signature': 'secret'},
+            {'type': 'code_execution_result', 'call_id': 'call-1', 'result': {'authorization': 'private', 'stdout': 'ok'}},
+            {'type': 'model_output', 'content': [{'type': 'text', 'text': 'done'}]},
+        ], 'usage': {'total_tokens': 100, 'total_cached_tokens': 80}}
+        progress.snapshot(source)
+        progress.snapshot({**source, 'usage': {'total_tokens': 150}})
+        output = json.dumps(progress.parts, ensure_ascii=False)
+        self.assertIn('检查现有实现', output)
+        for private in ('hidden', 'fixture-api-key', 'signature', 'authorization', 'private'):
+            self.assertNotIn(private, output)
+        self.assertEqual(len(progress.parts), 5)
+        self.assertEqual(progress.usage['totalTokenCount'], 150)
+        self.assertEqual(progress.usage['cachedContentTokenCount'], 80)
+        self.assertEqual(progress.parts['step:1']['callId'], progress.parts['step:2']['callId'])
+
+    def test_duplicate_sse_deltas_are_not_appended_twice(self):
+        p = MessageProgress()
+        p.consume({'index': 1, 'step': {'type': 'thought'}}, 'step.start', 'a')
+        delta = {'index': 1, 'delta': {'type': 'thought_summary', 'content': {'type': 'text', 'text': 'summary'}}}
+        p.consume(delta, 'step.delta', 'b'); p.consume(delta, 'step.delta', 'b')
+        p.consume({'index': 1}, 'step.stop', 'c')
+        self.assertEqual(p.parts['step:1']['content'], 'summary')
+        self.assertEqual(p.parts['step:1']['status'], 'completed')
+
+    def test_late_summary_keeps_provider_step_order(self):
+        p = MessageProgress()
+        p.snapshot({'status': 'in_progress', 'steps': [{'type': 'thought'}, {'type': 'function_call', 'name': 'search'}]})
+        p.consume({'index': 0, 'step': {'type': 'thought'}}, 'step.start', 'first')
+        p.consume({'index': 0, 'delta': {'type': 'thought_summary', 'content': {'type': 'text', 'text': 'plan'}}}, 'step.delta', 'second')
+        ordered = sorted(p.parts.values(), key=lambda part: part['sequence'])
+        self.assertEqual([part['type'] for part in ordered], ['reasoning_summary', 'tool_call', 'status'])
+
+    async def test_lost_ack_retries_exact_batch_and_keeps_newer_local_content(self):
+        sent = []
+        async def post(body):
+            sent.append(json.loads(json.dumps(body)))
+            if len(sent) == 1: raise RuntimeError('lost ack')
+            return {'accepted': len(sent) != 2}
+        with tempfile.TemporaryDirectory() as directory:
+            p = MessageProgress(post=post, target=Path(directory) / 'progress.json')
+            p.put('call', 'tool_call', 'initial', status='running')
+            with self.assertRaises(RuntimeError): await p.flush()
+            self.assertTrue(p.target.exists())
+            p.put('call', 'tool_call', 'changed', status='completed')
+            await p.flush()
+            self.assertEqual(sent[0], sent[1])
+            self.assertEqual([b['sequence'] for b in sent], [1, 1, 2])
+            self.assertEqual(sent[2]['parts'][0]['content'], 'changed')
+            self.assertFalse(p.dirty)
+            self.assertEqual(json.loads(p.target.read_text())['sequence'], 2)
+
+    async def test_batches_are_bounded_and_order_is_stable(self):
+        batches = []
+        async def post(body): batches.append(body); return {}
+        p = MessageProgress(post=post)
+        for i in range(12): p.put(f'tool:{i}', 'tool_result', '中' * 30000)
+        await p.flush()
+        self.assertTrue(all(len(json.dumps(b, ensure_ascii=False).encode()) <= 256 * 1024 for b in batches))
+        self.assertEqual([x['sequence'] for b in batches for x in b['parts']], list(range(1, 13)))
+        self.assertTrue(all(x['truncated'] for b in batches for x in b['parts']))
+        p.put('tool:0', 'tool_result', 'changed')
+        self.assertEqual(p.parts['tool:0']['sequence'], 1)
+        self.assertLessEqual(sum(len(x['content'].encode()) for x in p.parts.values()), MAX_CAPTURE_BYTES)
+
+    async def test_agent_uploads_before_terminal_and_creates_once(self):
+        snapshots, writes, creates = 0, [], 0
+        p = MessageProgress(post=lambda _: None)
+        async def upload(body): writes.append(body); return {}
+        p.post = upload
+        state = {}
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state, 'canceled': False}
+        async def outbound(request):
+            nonlocal creates, snapshots
+            if request.method == 'POST':
+                creates += 1
+                return httpx.Response(200, json={'id': 'agent-1', 'status': 'in_progress'})
+            if request.url.params.get('stream'):
+                return httpx.Response(200, json={})  # Snapshot fallback when SSE is unavailable.
+            snapshots += 1
+            return httpx.Response(200, json={'id': 'agent-1', 'status': 'completed' if snapshots == 2 else 'in_progress',
+                'steps': [{'type': 'code_execution_call', 'code': 'npm test'}],
+                'output_text': 'answer' if snapshots == 2 else '', 'usage': {'total_tokens': snapshots * 100}})
+        async def sleep(_):
+            await p.flush()
+            await asyncio.sleep(0)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                {'model': 'Antigravity', 'options': {}}, {}, checkpoint=checkpoint, sleep=sleep, progress=p)
+        self.assertEqual(creates, 1)
+        self.assertTrue(any(any(part['type'] == 'tool_call' for part in batch['parts']) for batch in writes))
+        self.assertEqual(result['reply'], 'answer')
+        self.assertEqual(p.usage['totalTokenCount'], 200)
+
+    async def test_ordinary_chat_streams_text_and_usage_through_same_parts(self):
+        p = MessageProgress()
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}\n\n'
+                self_outer.assertEqual(p.parts['answer']['content'], 'hello ')
+                yield b'data: {"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"world"}]}}],"usageMetadata":{"totalTokenCount":10}}\n\n'
+        self_outer = self
+        async def outbound(request):
+            self.assertIn(':streamGenerateContent', str(request.url))
+            return httpx.Response(200, headers={'Content-Type': 'text/event-stream'}, stream=Stream())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate(client, KeyPool(['key'], rpm_per_key=1e6, rpd_per_key=100),
+                {'model': 'gemini-test', 'options': {'maxOutputTokens': 8192}}, {'inputText': 'hi'}, progress=p)
+        self.assertEqual(result['reply'], 'hello world')
+        self.assertEqual(result['response']['parts'][0]['text'], 'hello world')
+        self.assertEqual(result['response']['metadata']['usageMetadata']['totalTokenCount'], 10)
+        self.assertEqual(p.parts['answer']['status'], 'completed')
+        self.assertEqual(p.usage['totalTokenCount'], 10)

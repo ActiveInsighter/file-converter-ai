@@ -18,6 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from agent_trace import AgentTrace, TERMINAL
+from response_capture import interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, prepare_github_context, task_text
 
@@ -66,7 +67,9 @@ def build_agent_payload(job, message):
     name = str(job['model']).lower()
     payload = {
         'agent': options.get('id') or (DEFAULT_AGENT if name == 'antigravity' else name),
-        'input': '\n\n'.join(value for value in [job.get('prompt', ''), message.get('inputText', '')] if value),
+        'input': '\n\n'.join(value for value in [
+            *[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])],
+            job.get('prompt', ''), message.get('inputText', '')] if value),
         'background': True, 'store': True,
         'environment': {'type': 'remote'},
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
@@ -106,7 +109,7 @@ def build_agent_payload(job, message):
     return payload
 
 
-def parse_interaction(data):
+def parse_interaction(data, *, secrets=()):
     reply = data.get('output_text')
     if not isinstance(reply, str):
         reply = '\n\n'.join(
@@ -144,7 +147,8 @@ def parse_interaction(data):
     normalized['agentStepCount'] = len(data.get('steps', []))
     if type(usage.get('total_tool_use_tokens')) is int and usage['total_tool_use_tokens'] >= 0:
         normalized['toolUseTokenCount'] = usage['total_tool_use_tokens']
-    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized}
+    return {'reply': reply, 'error': error, 'finishReason': status.upper()[:64], 'usage': normalized,
+            'response': interaction_snapshot(data, secrets=secrets)}
 
 
 async def request_json(client, method, url, key, payload=None):
@@ -177,7 +181,7 @@ def upstream_error(status, data, key):
     return RuntimeError(f'Antigravity 请求失败（HTTP {status}）：{detail or "请检查 Agent、参数及 API Key 权限"}')
 
 
-async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic):
+async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None):
     from providers import GeminiProvider
     provider = GeminiProvider()
     payload = build_agent_payload(job, message)
@@ -259,8 +263,11 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
     url = f'{ROOT}/{quote(current["id"], safe="")}'
-    # Normal execution uses authoritative polling only. Detailed SSE/tool replay
-    # remains available through the explicit read-only trace- diagnostic mode.
+    # GET snapshots reconcile the optional event channel; neither can create a run.
+    observer = None
+    if progress is not None:
+        from agent_progress import observe_progress
+        observer = asyncio.create_task(observe_progress(client, url, key, progress))
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
@@ -268,10 +275,12 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     last_status = None
     try:
         while True:
+            if progress is not None:
+                progress.snapshot(current)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
-                result = parse_interaction(current)
+                result = parse_interaction(current, secrets=pool.keys)
                 telemetry('completed',
                     status=current['status'],
                     elapsed_seconds=round(clock() - started, 2),
@@ -336,3 +345,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         except Exception:
             pass
         raise
+    finally:
+        if observer is not None:
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)

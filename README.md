@@ -346,3 +346,12 @@ Remote 和后端派发端已同步适配。CLI 的 `--jpeg-quality` 保持可用
 CLI 也支持 `--svg-enabled --svg-provider gemini --svg-model <模型>`，以及
 `--svg-config '{"enabled":true,...}'`、`--image-config '{"jpeg_quality":95,"svg":{...}}'`。
 完整参数见 `python pdf2md.py --help`。
+
+## Agent / Chat 过程同步
+
+Gemini 消息执行器现在每 5 秒将变化内容和累计 Token 写入 PocketBase，Antigravity 的工具调用、
+工具结果和公开思考摘要按序保存；普通 Gemini 使用流式文本写相同内容分段。Remote 从数据库
+增量读取，刷新页面可恢复已保存过程。SSE 断开时使用 interaction 快照，不重新创建执行。
+上传失败保留恢复文件，最终完成前补传；Actions recovery artifact 同时包含 `*.progress.json` 过程恢复文件。
+先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
+完整接口及发布设计见后端 `docs/agent-message-stream.md`。
