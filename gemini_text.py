@@ -11,12 +11,15 @@ import argparse
 import json
 import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
+from response_capture import generate_content_snapshot
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 from agent_trace import AgentTrace
 from agent_progress import MessageProgress
@@ -44,6 +47,13 @@ def log_result(log, result):
         # JSON keeps arbitrary model text from becoming GitHub workflow commands.
         log.emit('reply', part=index, parts=len(parts), text=text)
 
+
+class GeminiRequestError(RuntimeError):
+    def __init__(self, message, data, *, secrets=()):
+        super().__init__(message)
+        self.result = {'reply': '', 'error': message, 'finishReason': 'HTTP_ERROR', 'usage': {},
+                       'response': generate_content_snapshot(data, secrets=secrets)}
+
 # Keep HTTP/error-category diagnostics; ordinary chat intentionally uses no tools.
 def safe_error_code(data: dict) -> str:
     """Only expose a machine-readable Google status, never message text."""
@@ -70,14 +80,23 @@ def build_payload(job: dict, message: dict) -> dict:
         job["model"], parts, thinking_level=options.get("thinkingLevel", ""),
         max_output_tokens=options["maxOutputTokens"],
     )
-    if not options.get("thinkingLevel"):
-        payload["generationConfig"].pop("thinkingConfig", None)
+    if not options.get('thinkingLevel'):
+        payload['generationConfig']['thinkingConfig'].pop('thinkingLevel', None)
+    if job['model'].startswith(('gemini-2.5', 'gemini-3', 'gemini-4')):
+        payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
+    elif not options.get('thinkingLevel'):
+        payload['generationConfig'].pop('thinkingConfig', None)
+    if job.get('history'):
+        payload['contents'] = [
+            {'role': turn['role'], 'parts': [{'text': turn['text']}]}
+            for turn in job['history']
+        ] + payload['contents']
     if job.get("systemPrompt"):
         payload["systemInstruction"] = {"parts": [{"text": job["systemPrompt"]}]}
     return payload
 
 
-def parse_answer(payload: dict) -> dict:
+def parse_answer(payload: dict, *, secrets=()) -> dict:
     candidate = (payload.get("candidates") or [{}])[0]
     reason = str(candidate.get("finishReason") or "")[:64]
     reply = "\n".join(part["text"] for part in (candidate.get("content") or {}).get("parts", [])
@@ -92,9 +111,12 @@ def parse_answer(payload: dict) -> dict:
     elif not reply.strip():
         error = "Gemini 返回空回复"
     usage = {key: value for key, value in (payload.get("usageMetadata") or {}).items()
-             if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
+             if key in {"promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount", "toolUsePromptTokenCount", "toolUseTokenCount"}
              and isinstance(value, int) and value >= 0}
-    return {"reply": reply, "error": error, "finishReason": reason, "usage": usage}
+    if 'toolUsePromptTokenCount' in usage:
+        usage['toolUseTokenCount'] = usage['toolUsePromptTokenCount']
+    response = generate_content_snapshot(payload, secrets=secrets)
+    return {"reply": reply, "error": error, "finishReason": reason, "usage": usage, "response": response}
 
 
 class PocketBase:
@@ -142,6 +164,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
     provider = GeminiProvider()
     payload = build_payload(job, message)
     last_http_error = ''
+    last_data = {}
     for attempt in range(4):
         try:
             index, key, lease = await pool.acquire()
@@ -149,7 +172,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             # If every key was rejected, keep the actual HTTP code instead of
             # replacing it with the generic exhausted-pool exception.
             if last_http_error:
-                raise RuntimeError(last_http_error) from None
+                raise GeminiRequestError(last_http_error, last_data, secrets=pool.keys) from None
             raise
         try:
             async with asyncio.timeout(180):
@@ -180,7 +203,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
                                 if summary: progress.put('reasoning', 'reasoning_summary', summary, status='running')
                                 progress.usage.update(parse_answer({**data, 'candidates': [{'content': {'parts': [{'text': answer}]}}]})['usage'])
                         candidate = (data.get('candidates') or [{}])[0]
-                        data['candidates'] = [{**candidate, 'content': {'parts': [{'text': answer}]}}]
+                        data['candidates'] = [{**candidate, 'content': {'parts': ([{'text': summary, 'thought': True}] if summary else []) + [{'text': answer}]}}]
                         if progress is not None:
                             if answer: progress.put('answer', 'text', answer)
                             if summary: progress.put('reasoning', 'reasoning_summary', summary)
@@ -207,7 +230,8 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise
         if status == 200:
             await pool.mark_success(index, lease)
-            return parse_answer(data)
+            return parse_answer(data, secrets=pool.keys)
+        last_data = data
         error_code = safe_error_code(data)
         last_http_error = (f"Gemini 拒绝请求（HTTP {status}，错误类型 {error_code}），"
                            "请检查模型、工具权限、密钥权限或项目额度")
@@ -224,10 +248,10 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             await pool.rate_limited(index, lease, provider.retry_after(headers, data),
                                     daily_exhausted=quota in {"rpd", "spend"}, quota_type=quota)
         elif status not in (500, 502, 503, 504):
-            raise RuntimeError(last_http_error)
+            raise GeminiRequestError(last_http_error, data, secrets=pool.keys)
         if attempt < 3 and not scope and status != 429:
             await sleep(min(30, max(2 ** (attempt + 1), provider.retry_after(headers, data) or 0)))
-    raise RuntimeError("Gemini 暂时不可用或请求额度不足，请稍后重新提交")
+    raise GeminiRequestError("Gemini 暂时不可用或请求额度不足，请稍后重新提交", last_data, secrets=pool.keys)
 
 
 async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work_dir: Path):
@@ -254,6 +278,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
             log = AgentTrace(job=job_id, segment=message['index'], secrets=pool.keys, prefix='[gemini]')
             stage = 'permit'
             try:
+                begun = time.monotonic()
+                started_at = datetime.now(timezone.utc).isoformat()
                 # Not retried: a lost permit is not permission to send twice.
                 permit = await pb.post(f"{endpoint}/start", identity)
                 if not permit.get("send"):
@@ -285,13 +311,18 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     for secret in secrets:
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
-                    result = {"reply": '\n\n'.join(p['content'] for p in progress.parts.values() if p['type'] == 'text').encode('utf-8')[:MAX_REPLY_BYTES].decode('utf-8', errors='ignore'), "error": detail[:1800], "finishReason": "", "usage": progress.usage.copy()}
+                    result = getattr(error, "result", None) or {"reply": '\n\n'.join(p['content'] for p in progress.parts.values() if p['type'] == 'text').encode('utf-8')[:MAX_REPLY_BYTES].decode('utf-8', errors='ignore'), "error": detail[:1800], "finishReason": "", "usage": progress.usage.copy()}
                 finally:
                     progress_task.cancel()
                     await asyncio.gather(progress_task, return_exceptions=True)
                 usages.append(result.get('usage') or {})
                 log_result(log, result)
                 stage = 'recovery_write'
+                if isinstance(result.get('response'), dict):
+                    result['response']['metadata']['execution'] = {
+                        'startedAt': started_at, 'finishedAt': datetime.now(timezone.utc).isoformat(),
+                        'durationSeconds': round(time.monotonic() - begun, 3), 'timingBasis': 'Actions runner wall clock',
+                    }
                 saved = {**identity, **result}
                 target = work_dir / f"{message['id']}.json"
                 temporary = target.with_suffix(".tmp")
