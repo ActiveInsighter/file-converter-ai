@@ -2,7 +2,7 @@
 
 本文件记录了 `file-converter-ai` 重构后向 PocketBase 上传的所有结构化字段（覆盖普通 Gemini `generateContent` / `streamGenerateContent` 与 Antigravity `v1beta/interactions` API），供你在 PocketBase 服务端手动修改表结构与 `pb_hooks`，并方便后续在 `rikkahub-antigravity` 前端直接读取展示。
 
-> 自动化脚本已同步提供在 [`migrations/pb_migrations_gemini_structured_parts.js`](../migrations/pb_migrations_gemini_structured_parts.js)，可直接放入 PocketBase 的 `pb_migrations/` 目录，或按下方字段表在 PocketBase Admin UI 中添加。
+> 自动化脚本已同步提供在 [`migrations/pb_migrations_gemini_structured_parts.js`](../migrations/pb_migrations_gemini_structured_parts.js)，部署时使用后端仓库 `pocketbase/pb_migrations/1794906000_gemini_structured_parts.js` 的有序文件名；此处保留相同副本。必须同时部署后端 `gemini_execution.js`、`gemini_structured.js`、`gemini_response.js`、`agent_parts.js`，以放行、校验并持久化新字段。
 
 ---
 
@@ -26,15 +26,15 @@
 
 ---
 
-## 二、`aw_gemini_message_parts` 流式分片表字段（`/progress` 实时上传）
+## 二、`aw_agent_parts` 流式分片表字段（`/progress` 实时上传）
 
 流式运行期间，`MessageProgress` 会将增量分片发送到 `POST /api/anyworkflow/gemini/jobs/{jobId}/messages/{messageId}/progress`，每个 `part` 包含以下字段：
 
 | 字段名 | PocketBase 类型 | 说明 |
 | :--- | :--- | :--- |
-| `job` | `relation` (`aw_gemini_jobs`) | 所属任务 |
+| `owner` | `relation` (`aw_clients`) | 所属用户（沿用已有访问规则） |
 | `message` | `relation` (`aw_gemini_messages`) | 所属消息 |
-| `key` | `text` (128) | 稳定幂等键，如 `step:0`, `reasoning`, `answer`, `annotations`, `agent-status` |
+| `key` | `text` (120) | 稳定幂等键，如 `step:0`, `reasoning`, `answer`, `annotations`, `agent-status` |
 | `sequence` | `number` | 排序序号（`1..9998` 为步骤，`9999` 为 `answer`，`10000` 为 `agent-status`） |
 | `type` | `text` (64) | `reasoning_summary` / `tool_call` / `tool_result` / `text` / `image` / `annotations` / `status` |
 | `status` | `text` (32) | `running` / `completed` / `failed` |

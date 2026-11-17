@@ -167,6 +167,24 @@ class StreamingAndProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress.parts['step:0']['toolKind'], 'server')
         self.assertEqual(progress.usage['thoughtsTokenCount'], 3)
 
+    async def test_progress_keys_have_unique_stable_sequences_and_bound_payloads(self):
+        writes = []
+        async def post(body):
+            writes.append(body)
+            return {}
+        p = MessageProgress(post=post)
+        p.put('reasoning', 'reasoning_summary', 'Plan')
+        p.put('step:0', 'tool_call', 'call', payload={'code': 'x' * 300000})
+        p.put('step:0:annotations', 'annotations', '[]')
+        p.put('step:1', 'tool_result', 'done')
+        initial = {key: part['sequence'] for key, part in p.parts.items()}
+        p.put('step:0', 'tool_call', 'updated', payload={'code': 'print(2)'})
+        self.assertEqual(initial, {key: part['sequence'] for key, part in p.parts.items()})
+        self.assertEqual(len(set(initial.values())), len(initial))
+        await p.flush()
+        self.assertFalse(p.dirty)
+        self.assertLess(len(json.dumps(writes[0]).encode()), 256 * 1024)
+
     async def test_flush_skips_empty_heartbeat_and_consumes_delta_without_start(self):
         writes = []
 

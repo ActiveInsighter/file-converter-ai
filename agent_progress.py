@@ -12,6 +12,7 @@ import json
 import re
 
 from agent_trace import AgentTrace, TERMINAL
+from response_capture import sanitize
 
 PART_BYTES = 60 * 1024
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
@@ -45,14 +46,22 @@ class MessageProgress:
         old_bytes = len(previous['content'].encode()) if previous else 0
         budget = max(0, MAX_CAPTURE_BYTES - self.capture_bytes + old_bytes)
         limit = min(PART_BYTES, budget)
-        # Provider step order is stable even if an SSE summary arrives after a poll.
-        if key.startswith('step:'):
+        # Keep identities stable and avoid collisions with reasoning and annotations.
+        if previous is not None:
+            sequence = previous['sequence']
+        elif key.startswith('step:'):
             sequence = int(key.split(':')[1]) + 1
             if sequence > 9998: return
         elif key == 'agent-status': sequence = 10000
         elif key == 'answer': sequence = 9999
         elif key == 'reasoning': sequence = 1
         else: sequence = previous['sequence'] if previous else len(self.parts) + 1
+        if previous is None and key not in ('answer', 'agent-status'):
+            occupied = {p['sequence'] for p in self.parts.values()}
+            while sequence in occupied and sequence <= 9998:
+                sequence += 1
+            if sequence > 9998:
+                return
         part = {'key': key, 'sequence': sequence,
                 'type': kind, 'content': raw[:limit].decode('utf-8', errors='ignore'), 'status': status,
                 'toolName': self.redactor.redact(tool_name)[:120], 'callId': self.redactor.redact(call_id)[:256],
@@ -60,7 +69,13 @@ class MessageProgress:
         if tool_kind:
             part['toolKind'] = tool_kind
         if payload is not None:
-            part['payload'] = payload
+            # A single oversized payload must not prevent the dirty queue draining.
+            clean_payload = sanitize(payload, secrets=self.redactor.secrets)
+            encoded_payload = json.dumps(clean_payload, ensure_ascii=False)
+            if len(encoded_payload.encode()) <= PART_BYTES:
+                part['payload'] = clean_payload
+            else:
+                part['truncated'] = True
         if part != previous:
             self.parts[key] = part
             self.capture_bytes += len(part['content'].encode()) - old_bytes
