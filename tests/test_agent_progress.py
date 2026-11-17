@@ -70,16 +70,74 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 9)
         self.assertEqual(delays, [2, 4, 8, 16, 30, 30, 30, 30])
 
-    async def test_stream_stops_on_permanent_rejection_and_cursorless_replay(self):
+    async def test_stream_stops_on_permanent_rejection(self):
         for response in [httpx.Response(403), httpx.Response(200, json={}),
-                         httpx.Response(200, headers={'content-type': 'text/event-stream'},
-                            text='event: step.delta\ndata: {"index":0,"delta":{"type":"text","text":"hello"}}\n\n')]:
+                         httpx.Response(400, json={'error': {'code': 'invalid_request', 'message': 'bad parameters'}})]:
             requests = []
             async def outbound(request): requests.append(request); return response
             async def sleep(_): self.fail('Unsupported streams must not loop')
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 await observe_progress(client, 'https://fixture.test/agent', 'fixture-key', MessageProgress(), sleep=sleep)
             self.assertEqual(len(requests), 1)
+
+    async def test_cursorless_replay_survives_precondition_and_saves_each_step_once(self):
+        writes, requests, delay = [], [], []
+        async def post(body): writes.append(json.loads(json.dumps(body))); return {'accepted': True}
+        p = MessageProgress(post=post)
+        def frame(kind, **data): return 'data: ' + json.dumps({'event_type': kind, **data}) + '\n\n'
+        def step(index, text):
+            return (frame('step.start', index=index, step={'type': 'model_output'})
+                    + frame('step.delta', index=index, delta={'type': 'text', 'text': text})
+                    + frame('step.stop', index=index))
+        async def outbound(request):
+            requests.append(request)
+            self.assertNotIn('last_event_id', request.url.params)
+            if len(requests) == 2:
+                return httpx.Response(400, json={'error': {'code': 'invalid_request', 'message': 'Precondition check failed.'}})
+            body = step(0, 'hello')
+            if len(requests) == 3:
+                body += step(1, 'world') + frame('interaction.completed', interaction={'status': 'completed'})
+            return httpx.Response(200, headers={'content-type': 'text/event-stream'}, text=body)
+        async def sleep(seconds): delay.append(seconds)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            await observe_progress(client, 'https://fixture/agent', 'fixture-key', p, sleep=sleep)
+        self.assertEqual(len(requests), 3)
+        self.assertEqual([p.parts[f'step:{index}']['content'] for index in [0, 1]], ['hello', 'world'])
+        saved = [part for batch in writes for part in batch['parts'] if part['key'] == 'step:0' and part['status'] == 'completed']
+        self.assertEqual(len(saved), 1, 'replaying an identical completed step must not rewrite it')
+        self.assertEqual([len(batch['parts']) for batch in writes], [1, 1])
+
+    async def test_step_stop_is_acked_before_reading_the_next_event(self):
+        writes, attempt = [], 0
+        async def post(body):
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1: raise RuntimeError('database temporarily unavailable')
+            writes.append(json.loads(json.dumps(body))); return {'accepted': True}
+        p = MessageProgress(post=post)
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"event_type":"step.start","index":0,"step":{"type":"text","text":"first"}}\n\n'
+                yield b'data: {"event_type":"step.stop","index":0}\n\n'
+                self_outer.assertEqual(len(writes), 1, 'next event must wait for the first step database ACK')
+                yield b'data: {"event_type":"interaction.completed","interaction":{"status":"completed"}}\n\n'
+        self_outer = self
+        async def outbound(request): return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Stream())
+        async def sleep(_): pass
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            await observe_progress(client, 'https://fixture/agent', 'fixture-key', p, sleep=sleep)
+        self.assertEqual(attempt, 2)
+        self.assertEqual(writes[0]['parts'][0]['content'], 'first')
+
+    async def test_closed_job_keeps_unacknowledged_step_in_spool(self):
+        async def post(body): return {'closed': True, 'accepted': False}
+        with tempfile.TemporaryDirectory() as directory:
+            p = MessageProgress(post=post, target=Path(directory) / 'progress.json')
+            p.put('step:0', 'text', 'unsaved')
+            await p.persist_step(0)
+            self.assertTrue(p.closed)
+            self.assertIn('step:0', p.dirty)
+            self.assertEqual(json.loads(p.target.read_text())['pending']['parts'][0]['content'], 'unsaved')
 
     async def test_stream_reconnect_backoff_can_be_canceled(self):
         entered = asyncio.Event()
