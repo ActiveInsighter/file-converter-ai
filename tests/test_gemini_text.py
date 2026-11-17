@@ -2,13 +2,16 @@ import asyncio
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 
-from gemini_text import (PocketBase, build_payload, create_key_pool, generate, parse_answer,
+from gemini_text import (PocketBase, build_payload, create_key_pool, generate, log_result, parse_answer,
                          recover, run_job, safe_error_code)
+from agent_trace import AgentTrace
 from key_pool import KeyPool
 
 
@@ -19,6 +22,27 @@ def job(concurrency=2):
 
 
 class TextPayloadTests(unittest.TestCase):
+    def test_complete_reply_is_chunked_redacted_and_cannot_inject_workflow_commands(self):
+        rows = []
+        log = AgentTrace(job='j' * 15, segment=2, secrets=['fixture-secret'], prefix='[gemini]',
+                         sink=lambda line, **_: rows.append(line))
+        reply = '中文' * 1998 + 'fixture-secret\n::error::not a command\n' + '末' * 5000
+        result = {'reply': reply, 'error': '', 'finishReason': 'STOP',
+                  'usage': {'totalTokenCount': 123, 'promptTokenCount': 100,
+                            'candidatesTokenCount': 23, 'cachedContentTokenCount': 80}}
+        log_result(log, result)
+        parsed = [json.loads(line.removeprefix('[gemini] ')) for line in rows]
+        self.assertEqual(parsed[0]['total_tokens'], 123)
+        self.assertEqual(parsed[0]['cached_tokens'], 80)
+        self.assertIsNone(parsed[0]['thought_tokens'])
+        self.assertEqual(''.join(row['text'] for row in parsed[1:]), log.redact(reply))
+        self.assertEqual([row['part'] for row in parsed[1:]], list(range(1, len(parsed))))
+        self.assertTrue(all(len(row['text']) <= 4000 for row in parsed[1:]))
+        self.assertTrue(all(row['job'] == 'j' * 15 and row['segment'] == 2 for row in parsed))
+        self.assertTrue(all(line.startswith('[gemini] ') and '\n' not in line for line in rows))
+        self.assertNotIn('fixture-secret', ''.join(rows))
+        self.assertEqual(result['reply'], reply)
+
     def test_only_text_and_explicit_prompts_no_pdf_rules(self):
         data = build_payload(job(), {"inputText": "# markdown"})
         self.assertEqual(data["contents"], [{"role": "user", "parts": [{"text": "shared prompt"}, {"text": "# markdown"}]}])
@@ -160,9 +184,19 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if path.endswith('/start'): return {"send": True}
                 raise RuntimeError('PB offline')
         async def answer(*_): return {"reply": 'unsaved reply', "error": '', "finishReason": 'STOP', "usage": {}}
+        logs = StringIO()
         with tempfile.TemporaryDirectory() as directory, patch('gemini_text.generate', side_effect=answer) as model:
-            result = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
+            with redirect_stdout(logs):
+                result = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
             self.assertEqual(result, 2)
+            rows = [json.loads(line.removeprefix('[gemini] ')) for line in logs.getvalue().splitlines()]
+            events = [row['event'] for row in rows]
+            self.assertLess(events.index('reply'), events.index('segment_error'))
+            self.assertEqual(next(row for row in rows if row['event'] == 'reply')['text'], 'unsaved reply')
+            error = next(row for row in rows if row['event'] == 'segment_error')
+            self.assertEqual(error['stage'], 'persistence')
+            self.assertEqual(error['error'], 'PB offline')
+            self.assertTrue(error['recovery_available'])
             self.assertEqual(model.call_count, 1)
             paths = list(Path(directory).glob('*.json'))
             self.assertEqual(len(paths), 1)
@@ -173,6 +207,36 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
             await recover(RecoveryPB(), Path(directory))
             self.assertEqual(saved[0][1]['executionId'], '123:1')
             self.assertEqual(model.call_count, 1)
+
+    async def test_job_summary_sums_each_segment_once_including_failed_reply(self):
+        value = job(2)
+        value['messages'] = value['messages'][:2]
+        async def pool_factory(_): return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+        class PB:
+            async def post(self, path, data, **kwargs):
+                if path.endswith('/claim'): return value
+                if path.endswith('/start'): return {'send': True}
+                return {}
+        async def answer(_client, _pool, _job, message):
+            failed = message['index'] == 2
+            return {'reply': 'partial answer' if failed else 'answer',
+                    'error': 'output limit' if failed else '', 'finishReason': 'MAX_TOKENS' if failed else 'STOP',
+                    'usage': {'totalTokenCount': 120, 'promptTokenCount': 100,
+                              'candidatesTokenCount': 20, 'cachedContentTokenCount': 80}}
+        logs = StringIO()
+        with tempfile.TemporaryDirectory() as directory, patch('gemini_text.generate', side_effect=answer), redirect_stdout(logs):
+            result = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
+        rows = [json.loads(line.removeprefix('[gemini] ')) for line in logs.getvalue().splitlines()]
+        summary = rows[-1]
+        self.assertEqual(result, 2)
+        self.assertEqual(summary['event'], 'job_summary')
+        self.assertEqual((summary['generated'], summary['saved'], summary['failed']), (2, 2, 1))
+        self.assertEqual(summary['total_tokens'], 240)
+        self.assertEqual(summary['cached_tokens'], 160)
+        self.assertEqual(summary['usage_reported_segments'], 2)
+        self.assertEqual(len([row for row in rows if row['event'] == 'segment_result']), 2)
+        self.assertEqual({row['segment'] for row in rows if row['event'] == 'reply'}, {1, 2})
+        self.assertIn('partial answer', logs.getvalue())
 
     async def test_cancel_or_ambiguous_permit_never_sends(self):
         value = job()

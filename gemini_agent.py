@@ -12,11 +12,12 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
 
-from agent_trace import AgentTrace, watch_interaction
+from agent_trace import AgentTrace, TERMINAL
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, prepare_github_context, task_text
 
@@ -29,7 +30,9 @@ MAX_REPLY_BYTES = 2 * 1024 * 1024
 
 def agent_telemetry(event, **fields):
     """Metadata only: no prompts, interaction IDs, credentials, or tool payloads."""
-    print('[agent.telemetry] ' + json.dumps({'event': event, **fields}, ensure_ascii=False, separators=(',', ':')), flush=True)
+    print('[agent.telemetry] ' + json.dumps({
+        'at': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+        'event': event, **fields}, ensure_ascii=False, separators=(',', ':')), flush=True)
 
 
 def agent_usage_diagnostics(data):
@@ -180,25 +183,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     payload = build_agent_payload(job, message)
     started = clock()
     trace = AgentTrace(job=job.get('id', os.environ.get('REQUEST_ID', '')),
-                       segment=message.get('index'), secrets=pool.keys, clock=clock)
-    original_checkpoint = checkpoint
-    checkpoint_report = started
-    async def checkpoint(update=None):
-        nonlocal checkpoint_report
-        began = clock()
-        try:
-            return await original_checkpoint(update)
-        finally:
-            if clock() - checkpoint_report >= 30 or clock() - began >= 1:
-                trace.emit('checkpoint_timing', seconds=round(clock() - began, 3), writing=update is not None)
-                checkpoint_report = clock()
+                       segment=message.get('index'), secrets=pool.keys, clock=clock, verbose=False)
+    def telemetry(event, **fields):
+        agent_telemetry(event, **trace.context, **fields)
     state = (await checkpoint()).get('state') or {}
     if not state.get('id'):
         context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
                                                task_text(job, message), trace=trace)
         if context:
             payload['system_instruction'] = payload.get('system_instruction', '') + '\n\nTrusted task context:\n' + json.dumps(context)
-    agent_telemetry('prepared',
+    telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
         github_enabled=bool(os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()),
@@ -211,9 +205,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     for attempt in range(max(1, len(pool.keys))):
         if not state.get('id') and (await checkpoint()).get('canceled'):
             raise AgentCanceled('Agent 已取消，未创建远程执行。')
-        acquire_started = clock()
         index, key, lease = await pool.acquire()
-        trace.emit('credential_acquired', wait_seconds=round(clock() - acquire_started, 3), key_index=index)
         fingerprint = hashlib.sha256(key.encode()).hexdigest()
         if state.get('id'):
             # Resume the original remote execution, never create a second interaction.
@@ -238,7 +230,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = data
             if not isinstance(data.get('id'), str) or not data['id']:
                 raise RuntimeError('Agent 未返回 interaction ID；未自动重发。')
-            agent_telemetry('created', elapsed_seconds=round(clock() - started, 2),
+            telemetry('created', elapsed_seconds=round(clock() - started, 2),
                             status=data.get('status', 'unknown'),
                             environment_created=bool(data.get('environment_id')))
             state = {'id': data['id'], 'credentialHash': fingerprint, 'status': data.get('status', 'in_progress')}
@@ -252,7 +244,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 raise
             break
         await pool.mark_error(index, lease, http_status=status)
-        print(f'[agent] create rejected attempt={attempt + 1}/{len(pool.keys)} HTTP={status}', flush=True)
         scope = provider.credential_error_scope(status, data)
         if scope:
             pool.retire_key(index, 'agent access unavailable')
@@ -268,8 +259,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
     url = f'{ROOT}/{quote(current["id"], safe="")}'
-    # Independent, read-only event stream; polling remains authoritative for control/results.
-    stream_task = asyncio.create_task(watch_interaction(client, url, key, trace))
+    # Normal execution uses authoritative polling only. Detailed SSE/tool replay
+    # remains available through the explicit read-only trace- diagnostic mode.
     deadline = clock() + job.get('options', {}).get('agent', {}).get('timeoutMinutes', 175) * 60
     failures = 0
     poll_count = 0
@@ -281,8 +272,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 await pool.mark_success(index, lease)
                 result = parse_interaction(current)
-                trace.snapshot(current)
-                agent_telemetry('completed',
+                telemetry('completed',
                     status=current['status'],
                     elapsed_seconds=round(clock() - started, 2),
                     polls=poll_count,
@@ -315,14 +305,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     raise upstream_error(status, data, key)
                 current, failures = data, 0
                 poll_count += 1
-                # Heartbeat and cumulative counters, never the response body or thoughts.
-                if current.get('status') != last_status or clock() - last_report >= 30:
+                # One useful progress line per minute, plus nonterminal status changes.
+                # Terminal usage is reported once above; cumulative counters are never summed.
+                if (current.get('status') not in TERMINAL
+                        and (current.get('status') != last_status or clock() - last_report >= 60)):
                     summary = agent_usage_diagnostics(current)
-                    agent_telemetry('progress', elapsed_seconds=round(clock() - started, 2),
+                    telemetry('progress', elapsed_seconds=round(clock() - started, 2),
                                     polls=poll_count, status=current.get('status', 'unknown'),
                                     **summary)
-                    trace.emit('poll_timing', http=status, seconds=round(clock() - poll_started, 3),
-                               polls=poll_count, status=current.get('status', 'unknown'), **summary)
                     last_status = current.get('status')
                     last_report = clock()
             except (httpx.TransportError, TimeoutError) as error:
@@ -346,8 +336,3 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         except Exception:
             pass
         raise
-    finally:
-        # A diagnostic failure must never alter execution or hide the actual result.
-        stream_task.cancel()
-        await asyncio.gather(stream_task, return_exceptions=True)
-        trace.summary('executor finished monitoring')
