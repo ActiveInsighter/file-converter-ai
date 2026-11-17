@@ -273,30 +273,27 @@ Git 恢复 JSON 不是回复恢复 JSON，不能交给 `--recover-dir`。恢复�
 
 ### Actions Agent 诊断日志
 
-Gemini 消息 workflow 的 `Send segments and save replies to PocketBase` 步骤输出 `[agent.telemetry]`
-JSON 行（`prepared` / `created` / `progress` / `completed`），只记录：
-使用模型、是否挂载 GitHub、工具**类型**、输入/系统提示词**字符数**、轮询次数、耗时、
-返回步骤的类型统计，以及 Google 原样返回的累计 `total_tokens`、
-`total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、
-`total_tool_use_tokens`、`total_cached_tokens`。该组计数日志不记录正文。
-日志不会把轮询的累计用量重复求和。
-`[gemini]` 行还会记录任务领取、分段开始、分段保存与总耗时。
+Gemini 消息 workflow 的 `Send segments and save replies to PocketBase` 步骤默认只输出有用信息：
 
-执行器同时以只读 SSE 连接已有 interaction，输出更详细的 `[agent.trace]` JSON 行：
+- `[gemini]` JSON 行的 `segment_result`：完成状态、finish reason、错误原因、生成耗时，
+  以及输入、输出、思考、工具、缓存和总 Token；未返回的计数为 `null`，不估算。
+- `reply`：完整 AI 回复，经凭据脱敏后每 4000 字符分块，使用 `part` / `parts` 标明顺序。
+  不截断长回复；JSON 转义换行及控制字符，避免回复文本被当作 Actions 命令。
+- `segment_saved`：数据库已确认保存。结果及回复在保存前打印；保存失败会输出
+  `segment_error` 的阶段、错误类型、原因与 `recovery_available`，区分模型问题和 PB 问题。
+- `job_summary`：总耗时、生成/保存/失败段数，各段最后一次返回用量的合计，
+  以及 `usage_reported_segments`。没有用量的段不补零；缓存属于输入的子集，不重复计入总计。
+- 每行包含 UTC 时间、任务 ID、分段序号（任务汇总不指定分段）和耗时，支持并发时定位。
 
-- 每行携带 UTC 时间、任务 ID、分段序号、从开始观察至今的耗时。
-- 工具调用和结果的类型、名称、脱敏参数/命令/输出预览；每项最多 1800 字符，
-  每次观察的正文预览总量最多约 1 MiB。输出预览不等同于完整工具日志。
-- 工具调用到结果的观察耗时；有 `call_id` 时精确关联，否则标注 `type_fifo_estimate`。
-- API 提供的 `thought_summary` 摘要；不打印内部原始思考或加密 signature。
-  Agent 未提供摘要时，只能看到 thought 阶段的起止，不能凭空补出内容。
-- 状态查询耗时、PB checkpoint 耗时、获取 Key 等待、HTTP 错误、事件流重连、
-  每 20 秒一次的空闲时间/待返回工具状态，以及末尾的阶段汇总。
+Agent 的 `[agent.telemetry]` 保留创建/完成信息及累计用量；同一状态的进度最多每分钟一次，
+终态用量只记录一次，不把每轮轮询的累计值相加。普通任务不订阅诊断 SSE，不打印工具参数、
+工具输出、思考摘要、20 秒心跳、checkpoint 耗时或结束时的整份步骤回放。
+HTTP 拒绝、连接中断等关键错误仍会保留并脱敏。数据库中的原始回复不受日志脱敏影响。
+AI 回复会进入 Actions 日志，日志可见性沿用仓库设置。
 
-SSE 断线时使用最后事件 ID 续接，并去重；事件流故障不影响原有轮询、取消和结果保存。
-日志会脱敏已配置的 API Key、PAT、PB 凭据、常见认证头及令牌字段。
-工具正文预览会出现在 Actions 日志中；公开仓库的日志也公开可读。
-**历史回放的事件到达间隔不代表原始执行耗时**，日志明确标注这一点。
+详细 `[agent.trace]` 仅用于显式的只读诊断，包含有界工具预览、事件重连及阶段汇总。
+工具预览每项最多 1800 字符、每次观察合计约 1 MiB；历史事件到达间隔不代表原始执行耗时。
+诊断与普通日志均会脱敏 API Key、PAT、PB 凭据、认证头和令牌字段。
 
 对正在运行或已结束的任务，可以用现有 workflow 启动只读诊断：
 

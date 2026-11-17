@@ -25,6 +25,20 @@ def event(kind, **fields):
 
 
 class TraceTests(unittest.TestCase):
+    def test_normal_trace_keeps_errors_and_suppresses_success_noise(self):
+        rows = []
+        trace = AgentTrace(verbose=False, secrets=['fixture-secret'],
+                           sink=lambda line, **_: rows.append(line))
+        for name in ('step_start', 'step_stop', 'snapshot_step', 'stream_heartbeat', 'checkpoint_timing'):
+            trace.emit(name)
+        trace.emit('create_http', http=200)
+        self.assertEqual(rows, [])
+        trace.emit('create_http', http=403, error='fixture-secret access denied')
+        trace.emit('poll_transport_error', error_type='ReadTimeout')
+        self.assertEqual(len(rows), 2)
+        self.assertIn('403', rows[0])
+        self.assertNotIn('fixture-secret', ''.join(rows))
+
     def make_trace(self):
         rows = []
         now = [10.0]
@@ -113,7 +127,7 @@ class TraceTests(unittest.TestCase):
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
-    async def test_diagnostic_failure_cannot_change_generation_or_cancel_remote(self):
+    async def test_normal_execution_never_opens_diagnostic_stream(self):
         from gemini_agent import generate_agent
         from key_pool import KeyPool
         requests, state = [], {}
@@ -130,11 +144,12 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError('diagnostic failed')
         async def sleep(_):
             await asyncio.sleep(0.001)
-        with patch('gemini_agent.watch_interaction', broken_observer):
+        with patch('agent_trace.watch_interaction', side_effect=broken_observer) as observer:
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 result = await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
                     {'model': 'Antigravity', 'prompt': 'hi', 'options': {}}, {'index': 1}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'answer')
+        observer.assert_not_called()
         self.assertEqual(requests, [('POST', '/v1beta/interactions'), ('GET', '/v1beta/interactions/saved')])
 
     async def test_workflow_trace_prefix_routes_without_claiming_job(self):

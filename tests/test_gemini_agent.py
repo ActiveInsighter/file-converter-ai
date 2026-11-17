@@ -134,6 +134,38 @@ class AgentPayloadTests(unittest.TestCase):
 
 
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_is_throttled_and_terminal_usage_is_reported_once(self):
+        now, polls = [0.0], 0
+        state = {}
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(seconds): now[0] += seconds
+        async def outbound(request):
+            nonlocal polls
+            self.assertNotIn('stream', request.url.params)
+            if request.method == 'POST':
+                return httpx.Response(200, json={'id': 'v1_agent', 'status': 'in_progress'})
+            polls += 1
+            completed = polls == 45
+            return httpx.Response(200, json={'id': 'v1_agent',
+                'status': 'completed' if completed else 'in_progress', 'output_text': 'answer' if completed else '',
+                'usage': {'total_tokens': polls * 10}})
+        logs = StringIO()
+        with redirect_stdout(logs):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100),
+                    {**job(), 'id': 'j' * 15}, {'index': 3}, checkpoint=checkpoint, sleep=sleep, clock=lambda: now[0])
+        rows = [json.loads(line.removeprefix('[agent.telemetry] ')) for line in logs.getvalue().splitlines()]
+        progress = [row for row in rows if row['event'] == 'progress']
+        self.assertEqual([row['elapsed_seconds'] for row in progress], [3, 63, 123])
+        completed = [row for row in rows if row['event'] == 'completed']
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]['usage']['total_tokens'], 450)
+        self.assertTrue(all(row['job'] == 'j' * 15 and row['segment'] == 3 for row in rows))
+        self.assertEqual(result['usage']['totalTokenCount'], 450)
+        self.assertNotIn('[agent.trace]', logs.getvalue())
+
     async def test_push_permission_failure_prevents_any_google_request(self):
         calls = []
         async def checkpoint(update=None):
@@ -180,7 +212,7 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"event":"prepared"', logs.getvalue())
         self.assertNotIn('budget_tokens', logs.getvalue())
         self.assertIn('"event":"created"', logs.getvalue())
-        self.assertIn('"event":"progress"', logs.getvalue())
+        self.assertNotIn('"event":"progress"', logs.getvalue())
         self.assertIn('"event":"completed"', logs.getvalue())
         self.assertIn('"step_types":{"model_output":1}', logs.getvalue())
         self.assertNotIn('fixture-secret', logs.getvalue())

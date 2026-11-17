@@ -23,8 +23,10 @@ TERMINAL = {'completed', 'failed', 'incomplete', 'requires_action', 'cancelled',
 
 
 class AgentTrace:
-    def __init__(self, *, job='', segment=None, secrets=(), clock=time.monotonic, sink=print):
+    def __init__(self, *, job='', segment=None, secrets=(), clock=time.monotonic, sink=print,
+                 verbose=True, prefix='[agent.trace]'):
         self.clock, self.sink = clock, sink
+        self.verbose, self.prefix = verbose, prefix
         self.started = self.last_event = clock()
         self.context = {'job': job, 'segment': segment}
         values = [*secrets]
@@ -77,6 +79,9 @@ class AgentTrace:
         return {'chars': len(raw), 'preview': preview, 'truncated': len(clean) > len(preview)}
 
     def emit(self, event, **fields):
+        if not self.verbose and not (event.endswith(('_error', '_failed'))
+                                     or event == 'create_http' and fields.get('http', 0) >= 400):
+            return
         row = {'at': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
                'event': event, **self.context, 'elapsed_seconds': round(self.clock() - self.started, 3), **fields}
         def clean(value):
@@ -87,7 +92,7 @@ class AgentTrace:
             if isinstance(value, list):
                 return [clean(v) for v in value]
             return value
-        self.sink('[agent.trace] ' + json.dumps(clean(row), ensure_ascii=False, separators=(',', ':')), flush=True)
+        self.sink(self.prefix + ' ' + json.dumps(clean(row), ensure_ascii=False, separators=(',', ':')), flush=True)
 
     def summary(self, reason):
         longest = sorted(({'index': i, 'type': s['type'], 'name': s.get('name'),

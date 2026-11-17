@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import re
-import time
 from pathlib import Path
 
 import httpx
@@ -19,8 +18,30 @@ import httpx
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
+from agent_trace import AgentTrace
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
+TOKEN_FIELDS = {
+    'input_tokens': 'promptTokenCount', 'output_tokens': 'candidatesTokenCount',
+    'thought_tokens': 'thoughtsTokenCount', 'cached_tokens': 'cachedContentTokenCount',
+    'tool_tokens': 'toolUseTokenCount', 'total_tokens': 'totalTokenCount',
+}
+
+
+def log_result(log, result):
+    """Log the answer once, before persistence; never dump prompts or tool output."""
+    usage = result.get('usage') or {}
+    # Redact the whole reply before chunking, including credentials spanning chunks.
+    reply = log.redact(result.get('reply') or '')
+    parts = [reply[i:i + 4000] for i in range(0, len(reply), 4000)]
+    log.emit('segment_result', status='failed' if result.get('error') else 'succeeded',
+             finish_reason=result.get('finishReason', ''), error=result.get('error', ''),
+             reply_chars=len(result.get('reply') or ''), reply_parts=len(parts),
+             **{name: usage.get(key) for name, key in TOKEN_FIELDS.items()},
+             steps=usage.get('agentStepCount'))
+    for index, text in enumerate(parts, 1):
+        # JSON keeps arbitrary model text from becoming GitHub workflow commands.
+        log.emit('reply', part=index, parts=len(parts), text=text)
 
 # Keep HTTP/error-category diagnostics; ordinary chat intentionally uses no tools.
 def safe_error_code(data: dict) -> str:
@@ -184,28 +205,34 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     path = f"jobs/{job_id}"
     identity = {"executionId": execution_id}
     job = await pb.post(f"{path}/claim", identity, retries=3)
-    print(f"[gemini] job claimed model={job['model']} segments={len(job['messages'])} "
-          f"concurrency={job['options']['concurrency']}", flush=True)
     pool = await pool_factory(job["options"])
+    job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
+    job_log.emit('job_started', model=job['model'], segments=len(job['messages']),
+                 concurrency=job['options']['concurrency'])
     queue = asyncio.Queue()
     for message in job["messages"]:
         if message["status"] == "queued":
             queue.put_nowait(message)
     work_dir.mkdir(parents=True, exist_ok=True)
     failures = []
+    usages = []
+    counts = {'saved': 0, 'skipped': 0, 'canceled': 0}
 
     async def worker():
         while not queue.empty():
             message = queue.get_nowait()
             endpoint = f"{path}/messages/{message['id']}"
+            log = AgentTrace(job=job_id, segment=message['index'], secrets=pool.keys, prefix='[gemini]')
+            stage = 'permit'
             try:
-                begun = time.monotonic()
                 # Not retried: a lost permit is not permission to send twice.
                 permit = await pb.post(f"{endpoint}/start", identity)
                 if not permit.get("send"):
-                    print(f"[gemini] segment={message['index']} skipped: no send permit", flush=True)
+                    counts['skipped'] += 1
+                    log.emit('segment_skipped', reason='no send permit')
                     continue
-                print(f"[gemini] segment={message['index']} started agent={is_antigravity(job['model'])}", flush=True)
+                log.emit('segment_started', model=job['model'])
+                stage = 'generation'
                 try:
                     if is_antigravity(job['model']):
                         async def checkpoint(state=None):
@@ -214,6 +241,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     else:
                         result = await generate(client, pool, job, message)
                 except AgentCanceled:
+                    counts['canceled'] += 1
+                    log.emit('segment_canceled')
                     continue
                 except Exception as error:
                     # Never include provider bodies, credentials, or source text in logs.
@@ -223,29 +252,26 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")
                     result = {"reply": "", "error": detail[:1800], "finishReason": "", "usage": {}}
+                usages.append(result.get('usage') or {})
+                log_result(log, result)
+                stage = 'recovery_write'
                 saved = {**identity, **result}
                 target = work_dir / f"{message['id']}.json"
                 temporary = target.with_suffix(".tmp")
                 temporary.write_text(json.dumps({"jobId": job_id, "messageId": message["id"], "result": saved}, ensure_ascii=False), encoding="utf-8")
                 temporary.replace(target)
+                stage = 'persistence'
                 # Retrying persistence cannot trigger another Gemini request.
                 await pb.post(f"{endpoint}/complete", saved, retries=5)
                 target.unlink()
-                usage = result.get('usage') or {}
-                print(f"[gemini] segment={message['index']} saved "
-                      f"status={'failed' if result['error'] else 'succeeded'} "
-                      f"elapsed_seconds={time.monotonic() - begun:.2f} "
-                      f"total_tokens={usage.get('totalTokenCount', 'unknown')} "
-                      f"input_tokens={usage.get('promptTokenCount', 'unknown')} "
-                      f"output_tokens={usage.get('candidatesTokenCount', 'unknown')} "
-                      f"thought_tokens={usage.get('thoughtsTokenCount', 'unknown')} "
-                      f"tool_tokens={usage.get('toolUseTokenCount', 'unknown')} "
-                      f"steps={usage.get('agentStepCount', 'unknown')}", flush=True)
+                counts['saved'] += 1
+                log.emit('segment_saved', status='failed' if result['error'] else 'succeeded')
                 if result["error"]:
                     failures.append(message["id"])
-            except Exception:
+            except Exception as error:
                 failures.append(message["id"])
-                print(f"[gemini] segment={message['index']} persistence/permit failed; check PB and recovery artifact", flush=True)
+                log.emit('segment_error', stage=stage, error_type=type(error).__name__,
+                         error=log.redact(str(error))[:1800], recovery_available=(work_dir / f"{message['id']}.json").exists())
             finally:
                 queue.task_done()
 
@@ -253,6 +279,14 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
         await asyncio.gather(*(worker() for _ in range(job["options"]["concurrency"])))
     finally:
         await pool.close()
+    totals = {}
+    for name, key in TOKEN_FIELDS.items():
+        values = [usage.get(key) for usage in usages]
+        reported = [value for value in values if type(value) is int]
+        totals[name] = sum(reported) if reported else None
+    job_log.emit('job_summary', status='failed' if failures else 'canceled' if counts['canceled'] else 'completed',
+                 generated=len(usages), failed=len(failures), **counts, **totals,
+                 usage_reported_segments=sum(type(usage.get('totalTokenCount')) is int for usage in usages))
     return 2 if failures else 0
 
 
