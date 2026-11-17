@@ -181,6 +181,12 @@ class PocketBase:
                     raise RuntimeError("PB connection failed; no model request was re-sent") from None
             await asyncio.sleep(min(16, 2 ** attempt))
 
+    async def checkpoint(self, path: str, identity: dict, state=None):
+        # Checkpoints are idempotent for the recorded interaction. A service
+        # restart can leave the public proxy returning 502 longer than 1+2+4s;
+        # keep the same execution identity through that recovery window.
+        return await self.post(path, {**identity, **({'state': state} if state is not None else {})}, retries=12)
+
 
 async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None) -> dict:
     if is_antigravity(job['model']):
@@ -405,7 +411,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 try:
                     if is_antigravity(job['model']):
                         async def checkpoint(state=None):
-                            return await pb.post(f"{endpoint}/checkpoint", {**identity, **({'state': state} if state is not None else {})}, retries=3)
+                            return await pb.checkpoint(f"{endpoint}/checkpoint", identity, state)
                         result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress)
                     else:
                         result = await generate(client, pool, job, message, progress=progress)
