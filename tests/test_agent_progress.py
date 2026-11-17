@@ -7,13 +7,76 @@ from unittest.mock import patch
 
 import httpx
 
-from agent_progress import MessageProgress, MAX_CAPTURE_BYTES
+from agent_progress import MessageProgress, MAX_CAPTURE_BYTES, observe_progress
 from gemini_agent import generate_agent
 from gemini_text import generate
 from key_pool import KeyPool
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_agent_reconnects_past_six_streams_and_keeps_cursor(self):
+        p = MessageProgress()
+        requests, delays = [], []
+        async def outbound(request):
+            requests.append(request)
+            number = len(requests)
+            self.assertEqual(request.method, 'GET')
+            self.assertEqual(request.url.params.get('last_event_id'), f'event-{number - 1}' if number > 1 else None)
+            data = {'index': number - 1, 'step': {'type': 'function_call', 'name': f'tool-{number}'}}
+            kind = 'step.start'
+            if number == 9:
+                # Providers can put the event name in JSON rather than SSE's event field.
+                data = {'event_type': 'interaction.completed', 'interaction': {'status': 'completed'}}
+                kind = ''
+            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                text=f'id: event-{number}\nevent: {kind}\ndata: {json.dumps(data)}\n\n')
+        async def sleep(delay): delays.append(delay)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            await observe_progress(client, 'https://fixture.test/agent', 'fixture-key', p, sleep=sleep)
+        self.assertEqual(len(requests), 9)
+        self.assertEqual(len(delays), 8)
+        self.assertIn('step:7', p.parts)
+        self.assertEqual(p.usage['agentStepCount'], 8)
+        p.snapshot({'status': 'in_progress'})
+        self.assertEqual(p.usage['agentStepCount'], 8)
+
+    async def test_stream_retries_transient_failures_before_first_event(self):
+        p = MessageProgress()
+        attempts, delays = 0, []
+        async def outbound(request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1: raise httpx.ConnectError('fixture-key must not be logged')
+            if attempts < 9: return httpx.Response(503)
+            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                text='data: {"event_type":"interaction.completed","interaction":{"status":"completed"}}\n\n')
+        async def sleep(delay): delays.append(delay)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            await observe_progress(client, 'https://fixture.test/agent', 'fixture-key', p, sleep=sleep)
+        self.assertEqual(attempts, 9)
+        self.assertEqual(delays, [2, 4, 8, 16, 30, 30, 30, 30])
+
+    async def test_stream_stops_on_permanent_rejection_and_cursorless_replay(self):
+        for response in [httpx.Response(403), httpx.Response(200, json={}),
+                         httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                            text='event: step.delta\ndata: {"index":0,"delta":{"type":"text","text":"hello"}}\n\n')]:
+            requests = []
+            async def outbound(request): requests.append(request); return response
+            async def sleep(_): self.fail('Unsupported streams must not loop')
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                await observe_progress(client, 'https://fixture.test/agent', 'fixture-key', MessageProgress(), sleep=sleep)
+            self.assertEqual(len(requests), 1)
+
+    async def test_stream_reconnect_backoff_can_be_canceled(self):
+        entered = asyncio.Event()
+        async def outbound(request): return httpx.Response(503)
+        async def sleep(_): entered.set(); await asyncio.Event().wait()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            observer = asyncio.create_task(observe_progress(client, 'https://fixture.test/agent', 'fixture-key', MessageProgress(), sleep=sleep))
+            await entered.wait()
+            observer.cancel()
+            with self.assertRaises(asyncio.CancelledError): await observer
+
     def test_snapshot_retains_only_public_summaries_and_redacts_tools(self):
         progress = MessageProgress(secrets=['fixture-api-key'])
         source = {'status': 'in_progress', 'steps': [

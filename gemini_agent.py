@@ -347,6 +347,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     summary = agent_usage_diagnostics(current)
                     telemetry('progress', elapsed_seconds=round(clock() - started, 2),
                                     polls=poll_count, status=current.get('status', 'unknown'),
+                                    **({'event_observer_active': observer is not None and not observer.done(),
+                                        'observed_step_count': progress.usage.get('agentStepCount', 0)}
+                                       if progress is not None else {}),
                                     **summary)
                     last_status = current.get('status')
                     last_report = clock()

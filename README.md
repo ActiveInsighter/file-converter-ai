@@ -351,7 +351,11 @@ CLI 也支持 `--svg-enabled --svg-provider gemini --svg-model <模型>`，以�
 
 Gemini 消息执行器现在每 5 秒将变化内容和累计 Token 写入 PocketBase，Antigravity 的工具调用、
 工具结果和公开思考摘要按序保存；普通 Gemini 使用流式文本写相同内容分段。Remote 从数据库
-增量读取，刷新页面可恢复已保存过程。SSE 断开时使用 interaction 快照，不重新创建执行。
+增量读取，刷新页面可恢复已保存过程。SSE 断开后，在任务整个生命周期内使用事件游标继续重连，
+并持续轮询 interaction 状态，不重新创建执行。非终态快照可能只返回状态、不含步骤或用量，
+不能靠快照补齐事件流；重连失败会记录原因与退避时间。暂时故障在收到首个事件前也会重试，
+永久拒绝或没有事件游标的内容流会明确记录降级原因，避免重放增量造成重复内容。
+Actions 每分钟的状态日志同时记录事件观察器是否仍运行及已观察步骤数，区分快照步骤数与事件步骤数。
 上传失败保留恢复文件，最终完成前补传；Actions recovery artifact 同时包含 `*.progress.json` 过程恢复文件。
 先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
 完整接口及发布设计见后端 `docs/agent-message-stream.md`。
