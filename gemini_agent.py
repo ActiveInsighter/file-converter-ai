@@ -135,13 +135,14 @@ def build_agent_payload(job, message, *, environment_id=None, previous_interacti
     input_parts = [job.get('prompt', ''), message.get('inputText', '')]
     if not prev_interaction:
         input_parts = [*[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])], *input_parts]
+    agent_model = str(options.get('model') or job.get('options', {}).get('agentModel') or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     payload = {
         'agent': options.get('id') or (DEFAULT_AGENT if name == 'antigravity' else name),
         'input': '\n\n'.join(value for value in input_parts if value),
         'background': True, 'store': True,
         'environment': reused_env if reused_env else {'type': 'remote'},
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
-        'agent_config': {'type': 'antigravity', 'model': options.get('model', DEFAULT_MODEL)},
+        'agent_config': {'type': 'antigravity', 'model': agent_model},
     }
     if prev_interaction:
         payload['previous_interaction_id'] = prev_interaction

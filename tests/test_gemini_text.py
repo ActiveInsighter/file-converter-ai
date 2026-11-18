@@ -423,6 +423,51 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100), job(), job()['messages'][0])
         self.assertEqual(calls, 1)
 
+    def test_thinking_config_adapts_by_gemini_model_family(self):
+        def make_job(model, thinking):
+            j = job()
+            j["model"] = model
+            j["options"]["thinkingLevel"] = thinking
+            return j
+
+        p25 = build_payload(make_job("gemini-2.5-flash", "high"), {"inputText": "hi"})
+        self.assertEqual(p25["generationConfig"]["thinkingConfig"], {"thinkingBudget": 24576, "includeThoughts": True})
+
+        p25_off = build_payload(make_job("gemini-2.5-flash", "off"), {"inputText": "hi"})
+        self.assertEqual(p25_off["generationConfig"]["thinkingConfig"], {"thinkingBudget": 0, "includeThoughts": False})
+
+        p25_pro_off = build_payload(make_job("gemini-2.5-pro", "off"), {"inputText": "hi"})
+        self.assertEqual(p25_pro_off["generationConfig"]["thinkingConfig"], {"thinkingBudget": 128, "includeThoughts": False})
+
+        p3 = build_payload(make_job("models/gemini-3-flash-preview", "medium"), {"inputText": "hi"})
+        self.assertEqual(p3["generationConfig"]["thinkingConfig"], {"thinkingLevel": "medium", "includeThoughts": True})
+
+        p20 = build_payload(make_job("gemini-2.0-flash", "high"), {"inputText": "hi"})
+        self.assertNotIn("thinkingConfig", p20["generationConfig"])
+
+    async def test_env_model_and_thinking_level_override_claimed_job(self):
+        value = job()
+        seen = {}
+        async def pool_factory(_):
+            return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+        class PB:
+            async def post(self, path, data, **kwargs):
+                if path.endswith('/claim'):
+                    return value
+                if path.endswith('/start'):
+                    return {"send": True}
+                return {}
+        async def fake_generate(client, pool, claimed_job, message, **kwargs):
+            seen["model"] = claimed_job["model"]
+            seen["thinkingLevel"] = claimed_job["options"]["thinkingLevel"]
+            return {"reply": "ok", "error": "", "finishReason": "STOP", "usage": {}}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict("os.environ", {"GEMINI_MODEL": "models/gemini-2.5-pro", "GEMINI_THINKING_LEVEL": "high"}), \
+             patch("gemini_text.generate", side_effect=fake_generate):
+            rc = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, {"model": "gemini-2.5-pro", "thinkingLevel": "high"})
+
 
 if __name__ == '__main__':
     unittest.main()

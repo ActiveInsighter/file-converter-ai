@@ -83,19 +83,49 @@ async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") 
         rpm_per_key=options["rpmPerKey"], rpd_per_key=options["rpdPerKey"])
 
 
+def normalize_model_name(model: str) -> str:
+    return str(model or "").strip().removeprefix("models/")
+
+
+def build_thinking_config(model: str, thinking_level: str) -> dict | None:
+    name = normalize_model_name(model).lower()
+    level = str(thinking_level or "").strip().lower()
+    if name.startswith("gemini-2.5"):
+        is_pro = "pro" in name
+        if level == "off":
+            return {"thinkingBudget": 128 if is_pro else 0, "includeThoughts": False}
+        budget_map = {"minimal": 1024, "low": 2048, "medium": 8192, "high": 24576}
+        if level in budget_map:
+            return {"thinkingBudget": budget_map[level], "includeThoughts": True}
+        return {"includeThoughts": True}
+    if name.startswith(("gemini-3", "gemini-4")) or "-latest" in name or "thinking" in name:
+        if level == "off":
+            return {"thinkingLevel": "minimal", "includeThoughts": False}
+        config: dict = {"includeThoughts": True}
+        if level in ("minimal", "low", "medium", "high"):
+            config["thinkingLevel"] = level
+        return config
+    if name.startswith(("gemini-1.", "gemini-2.0", "gemma-")):
+        return None
+    # Unknown/custom model names: honor explicit thinkingLevel if provided.
+    if level in ("minimal", "low", "medium", "high"):
+        return {"thinkingLevel": level}
+    return None
+
+
 def build_payload(job: dict, message: dict) -> dict:
     parts = [{"text": value} for value in (job.get("prompt", ""), message.get("inputText", "")) if value]
     options = job["options"]
+    model_name = normalize_model_name(job["model"])
     payload = GeminiProvider().build_payload(
-        job["model"], parts, thinking_level=options.get("thinkingLevel", ""),
+        model_name, parts, thinking_level=options.get("thinkingLevel", ""),
         max_output_tokens=options["maxOutputTokens"],
     )
-    if not options.get('thinkingLevel'):
-        payload['generationConfig']['thinkingConfig'].pop('thinkingLevel', None)
-    if job['model'].startswith(('gemini-2.5', 'gemini-3', 'gemini-4')):
-        payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
-    elif not options.get('thinkingLevel'):
-        payload['generationConfig'].pop('thinkingConfig', None)
+    thinking_config = build_thinking_config(model_name, options.get("thinkingLevel", ""))
+    if thinking_config is None:
+        payload["generationConfig"].pop("thinkingConfig", None)
+    else:
+        payload["generationConfig"]["thinkingConfig"] = thinking_config
     if options.get('responseMimeType'):
         payload['generationConfig']['responseMimeType'] = str(options['responseMimeType'])
     if isinstance(options.get('responseSchema'), dict):
@@ -209,7 +239,7 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
         try:
             async with asyncio.timeout(180):
                 # Gemini responses are bounded too, even for a chunked HTTP response.
-                endpoint = provider.endpoint(provider.default_base_url, job["model"])
+                endpoint = provider.endpoint(provider.default_base_url, normalize_model_name(job["model"]))
                 if progress is not None:
                     endpoint = endpoint.replace(':generateContent', ':streamGenerateContent') + '?alt=sse'
                 async with client.stream("POST", endpoint,
@@ -372,6 +402,12 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     path = f"jobs/{job_id}"
     identity = {"executionId": execution_id}
     job = await pb.post(f"{path}/claim", identity, retries=3)
+    env_model = normalize_model_name(os.environ.get("GEMINI_MODEL", ""))
+    if env_model:
+        job["model"] = env_model
+    env_thinking = os.environ.get("GEMINI_THINKING_LEVEL", "").strip().lower()
+    if env_thinking:
+        job.setdefault("options", {})["thinkingLevel"] = env_thinking
     pool = await pool_factory(job["options"])
     job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
     antigravity = is_antigravity(job['model'])
