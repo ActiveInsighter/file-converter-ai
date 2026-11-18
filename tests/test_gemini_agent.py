@@ -386,7 +386,10 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
             pb = type('PB', (), {'root': 'https://pb.example.com', 'token': 'pb-tok', 'client': client})()
             task = {**job(), 'parentMessage': 'msg_parent_1', 'history': [{'role': 'user', 'text': 'first'}]}
-            result = await generate_agent(client, KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100), task, {}, checkpoint=checkpoint, sleep=sleep, pb=pb)
+            pool = KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100)
+            result = await generate_agent(client, pool, task, {}, checkpoint=checkpoint, sleep=sleep, pb=pb)
+        self.assertEqual(pool.used, [0, 1])
+        self.assertEqual(pool.disabled_keys, {})
         self.assertEqual(result['reply'], 'continued ok')
         self.assertEqual(sent_keys, ['key-2', 'key-2'])
         self.assertEqual(sent_bodies[0]['environment'], 'env_reused_1')
@@ -395,6 +398,7 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['response']['metadata']['environment_id'], 'env_reused_1')
 
     async def test_generate_agent_falls_back_to_fresh_environment_when_expired(self):
+        import hashlib
         sent_bodies = []
         state = {}
         async def checkpoint(update=None):
@@ -406,7 +410,8 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             if request.url.host == 'pb.example.com':
                 return httpx.Response(200, json={
                     'id': 'msg_parent_old',
-                    'providerState': {'id': 'v1_old', 'environmentId': 'env_expired'},
+                    'providerState': {'id': 'v1_old', 'environmentId': 'env_expired',
+                                      'credentialHash': hashlib.sha256(b'key-1').hexdigest()},
                 })
             if request.method == 'POST':
                 body = json.loads(request.content)

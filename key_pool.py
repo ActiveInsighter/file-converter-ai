@@ -219,15 +219,17 @@ class KeyPool:
     def _ready_at(self, bucket: Bucket) -> float:
         return max(bucket.next_allowed, bucket.cooldown_until)
 
-    async def acquire(self) -> tuple[int, str, str]:
+    async def acquire(self, *, key_index: int | None = None) -> tuple[int, str, str]:
+        buckets = self.buckets if key_index is None else [self.bucket_of[key_index]]
         waiting_since = self.clock()
         while True:
             async with self.lock:
                 now = self.clock()
                 live = [
-                    bucket for bucket in self.buckets
+                    bucket for bucket in buckets
                     if not bucket.disabled and bucket.used < self.rpd_per_key
-                    and any(index not in self.disabled_keys for index in bucket.keys)
+                    and any(index not in self.disabled_keys for index in bucket.keys
+                            if key_index is None or index == key_index)
                 ]
                 if not live:
                     raise QuotaPoolExhaustedError(
@@ -238,8 +240,11 @@ class KeyPool:
                 if ready and self.next_global <= now:
                     bucket = min(ready, key=lambda b: (b.used, b.last_used, random.random()))
                     available = [i for i in bucket.keys if i not in self.disabled_keys]
-                    index = available[bucket.turn % len(available)]
-                    bucket.turn += 1
+                    if key_index is None:
+                        index = available[bucket.turn % len(available)]
+                        bucket.turn += 1
+                    else:
+                        index = key_index
                     bucket.used += 1
                     bucket.last_used = now
                     # Small jitter keeps buckets from lining up on the same tick.

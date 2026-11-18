@@ -75,58 +75,56 @@ def _parse_provider_state(raw):
 
 
 async def resolve_previous_agent_context(pb, job):
-    options = job.get('options', {}).get('agent', {})
-    env_id = str(options.get('environmentId') or job.get('environmentId') or '').strip()
-    prev_id = str(options.get('previousInteractionId') or job.get('previousInteractionId') or '').strip()
-    cred_hash = str(options.get('credentialHash') or '').strip()
-    if env_id:
-        return {'environment_id': env_id, 'previous_interaction_id': prev_id or None, 'credential_hash': cred_hash or None}
-    if pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None):
-        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+    if 'agentContext' in job:
+        context = job['agentContext'] or {}
+        return {
+            'environment_id': context.get('environmentId'),
+            'previous_interaction_id': context.get('interactionId'),
+            'credential_hash': context.get('credentialHash'),
+        }
+    # Compatibility with PocketBase versions where claim omits Agent context.
+    if len(job.get('messages', [])) > 1 or pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None):
+        return {}
 
     parent_message_id = str(job.get('parentMessage') or '').strip()
-    replaces_message_id = str(job.get('replacesMessage') or '').strip()
     headers = {'Authorization': pb.token}
 
-    if not parent_message_id and not replaces_message_id and job.get('id'):
+    if not parent_message_id and job.get('id'):
         try:
             resp = await pb.client.get(
                 f"{pb.root}/api/collections/aw_gemini_jobs/records/{quote(str(job['id']), safe='')}",
                 headers=headers,
-                params={'fields': 'parentMessage,replacesMessage'},
+                params={'fields': 'parentMessage'},
                 timeout=15,
             )
             if resp.status_code == 200:
                 record = resp.json()
                 parent_message_id = str(record.get('parentMessage') or '').strip()
-                replaces_message_id = str(record.get('replacesMessage') or '').strip()
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError):
+            return {}
 
-    target_message_id = parent_message_id or replaces_message_id
-    if not target_message_id:
-        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+    if not parent_message_id:
+        return {}
 
     try:
         resp = await pb.client.get(
-            f"{pb.root}/api/collections/aw_gemini_messages/records/{quote(target_message_id, safe='')}",
+            f"{pb.root}/api/collections/aw_gemini_messages/records/{quote(parent_message_id, safe='')}",
             headers=headers,
             params={'fields': 'id,job,providerState'},
             timeout=15,
         )
         if resp.status_code != 200:
-            return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+            return {}
         state = _parse_provider_state(resp.json().get('providerState'))
-        resolved_env = str(state.get('environmentId') or '').strip() or None
-        resolved_prev = (str(state.get('id') or '').strip() or None) if parent_message_id else None
-        resolved_hash = str(state.get('credentialHash') or '').strip() or None
+        if state.get('status') not in (None, 'completed'):
+            return {}
         return {
-            'environment_id': resolved_env,
-            'previous_interaction_id': resolved_prev,
-            'credential_hash': resolved_hash,
+            'environment_id': state.get('environmentId'),
+            'previous_interaction_id': state.get('id'),
+            'credential_hash': state.get('credentialHash'),
         }
-    except Exception:
-        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+    except (httpx.HTTPError, ValueError):
+        return {}
 
 
 def build_agent_payload(job, message, *, environment_id=None, previous_interaction_id=None):
@@ -279,23 +277,19 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     def telemetry(event, **fields):
         agent_telemetry(event, **trace.context, **fields)
     state = (await checkpoint()).get('state') or {}
-    prev_ctx = {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
-    if not state.get('id'):
-        prev_ctx = await resolve_previous_agent_context(pb, job)
-    reusing_remote = bool(prev_ctx.get('environment_id') or prev_ctx.get('previous_interaction_id'))
-    payload = build_agent_payload(
-        job,
-        message,
-        environment_id=prev_ctx.get('environment_id'),
-        previous_interaction_id=prev_ctx.get('previous_interaction_id'),
-    )
-    preferred_hash = prev_ctx.get('credential_hash')
-    if preferred_hash and not any(hashlib.sha256(k.encode()).hexdigest() == preferred_hash for k in pool.keys):
-        preferred_hash = None
-        if reusing_remote:
-            telemetry('environment_fallback', reason='credential_missing')
-            reusing_remote = False
-            payload = build_agent_payload(job, message)
+    resumed = bool(state.get('id'))
+    context = {} if resumed else await resolve_previous_agent_context(pb, job)
+    preferred_hash = state.get('credentialHash') if resumed else context.get('credential_hash')
+    preferred_key = next((i for i, k in enumerate(pool.keys) if hashlib.sha256(k.encode()).hexdigest() == preferred_hash), None)
+    if resumed and preferred_key is None:
+        raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
+    reusing_remote = bool(context.get('environment_id') and context.get('previous_interaction_id'))
+    if reusing_remote and preferred_key is None:
+        telemetry('environment_fallback', reason='credential_missing')
+        reusing_remote = False
+    payload = build_agent_payload(job, message,
+        environment_id=context['environment_id'] if reusing_remote else None,
+        previous_interaction_id=context['previous_interaction_id'] if reusing_remote else None)
     telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
@@ -303,29 +297,21 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         github_mcp_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
         input_chars=len(payload['input']),
         system_chars=len(payload.get('system_instruction', '')),
-        resumed=bool(state.get('id')),
+        resumed=resumed,
         reused_environment=isinstance(payload.get('environment'), str),
         continued_interaction=bool(payload.get('previous_interaction_id')))
     index = key = lease = None
     current = None
-    fell_back_to_fresh = False
-    for attempt in range(max(1, len(pool.keys) + (1 if reusing_remote else 0))):
-        if not state.get('id') and (await checkpoint()).get('canceled'):
+    attempts = len(pool.keys) + int(reusing_remote)
+    for attempt in range(attempts):
+        if not resumed and (await checkpoint()).get('canceled'):
             raise AgentCanceled('Agent 已取消，未创建远程执行。')
-        index, key, lease = await pool.acquire()
+        index, key, lease = await pool.acquire(key_index=preferred_key if resumed or reusing_remote else None)
         fingerprint = hashlib.sha256(key.encode()).hexdigest()
-        if state.get('id'):
+        if resumed:
             # Resume the original remote execution, never create a second interaction.
-            if state.get('credentialHash') != fingerprint:
-                await pool.mark_cancelled(index, lease)
-                pool.retire_key(index, 'different interaction credential')
-                continue
             current = {'id': state['id'], 'status': 'in_progress'}
             break
-        if preferred_hash and fingerprint != preferred_hash and not fell_back_to_fresh:
-            await pool.mark_cancelled(index, lease)
-            pool.retire_key(index, 'different environment credential')
-            continue
         try:
             create_started = clock()
             status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
@@ -345,8 +331,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                             status=data.get('status', 'unknown'),
                             environment_created=bool(data.get('environment_id')))
             state = {'id': data['id'], 'credentialHash': fingerprint, 'status': data.get('status', 'in_progress')}
-            if isinstance(data.get('environment_id'), str):
-                state['environmentId'] = data['environment_id']
+            environment_id = data.get('environment_id') or (payload['environment'] if reusing_remote else None)
+            if isinstance(environment_id, str):
+                state['environmentId'] = environment_id
             try:
                 await checkpoint(state)
             except Exception:
@@ -354,10 +341,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await cancel_interaction(client, f'{ROOT}/{quote(data["id"], safe="")}', key)
                 raise
             break
-        if status in (400, 404) and reusing_remote and not fell_back_to_fresh:
-            fell_back_to_fresh = True
+        if status in (400, 404) and reusing_remote:
             reusing_remote = False
-            preferred_hash = None
             await pool.mark_cancelled(index, lease)
             telemetry('environment_fallback', reason='upstream_rejected', http=status)
             payload = build_agent_payload(job, message)
@@ -372,7 +357,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         else:
             # A definite rejected POST is safe to report, without guessing other IDs.
             raise upstream_error(status, data, key)
-        if attempt + 1 >= max(1, len(pool.keys)):
+        if reusing_remote or attempt + 1 >= attempts:
             raise upstream_error(status, data, key)
     if current is None:
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')

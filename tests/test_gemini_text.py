@@ -108,16 +108,15 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                     'environment_id': 'shared-sandbox', 'output_text': 'marker found'})
 
             self.assertEqual(request.headers['Authorization'], 'fixture-pb-token')
-            if request.method == 'GET':
-                # The deployed claim API omits relationship fields.
-                if path[3] == 'aw_gemini_jobs':
-                    parent = first_message if path[-1] == second_id else ''
-                    return httpx.Response(200, json={'parentMessage': parent})
-                self.assertEqual(path[-1], first_message)
-                return httpx.Response(200, json={'providerState': states[first_message]})
+            self.assertEqual(request.method, 'POST')
             action = path[-1]
             if action == 'claim':
-                return httpx.Response(200, json=jobs[path[-2]])
+                context = None
+                if path[-2] == second_id:
+                    parent = states[first_message]
+                    context = {'environmentId': parent['environmentId'], 'interactionId': parent['id'],
+                               'credentialHash': parent['credentialHash']}
+                return httpx.Response(200, json={**jobs[path[-2]], 'agentContext': context})
             if action == 'start':
                 return httpx.Response(200, json={'send': True})
             body = json.loads(request.content)
