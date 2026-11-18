@@ -62,19 +62,91 @@ def is_antigravity(model):
     return value == 'antigravity' or value.startswith('antigravity-')
 
 
-def build_agent_payload(job, message):
+def _parse_provider_state(raw):
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            return {}
+    return {}
+
+
+async def resolve_previous_agent_context(pb, job):
+    options = job.get('options', {}).get('agent', {})
+    env_id = str(options.get('environmentId') or job.get('environmentId') or '').strip()
+    prev_id = str(options.get('previousInteractionId') or job.get('previousInteractionId') or '').strip()
+    cred_hash = str(options.get('credentialHash') or '').strip()
+    if env_id:
+        return {'environment_id': env_id, 'previous_interaction_id': prev_id or None, 'credential_hash': cred_hash or None}
+    if pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None):
+        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+
+    parent_message_id = str(job.get('parentMessage') or '').strip()
+    replaces_message_id = str(job.get('replacesMessage') or '').strip()
+    headers = {'Authorization': pb.token}
+
+    if not parent_message_id and not replaces_message_id and job.get('id'):
+        try:
+            resp = await pb.client.get(
+                f"{pb.root}/api/collections/aw_gemini_jobs/records/{quote(str(job['id']), safe='')}",
+                headers=headers,
+                params={'fields': 'parentMessage,replacesMessage'},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                record = resp.json()
+                parent_message_id = str(record.get('parentMessage') or '').strip()
+                replaces_message_id = str(record.get('replacesMessage') or '').strip()
+        except Exception:
+            pass
+
+    target_message_id = parent_message_id or replaces_message_id
+    if not target_message_id:
+        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+
+    try:
+        resp = await pb.client.get(
+            f"{pb.root}/api/collections/aw_gemini_messages/records/{quote(target_message_id, safe='')}",
+            headers=headers,
+            params={'fields': 'id,job,providerState'},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+        state = _parse_provider_state(resp.json().get('providerState'))
+        resolved_env = str(state.get('environmentId') or '').strip() or None
+        resolved_prev = (str(state.get('id') or '').strip() or None) if parent_message_id else None
+        resolved_hash = str(state.get('credentialHash') or '').strip() or None
+        return {
+            'environment_id': resolved_env,
+            'previous_interaction_id': resolved_prev,
+            'credential_hash': resolved_hash,
+        }
+    except Exception:
+        return {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+
+
+def build_agent_payload(job, message, *, environment_id=None, previous_interaction_id=None):
     options = job.get('options', {}).get('agent', {})
     name = str(job['model']).lower()
+    reused_env = str(environment_id or '').strip() or None
+    prev_interaction = str(previous_interaction_id or '').strip() or None
+    input_parts = [job.get('prompt', ''), message.get('inputText', '')]
+    if not prev_interaction:
+        input_parts = [*[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])], *input_parts]
     payload = {
         'agent': options.get('id') or (DEFAULT_AGENT if name == 'antigravity' else name),
-        'input': '\n\n'.join(value for value in [
-            *[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])],
-            job.get('prompt', ''), message.get('inputText', '')] if value),
+        'input': '\n\n'.join(value for value in input_parts if value),
         'background': True, 'store': True,
-        'environment': {'type': 'remote'},
+        'environment': reused_env if reused_env else {'type': 'remote'},
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
         'agent_config': {'type': 'antigravity', 'model': options.get('model', DEFAULT_MODEL)},
     }
+    if prev_interaction:
+        payload['previous_interaction_id'] = prev_interaction
     if job.get('systemPrompt'):
         payload['system_instruction'] = job['systemPrompt']
     # A configured GitHub PAT grants access to every repository permitted by
@@ -82,17 +154,18 @@ def build_agent_payload(job, message):
     # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
     if github_token:
-        basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
-        payload['environment'] = {
-            'type': 'remote',
-            'network': {
-                'allowlist': [
-                    {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
-                    {'domain': 'api.github.com', 'transform': {'Authorization': f'Bearer {github_token}'}},
-                    {'domain': '*'},
-                ],
-            },
-        }
+        if not reused_env:
+            basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
+            payload['environment'] = {
+                'type': 'remote',
+                'network': {
+                    'allowlist': [
+                        {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
+                        {'domain': 'api.github.com', 'transform': {'Authorization': f'Bearer {github_token}'}},
+                        {'domain': '*'},
+                    ],
+                },
+            }
         # REST/Git stay authenticated for every prompt; no keyword can hide access.
         # Avoid loading the full GitHub MCP schema into every reasoning turn.
         if options.get('githubMcpEnabled') is True:
@@ -100,7 +173,7 @@ def build_agent_payload(job, message):
                 'url': 'https://api.githubcopilot.com/mcp',
                 'headers': {'Authorization': f'Bearer {github_token}'}})
         project = is_project_task(task_text(job, message))
-        if project:
+        if project and isinstance(payload['environment'], dict):
             mount_runtime(payload['environment'])
         payload['system_instruction'] = '\n\n'.join(
             part for part in [payload.get('system_instruction', ''), GUIDE if project else
@@ -197,16 +270,32 @@ async def cancel_interaction(client, url, key):
         raise upstream_error(status, data, key)
 
 
-async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None):
+async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None, pb=None):
     from providers import GeminiProvider
     provider = GeminiProvider()
-    payload = build_agent_payload(job, message)
     started = clock()
     trace = AgentTrace(job=job.get('id', os.environ.get('REQUEST_ID', '')),
                        segment=message.get('index'), secrets=pool.keys, clock=clock, verbose=False)
     def telemetry(event, **fields):
         agent_telemetry(event, **trace.context, **fields)
     state = (await checkpoint()).get('state') or {}
+    prev_ctx = {'environment_id': None, 'previous_interaction_id': None, 'credential_hash': None}
+    if not state.get('id'):
+        prev_ctx = await resolve_previous_agent_context(pb, job)
+    reusing_remote = bool(prev_ctx.get('environment_id') or prev_ctx.get('previous_interaction_id'))
+    payload = build_agent_payload(
+        job,
+        message,
+        environment_id=prev_ctx.get('environment_id'),
+        previous_interaction_id=prev_ctx.get('previous_interaction_id'),
+    )
+    preferred_hash = prev_ctx.get('credential_hash')
+    if preferred_hash and not any(hashlib.sha256(k.encode()).hexdigest() == preferred_hash for k in pool.keys):
+        preferred_hash = None
+        if reusing_remote:
+            telemetry('environment_fallback', reason='credential_missing')
+            reusing_remote = False
+            payload = build_agent_payload(job, message)
     telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
@@ -214,10 +303,13 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         github_mcp_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
         input_chars=len(payload['input']),
         system_chars=len(payload.get('system_instruction', '')),
-        resumed=bool(state.get('id')))
+        resumed=bool(state.get('id')),
+        reused_environment=isinstance(payload.get('environment'), str),
+        continued_interaction=bool(payload.get('previous_interaction_id')))
     index = key = lease = None
     current = None
-    for attempt in range(max(1, len(pool.keys))):
+    fell_back_to_fresh = False
+    for attempt in range(max(1, len(pool.keys) + (1 if reusing_remote else 0))):
         if not state.get('id') and (await checkpoint()).get('canceled'):
             raise AgentCanceled('Agent 已取消，未创建远程执行。')
         index, key, lease = await pool.acquire()
@@ -230,6 +322,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 continue
             current = {'id': state['id'], 'status': 'in_progress'}
             break
+        if preferred_hash and fingerprint != preferred_hash and not fell_back_to_fresh:
+            await pool.mark_cancelled(index, lease)
+            pool.retire_key(index, 'different environment credential')
+            continue
         try:
             create_started = clock()
             status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
@@ -258,6 +354,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await cancel_interaction(client, f'{ROOT}/{quote(data["id"], safe="")}', key)
                 raise
             break
+        if status in (400, 404) and reusing_remote and not fell_back_to_fresh:
+            fell_back_to_fresh = True
+            reusing_remote = False
+            preferred_hash = None
+            await pool.mark_cancelled(index, lease)
+            telemetry('environment_fallback', reason='upstream_rejected', http=status)
+            payload = build_agent_payload(job, message)
+            continue
         await pool.mark_error(index, lease, http_status=status)
         scope = provider.credential_error_scope(status, data)
         if scope:

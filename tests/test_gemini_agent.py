@@ -341,3 +341,89 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(AgentCanceled):
                 await generate_agent(client, KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
         self.assertEqual(len(calls), 1)
+
+    def test_build_agent_payload_reuses_environment_id_and_previous_interaction_id(self):
+        import os
+        task = {**job(), 'history': [{'role': 'user', 'text': 'old'}, {'role': 'model', 'text': 'reply'}]}
+        with patch.dict(os.environ, {'ANTIGRAVITY_GITHUB_TOKEN': 'ghp_test_only'}, clear=False):
+            payload = build_agent_payload(
+                task,
+                {'inputText': 'follow up'},
+                environment_id='env_saved_123',
+                previous_interaction_id='v1_prev_456',
+            )
+        self.assertEqual(payload['environment'], 'env_saved_123')
+        self.assertEqual(payload['previous_interaction_id'], 'v1_prev_456')
+        self.assertEqual(payload['input'], 'question\n\nfollow up')
+
+    async def test_generate_agent_reuses_parent_environment_and_matching_credential(self):
+        import hashlib
+        sent_bodies = []
+        sent_keys = []
+        state = {}
+        async def checkpoint(update=None):
+            if update:
+                state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(_): pass
+        async def outbound(request):
+            if request.url.host == 'pb.example.com':
+                if '/aw_gemini_messages/' in request.url.path:
+                    return httpx.Response(200, json={
+                        'id': 'msg_parent_1',
+                        'providerState': {
+                            'id': 'v1_parent',
+                            'environmentId': 'env_reused_1',
+                            'credentialHash': hashlib.sha256(b'key-2').hexdigest(),
+                        },
+                    })
+                return httpx.Response(404, json={})
+            sent_keys.append(request.headers.get('x-goog-api-key'))
+            if request.method == 'POST':
+                sent_bodies.append(json.loads(request.content))
+                return httpx.Response(202, json={'id': 'v1_child', 'environment_id': 'env_reused_1', 'status': 'in_progress'})
+            return httpx.Response(200, json={'id': 'v1_child', 'environment_id': 'env_reused_1', 'status': 'completed', 'output_text': 'continued ok'})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = type('PB', (), {'root': 'https://pb.example.com', 'token': 'pb-tok', 'client': client})()
+            task = {**job(), 'parentMessage': 'msg_parent_1', 'history': [{'role': 'user', 'text': 'first'}]}
+            result = await generate_agent(client, KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100), task, {}, checkpoint=checkpoint, sleep=sleep, pb=pb)
+        self.assertEqual(result['reply'], 'continued ok')
+        self.assertEqual(sent_keys, ['key-2', 'key-2'])
+        self.assertEqual(sent_bodies[0]['environment'], 'env_reused_1')
+        self.assertEqual(sent_bodies[0]['previous_interaction_id'], 'v1_parent')
+        self.assertEqual(sent_bodies[0]['input'], 'question')
+        self.assertEqual(result['response']['metadata']['environment_id'], 'env_reused_1')
+
+    async def test_generate_agent_falls_back_to_fresh_environment_when_expired(self):
+        sent_bodies = []
+        state = {}
+        async def checkpoint(update=None):
+            if update:
+                state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(_): pass
+        async def outbound(request):
+            if request.url.host == 'pb.example.com':
+                return httpx.Response(200, json={
+                    'id': 'msg_parent_old',
+                    'providerState': {'id': 'v1_old', 'environmentId': 'env_expired'},
+                })
+            if request.method == 'POST':
+                body = json.loads(request.content)
+                sent_bodies.append(body)
+                if body.get('environment') == 'env_expired':
+                    return httpx.Response(404, json={'error': {'message': 'environment not found'}})
+                return httpx.Response(202, json={'id': 'v1_fresh', 'environment_id': 'env_new', 'status': 'in_progress'})
+            return httpx.Response(200, json={'id': 'v1_fresh', 'environment_id': 'env_new', 'status': 'completed', 'output_text': 'fresh ok'})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = type('PB', (), {'root': 'https://pb.example.com', 'token': 'pb-tok', 'client': client})()
+            task = {**job(), 'parentMessage': 'msg_parent_old', 'history': [{'role': 'user', 'text': 'old turn'}]}
+            result = await generate_agent(client, KeyPool(['key-1'], rpm_per_key=1e6, rpd_per_key=100), task, {}, checkpoint=checkpoint, sleep=sleep, pb=pb)
+        self.assertEqual(result['reply'], 'fresh ok')
+        self.assertEqual(len(sent_bodies), 2)
+        self.assertEqual(sent_bodies[0]['environment'], 'env_expired')
+        self.assertEqual(sent_bodies[1]['environment'], {'type': 'remote'})
+        self.assertNotIn('previous_interaction_id', sent_bodies[1])
+        self.assertIn('user: old turn', sent_bodies[1]['input'])
+        self.assertEqual(state['environmentId'], 'env_new')
+
