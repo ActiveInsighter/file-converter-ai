@@ -50,7 +50,7 @@ class AgentPayloadTests(unittest.TestCase):
                 payload = build_agent_payload(task, {})
                 self.assertEqual(len(payload['environment']['sources']), 3)
                 self.assertIn('Access is determined by the configured token', payload['system_instruction'])
-                self.assertIn('Clone only the target repository', payload['system_instruction'])
+                self.assertIn('repositories relevant to the request', payload['system_instruction'])
                 rules = payload['environment']['network']['allowlist']
                 self.assertEqual(rules[0]['domain'], 'github.com')
                 self.assertEqual(rules[1]['transform']['Authorization'], 'Bearer fixture-github-secret')
@@ -205,26 +205,40 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['usage']['totalTokenCount'], 450)
         self.assertNotIn('[agent.trace]', logs.getvalue())
 
-    async def test_push_permission_failure_prevents_any_google_request(self):
-        calls = []
-        async def checkpoint(update=None):
-            return {'state': {}, 'canceled': False}
-        async def outbound(request):
-            calls.append(request)
-            self.assertEqual(request.method, 'GET')
-            self.assertNotEqual(request.url.host, 'generativelanguage.googleapis.com')
-            if request.url.path == '/user':
-                return httpx.Response(200, json={'login': 'owner'})
-            if request.url.host == 'api.github.com':
-                return httpx.Response(200, json={'full_name': 'owner/remote', 'default_branch': 'main'})
-            return httpx.Response(403)
-        task = job(); task['prompt'] = '重构owner/remote项目并推送分支'
-        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-pat'}):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
-                with self.assertRaisesRegex(RuntimeError, '无法写入'):
-                    await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
-                                         task, {}, checkpoint=checkpoint)
-        self.assertEqual(len(calls), 3)
+    async def test_repository_tasks_start_directly_with_or_without_github_token(self):
+        prompts = (
+            '看看 GitHub 里的 RikkaHub 和工作流 remote Gemini 页面，修复后触发 GitHub Action 推送部署',
+            '重构 owner/remote 和 owner/rikkahub 项目并推送分支',
+        )
+        for prompt in prompts:
+            for token in ('fixture-pat', ''):
+                with self.subTest(prompt=prompt, token_configured=bool(token)):
+                    state, calls = {}, []
+
+                    async def checkpoint(update=None):
+                        if update:
+                            state.update(update)
+                        return {'state': state.copy(), 'canceled': False}
+
+                    async def outbound(request):
+                        calls.append((request.method, request.url.host, request.url.path))
+                        self.assertEqual(request.url.host, 'generativelanguage.googleapis.com')
+                        payload = json.loads(request.content)
+                        self.assertEqual(payload['input'], prompt)
+                        self.assertEqual('network' in payload['environment'], bool(token))
+                        self.assertEqual('sources' in payload['environment'], bool(token))
+                        return httpx.Response(201, json={'id': 'agent-test', 'status': 'completed', 'output_text': 'ready'})
+
+                    pool = KeyPool(['fixture-key'], rpm_per_key=60, rpd_per_key=100)
+                    try:
+                        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': token}), redirect_stdout(StringIO()):
+                            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                                result = await generate_agent(client, pool, {**job(), 'prompt': prompt}, {},
+                                                              checkpoint=checkpoint)
+                        self.assertEqual(result['reply'], 'ready')
+                        self.assertEqual(calls, [('POST', 'generativelanguage.googleapis.com', '/v1beta/interactions')])
+                    finally:
+                        await pool.close()
 
     async def test_background_poll_retry_never_reposts_and_persists_identity(self):
         requests = []; state = {}; gets = 0

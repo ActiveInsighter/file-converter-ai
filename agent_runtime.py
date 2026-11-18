@@ -6,19 +6,18 @@ HELPER = '/workspace/.anyworkflow/github.py'
 
 GUIDE = f'''GitHub HTTPS Git and REST authentication is configured by the environment.
 Never request, print or store credentials. Access is determined by the configured token.
-Use the resolved repository from the trusted task context below. Do not search all of
-GitHub for generic words or enumerate issues/PRs unless the task needs them. If no
-repository is resolved, `python3 {HELPER}` has `identity` and `repos` commands returning a
-compact inventory. Clone only the target repository.
-Read its AGENTS.md and relevant project skills. Use `cd /workspace/<repo>` explicitly
+Use the repositories named in the request. If a name is abbreviated or unclear,
+`python3 {HELPER}` has `identity` and `repos` commands returning a compact inventory.
+Ask for the full repository name if the inventory still leaves the target ambiguous.
+Clone only the repositories relevant to the request.
+Read each repository's AGENTS.md and relevant project skills. Use `cd /workspace/<repo>` explicitly
 in shell commands. After one filesystem search timeout, switch to targeted rg/rg --files
 instead of repeating find_by_name/list_dir over the same tree. Check a component's
 actual export/path before importing it. Use project scripts to install Chromium when
 missing. Preserve nonzero test exit codes; do not hide failures behind `|| tail`.
 For UI changes, compile first, repair the exact failing browser assertion, then verify
 desktop/mobile. Never rerun an unchanged failing test or call a failed check passed.
-Check Git write access before substantial edits; host preflight already verified it
-when a target could be resolved. Push a feature branch and verify its remote SHA.
+When a push is requested, push a feature branch and verify its remote SHA.
 If push returns 403, stop and report the permission failure, retaining the commit.
 For a deployment-only task, inspect workflow configuration through GitHub REST,
 not a repository clone, npm install, or local build. The workflow performs the build.
