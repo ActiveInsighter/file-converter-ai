@@ -330,26 +330,13 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
             async with client.stream('GET', url, params=params, headers={'x-goog-api-key': key, 'Accept': 'text/event-stream'},
                                      timeout=httpx.Timeout(45, connect=15)) as response:
                 if response.status_code != 200:
-                    # Google can briefly reject a reconnect while the previous
-                    # subscription is being released. Match this error exactly;
-                    # authentication/other invalid requests stay permanent.
-                    precondition = False
-                    if response.status_code == 400:
-                        raw = await response.aread()
-                        try:
-                            detail = json.loads(raw).get('error', {})
-                            precondition = (isinstance(detail, dict) and detail.get('code') == 'invalid_request'
-                                            and detail.get('message') == 'Precondition check failed.')
-                        except (ValueError, AttributeError):
-                            pass
-                    if response.status_code not in (408, 429, 500, 502, 503, 504) and not precondition:
-                        print(f'[agent.progress] stream unavailable job={progress.job_id} '
-                              f'msg={progress.message_id} http={response.status_code}', flush=True)
-                        return
+                    # A rejected observer is not a remote execution failure.
+                    # Keep its cursor and retry this same read at a bounded rate.
+                    print(f'[agent.progress] stream unavailable job={progress.job_id} '
+                          f'msg={progress.message_id} http={response.status_code}', flush=True)
                 elif 'text/event-stream' not in response.headers.get('content-type', ''):
                     print(f'[agent.progress] stream unavailable job={progress.job_id} '
                           f'msg={progress.message_id} reason=non_sse_response', flush=True)
-                    return
                 else:
                     async for data, kind, event_id in sse_events(response):
                         received = True

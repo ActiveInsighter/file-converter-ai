@@ -132,8 +132,98 @@ class AgentPayloadTests(unittest.TestCase):
         partial = parse_interaction({'status': 'incomplete', 'output_text': 'partial'})
         self.assertEqual(partial['reply'], 'partial'); self.assertTrue(partial['error'])
 
+    def test_empty_sdk_convenience_text_does_not_hide_rest_model_output(self):
+        result = parse_interaction({'status': 'completed', 'output_text': '', 'steps': [
+            {'type': 'model_output', 'content': [{'type': 'text', 'text': 'REST answer'}]},
+        ]})
+        self.assertEqual(result['reply'], 'REST answer')
+        self.assertFalse(result['error'])
+
 
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observation_errors_never_fail_cancel_or_recreate_existing_agent(self):
+        state, requests, delays = {}, [], []
+        polls = 0
+        failures = [400, 401, 403, 404, 408, 409, 429] + [503] * 24
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state.copy(), 'canceled': False}
+        async def sleep(seconds): delays.append(seconds)
+        async def outbound(request):
+            nonlocal polls
+            requests.append(request)
+            self.assertEqual(request.headers['x-goog-api-key'], 'fixture-secret')
+            self.assertEqual(request.headers['Accept'], 'application/json')
+            if request.method == 'POST':
+                self.assertEqual(request.url.path, '/v1beta/interactions')
+                return httpx.Response(200, json={'id': 'v1_saved', 'status': 'in_progress'})
+            self.assertEqual(request.url.path, '/v1beta/interactions/v1_saved')
+            self.assertNotIn('last_event_id', request.url.params)
+            polls += 1
+            if polls <= len(failures):
+                return httpx.Response(failures[polls - 1], json={'error': {
+                    'code': 'invalid_request', 'message': 'Precondition check failed.'}})
+            if polls <= len(failures) + 22:
+                raise httpx.ReadTimeout('fixture-secret may not be logged')
+            if polls == len(failures) + 23: return httpx.Response(200, text='<html>unavailable</html>')
+            if polls == len(failures) + 24: return httpx.Response(200, json=[])
+            if polls == len(failures) + 25: return httpx.Response(200, json={'id': 'wrong-id', 'status': 'failed'})
+            if polls == len(failures) + 26: return httpx.Response(200, json={})
+            return httpx.Response(200, json={'id': 'v1_saved', 'status': 'completed', 'output_text': 'recovered'})
+        output = StringIO()
+        with redirect_stdout(output):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100),
+                    job(), {}, checkpoint=checkpoint, sleep=sleep)
+        self.assertEqual(result['reply'], 'recovered')
+        self.assertFalse(result['error'])
+        self.assertEqual(sum(r.method == 'POST' for r in requests), 1)
+        self.assertEqual(state['status'], 'completed')
+        self.assertEqual(max(delays), 30)
+        self.assertNotIn('fixture-secret', output.getvalue())
+
+    async def test_user_can_cancel_during_repeated_poll_failures(self):
+        state, requests, gets = {}, [], 0
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state, 'canceled': gets >= 3}
+        async def sleep(_): pass
+        async def outbound(request):
+            nonlocal gets
+            requests.append(request)
+            if request.url.path.endswith('/cancel'):
+                return httpx.Response(200, json={'status': 'cancelled'})
+            if request.method == 'POST':
+                return httpx.Response(200, json={'id': 'v1_saved', 'status': 'in_progress'})
+            gets += 1
+            return httpx.Response(400, json={'error': {'message': 'Precondition check failed.'}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with self.assertRaises(AgentCanceled):
+                await generate_agent(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100),
+                    job(), {}, checkpoint=checkpoint, sleep=sleep)
+        self.assertEqual(gets, 3)
+        self.assertEqual(sum(r.url.path.endswith('/cancel') for r in requests), 1)
+
+    async def test_local_observer_cancellation_does_not_cancel_remote_execution(self):
+        state, requests = {}, []
+        entered = asyncio.Event()
+        async def checkpoint(update=None):
+            if update: state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(_): entered.set(); await asyncio.Event().wait()
+        async def outbound(request):
+            requests.append(request)
+            return httpx.Response(200, json={'id': 'v1_saved', 'status': 'in_progress'})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            task = asyncio.create_task(generate_agent(client,
+                KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100), job(), {},
+                checkpoint=checkpoint, sleep=sleep))
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual(state['id'], 'v1_saved')
+        self.assertEqual(len(requests), 1)
+
     async def test_cancel_checks_official_endpoint_and_does_not_accept_http_errors(self):
         for status in [200, 404]:
             requests = []

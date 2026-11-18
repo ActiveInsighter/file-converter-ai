@@ -113,14 +113,31 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         for r in requests:
             if r.url.host == 'pb.example': self.assertEqual(json.loads(r.content)['executionId'], '123:1')
 
-    async def test_agent_checkpoint_rejects_permanent_auth_failure_without_retry(self):
-        requests = []
-        async def outbound(request): requests.append(request); return httpx.Response(403)
+    async def test_agent_checkpoint_preserves_identity_through_long_query_outage(self):
+        requests, delays = [], []
+        state = {'id': 'v1_existing', 'credentialHash': 'fingerprint'}
+        async def outbound(request):
+            requests.append(request)
+            self.assertEqual(json.loads(request.content), {'executionId': '123:1', 'state': state})
+            if len(requests) <= 24: return httpx.Response(403 if len(requests) == 1 else 502)
+            if len(requests) == 25: return httpx.Response(200, json=[])
+            return httpx.Response(200, json={'state': state, 'canceled': True})
+        async def sleep(seconds): delays.append(seconds)
         async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
             pb = PocketBase(client, 'https://pb.example')
-            with self.assertRaisesRegex(RuntimeError, 'HTTP 403'):
-                await pb.checkpoint('jobs/a/messages/b/checkpoint', {'executionId': '123:1'})
-        self.assertEqual(len(requests), 1)
+            with patch('gemini_text.asyncio.sleep', new=sleep):
+                result = await pb.checkpoint('jobs/a/messages/b/checkpoint', {'executionId': '123:1'}, state)
+        self.assertTrue(result['canceled'])
+        self.assertEqual(len(requests), 26)
+        self.assertEqual(max(delays), 30)
+
+    async def test_unavailable_checkpoint_can_stop_without_returning_a_false_terminal_state(self):
+        async def outbound(request): return httpx.Response(503)
+        async def sleep(_): raise asyncio.CancelledError()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with patch('gemini_text.asyncio.sleep', new=sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await PocketBase(client, 'https://pb.example').checkpoint('jobs/a/messages/b/checkpoint', {'executionId': '123:1'})
 
     async def test_real_executor_startup_accepts_empty_and_shared_project_groups(self):
         options = {"rpmPerKey": 15, "rpdPerKey": 500}

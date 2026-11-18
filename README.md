@@ -207,7 +207,11 @@ Antigravity 请求**不发送** `agent_config.max_total_tokens`，也不再设�
 
 Agent 后台执行需要 `background=true`、`store=true`。执行器在 PB 保存 interaction ID
 和凭据的 SHA-256（不保存 API Key），之后只轮询同一 ID；中断的创建不盲目重发。
-取消会调用远程 `/cancel`；读取失败重试 GET。不再设置应用层任务时限，旧任务中的
+只有用户明确取消才调用远程 `/cancel`；本地观察器停止不会取消上游。
+状态查询、SSE 和 PB checkpoint 的读取故障保留原任务，以最多 30 秒的退避持续恢复，
+不因 HTTP 错误、断线或重试次数耗尽判定 Agent 失败，不重新创建 interaction。
+权限或参数错误也作为观察失败记录，需修复连接配置后才能重新确认上游状态。
+不再设置应用层任务时限，旧任务中的
 `timeoutMinutes` 同样忽略；workflow 不再自设 180 分钟超时。GitHub 托管 Runner 仍有
 [每个 job 最长 6 小时的平台限制](https://docs.github.com/en/actions/reference/limits)，不能通过仓库配置取消。
 PB 必须先部署 `1794740000_gemini_agent_state.js`
@@ -358,15 +362,15 @@ Gemini 消息执行器在每个 Antigravity `step.stop` 后立即写入 PocketBa
 并持续轮询 interaction 状态，不重新创建执行。非终态快照可能只返回状态、不含步骤或用量，
 不能靠快照补齐事件流；重连失败会记录原因与退避时间。暂时故障在收到首个事件前也会重试。
 部分实际响应没有事件游标，此时从头重放并按步骤编号重建增量，已经完成且内容相同的步骤不重复写入。
-已确认的 `400 invalid_request / Precondition check failed.` 会退避重试；其他明确的参数或权限错误保留失败日志。
+包括 `400 invalid_request / Precondition check failed.` 在内的查询拒绝均记录 HTTP 状态并退避重试，
+只有读取到原 interaction 的终态才按该状态收尾。
 Actions 每分钟的状态日志同时记录事件观察器是否仍运行及已观察步骤数，区分快照步骤数与事件步骤数。
 上传失败保留恢复文件，最终完成前补传；Actions recovery artifact 同时包含 `*.progress.json` 过程恢复文件。
 无新内容时执行器每 30 秒发送一次无内容心跳，刷新 `progressAt`，不重复写入步骤。
 Remote 以此显示执行器在线状态，以最后一个非状态分段的时间显示最近步骤；任务行的
 `updated` 由调度器也会刷新，不能用来推断执行器仍在线。
-checkpoint 使用同一 executionId 和 interaction 身份重试短暂的 PB 5xx/连接故障，
-指数退避最多 16 秒、最多重试 12 次，为短暂发布提供比原先 7 秒更长的恢复窗口。
-权限等明确 4xx 错误仍立即报告，不重发模型创建请求。
+checkpoint 使用同一 executionId 和 interaction 身份持续重试 PB 查询故障，
+指数退避最多 30 秒；故障期间保留身份与已有内容，不重发模型创建请求。
 先发布 AnyWorkflow-workers 的 `1794870000_agent_message_parts.js` 迁移及 hooks，再更新执行器和 Remote。
 完整接口及发布设计见后端 `docs/agent-message-stream.md`。
 

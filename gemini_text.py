@@ -182,10 +182,25 @@ class PocketBase:
             await asyncio.sleep(min(16, 2 ** attempt))
 
     async def checkpoint(self, path: str, identity: dict, state=None):
-        # Checkpoints are idempotent for the recorded interaction. A service
-        # restart can leave the public proxy returning 502 longer than 1+2+4s;
-        # keep the same execution identity through that recovery window.
-        return await self.post(path, {**identity, **({'state': state} if state is not None else {})}, retries=12)
+        # An unavailable control query cannot prove the remote agent failed or
+        # was canceled. Retry the identical checkpoint until contact resumes.
+        # This also keeps the newly created interaction ID in memory while its
+        # initial database write is waiting, without creating another agent.
+        failures = 0
+        while True:
+            try:
+                result = await self.post(path, {**identity, **({'state': state} if state is not None else {})})
+                if (not isinstance(result, dict) or not isinstance(result.get('state'), dict)
+                        or type(result.get('canceled')) is not bool):
+                    raise ValueError('Invalid checkpoint response')
+                return result
+            except (RuntimeError, httpx.HTTPError, ValueError, TimeoutError) as error:
+                failures = min(failures + 1, 5)
+                delay = min(2 ** failures, 30)
+                # Never log exception text, response bodies or Authorization.
+                print(f'[agent.checkpoint] query deferred error_type={type(error).__name__} '
+                      f'delay_seconds={delay}', flush=True)
+                await asyncio.sleep(delay)
 
 
 async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None) -> dict:
