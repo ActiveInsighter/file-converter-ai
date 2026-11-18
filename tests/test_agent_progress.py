@@ -70,15 +70,20 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 9)
         self.assertEqual(delays, [2, 4, 8, 16, 30, 30, 30, 30])
 
-    async def test_stream_stops_on_permanent_rejection(self):
+    async def test_stream_rejections_remain_observation_errors_and_recover(self):
         for response in [httpx.Response(403), httpx.Response(200, json={}),
                          httpx.Response(400, json={'error': {'code': 'invalid_request', 'message': 'bad parameters'}})]:
             requests = []
-            async def outbound(request): requests.append(request); return response
-            async def sleep(_): self.fail('Unsupported streams must not loop')
+            async def outbound(request):
+                requests.append(request)
+                self.assertEqual(request.method, 'GET')
+                if len(requests) <= 8: return response
+                return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                    text='data: {"event_type":"interaction.completed","interaction":{"status":"completed"}}\n\n')
+            async def sleep(_): pass
             async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
                 await observe_progress(client, 'https://fixture.test/agent', 'fixture-key', MessageProgress(), sleep=sleep)
-            self.assertEqual(len(requests), 1)
+            self.assertEqual(len(requests), 9)
 
     async def test_cursorless_replay_survives_precondition_and_saves_each_step_once(self):
         writes, requests, delay = [], [], []

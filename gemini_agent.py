@@ -57,6 +57,10 @@ class AgentCanceled(RuntimeError):
     pass
 
 
+class AgentResponseError(RuntimeError):
+    """An unreadable observation is not an interaction failure."""
+
+
 def is_antigravity(model):
     value = str(model).casefold()
     return value == 'antigravity' or value.startswith('antigravity-')
@@ -111,7 +115,7 @@ def build_agent_payload(job, message):
 
 def parse_interaction(data, *, secrets=()):
     reply = data.get('output_text')
-    if not isinstance(reply, str):
+    if not isinstance(reply, str) or not reply.strip():
         reply = '\n\n'.join(
             part['text'] for step in data.get('steps', []) if step.get('type') == 'model_output'
             for part in step.get('content', []) if part.get('type') == 'text' and isinstance(part.get('text'), str)
@@ -162,17 +166,20 @@ def parse_interaction(data, *, secrets=()):
 
 
 async def request_json(client, method, url, key, payload=None):
-    async with client.stream(method, url, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
+    async with client.stream(method, url, headers={'x-goog-api-key': key, 'Content-Type': 'application/json',
+                                                   'Accept': 'application/json'},
                              json=payload, timeout=90) as response:
         raw = bytearray()
         async for block in response.aiter_bytes():
             raw.extend(block)
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise RuntimeError('Agent 响应超过 6 MiB，原 interaction 保留在上游。')
+                raise AgentResponseError('Agent 响应超过 6 MiB，原 interaction 保留在上游。')
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
-            raise RuntimeError(f'Agent 返回非 JSON 响应（HTTP {response.status_code}）') from None
+            raise AgentResponseError(f'Agent 返回非 JSON 响应（HTTP {response.status_code}）') from None
+        if not isinstance(data, dict):
+            raise AgentResponseError('Agent 返回的 JSON 不是 interaction 对象')
         return response.status_code, response.headers, data
 
 
@@ -256,12 +263,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             state = {'id': data['id'], 'credentialHash': fingerprint, 'status': data.get('status', 'in_progress')}
             if isinstance(data.get('environment_id'), str):
                 state['environmentId'] = data['environment_id']
-            try:
-                await checkpoint(state)
-            except Exception:
-                # Stop a remote run whose identity cannot be durably recorded.
-                await cancel_interaction(client, f'{ROOT}/{quote(data["id"], safe="")}', key)
-                raise
+            await checkpoint(state)
             break
         await pool.mark_error(index, lease, http_status=status)
         scope = provider.credential_error_scope(status, data)
@@ -278,7 +280,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     if current is None:
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
 
-    url = f'{ROOT}/{quote(current["id"], safe="")}'
+    interaction_id = current['id']
+    url = f'{ROOT}/{quote(interaction_id, safe="")}'
     # GET snapshots reconcile the optional event channel; neither can create a run.
     observer = None
     if progress is not None:
@@ -333,13 +336,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     trace.emit('poll_http_error', http=status, consecutive_failures=failures + 1,
                                seconds=round(clock() - poll_started, 3),
                                **({'error': trace.preview(data['error'])} if data.get('error') else {}))
-                    if status in [429, 500, 502, 503, 504]:
-                        failures += 1
-                        if failures <= 20:
-                            await sleep(min(failures * 2, 30))
-                            continue
-                    raise upstream_error(status, data, key)
-                current, failures = data, 0
+                    # Even a definite HTTP rejection of GET says nothing about
+                    # the remote execution's outcome. Keep observing this ID
+                    # with its original credential; never POST a replacement.
+                    failures = min(failures + 1, 5)
+                    await sleep(min(2 ** failures, 30))
+                    continue
+                if (not isinstance(data.get('status'), str) or not data['status']
+                        or data.get('id', interaction_id) != interaction_id):
+                    raise AgentResponseError('Agent 状态响应缺失或 interaction 身份不符')
+                current, failures = {'id': interaction_id, **data}, 0
                 poll_count += 1
                 # One useful progress line per minute, plus nonterminal status changes.
                 # Terminal usage is reported once above; cumulative counters are never summed.
@@ -354,26 +360,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                                     **summary)
                     last_status = current.get('status')
                     last_report = clock()
-            except (httpx.TransportError, TimeoutError) as error:
-                failures += 1
+            except (httpx.HTTPError, TimeoutError, AgentResponseError) as error:
+                failures = min(failures + 1, 5)
                 trace.emit('poll_transport_error', error_type=type(error).__name__, consecutive_failures=failures)
-                if failures > 20:
-                    raise RuntimeError('Agent 状态连接持续失败，interaction 已保留，未重复创建。') from None
-                await sleep(min(failures * 2, 30))
+                await sleep(min(2 ** failures, 30))
     except asyncio.CancelledError:
-        try:
-            await asyncio.shield(cancel_interaction(client, url, key))
-        finally:
-            await pool.mark_cancelled(index, lease)
-        raise
-    except AgentCanceled:
-        raise
-    except Exception:
-        # Do not leave an unmonitored agent spending tokens after a local failure.
-        try:
-            await cancel_interaction(client, url, key)
-        except Exception as cancel_error:
-            telemetry('cancel_failed', error_type=type(cancel_error).__name__)
+        # Stopping a local observer is not a user's remote cancel request.
+        # Its saved identity allows a later observer to resume with GET.
+        await pool.mark_cancelled(index, lease)
         raise
     finally:
         if observer is not None:
