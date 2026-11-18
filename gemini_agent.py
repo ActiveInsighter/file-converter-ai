@@ -18,6 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from agent_trace import AgentTrace, TERMINAL
+from agent_fast_tasks import AgentSummaryWorker, AgentTimingTracker, maybe_generate_title
 from response_capture import extract_structured_payload, interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, task_text
@@ -305,12 +306,17 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     from providers import GeminiProvider
     provider = GeminiProvider()
     started = clock()
+    message_id = str(message.get('id') or '').strip()
+    timing_tracker = AgentTimingTracker(clock=clock, t0=started)
     trace = AgentTrace(job=job.get('id', os.environ.get('REQUEST_ID', '')),
                        segment=message.get('index'), secrets=pool.keys, clock=clock, verbose=False)
     def telemetry(event, **fields):
         agent_telemetry(event, **trace.context, **fields)
     state = (await checkpoint()).get('state') or {}
     resumed = bool(state.get('id'))
+    title_task = None
+    if not resumed and pb is not None:
+        title_task = asyncio.create_task(maybe_generate_title(client, pool, pb, job, message))
     context = {} if resumed else await resolve_previous_agent_context(pb, job)
     preferred_hash = state.get('credentialHash') if resumed else context.get('credential_hash')
     preferred_key = next((i for i, k in enumerate(pool.keys) if hashlib.sha256(k.encode()).hexdigest() == preferred_hash), None)
@@ -358,6 +364,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             raise RuntimeError('Agent 提交连接中断，无法确认是否已创建；为避免重复执行，未自动重发。') from None
         if status in [200, 201, 202]:
             current = data
+            timing_tracker.mark_dispatched()
             if not isinstance(data.get('id'), str) or not data['id']:
                 raise RuntimeError('Agent 未返回 interaction ID；未自动重发。')
             telemetry('created', elapsed_seconds=round(clock() - started, 2),
@@ -398,9 +405,15 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     url = f'{ROOT}/{quote(current["id"], safe="")}'
     # GET snapshots reconcile the optional event channel; neither can create a run.
     observer = None
+    summary_worker = None
+    summary_task = None
     if progress is not None:
         from agent_progress import observe_progress
         observer = asyncio.create_task(observe_progress(client, url, key, progress))
+    if pb is not None and message_id:
+        summary_worker = AgentSummaryWorker(client, pool, pb, job, message, progress, sleep=sleep)
+        summary_task = asyncio.create_task(summary_worker.run())
+        await timing_tracker.sync_if_dirty(pb, message_id)
     failures = 0
     poll_count = 0
     last_report = started
@@ -412,22 +425,58 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 if not isinstance(step, dict):
                     continue
                 step_sig = (idx, str(step.get('type') or ''), bool(step.get('is_error')))
+                step_type = str(step.get('type') or 'unknown')[:80]
+                step_name = str(step.get('server_name') or step.get('name') or step.get('tool_name') or '')[:80]
+                timing_tracker.record_step(
+                    idx,
+                    step_type,
+                    label=step_name,
+                    status='failed' if step.get('is_error') else 'completed',
+                )
                 if step_sig not in seen_steps:
                     seen_steps.add(step_sig)
-                    step_type = str(step.get('type') or 'unknown')[:80]
-                    step_name = str(step.get('server_name') or step.get('name') or step.get('tool_name') or '')[:80]
                     telemetry('step', step_index=idx, step_type=step_type,
                               **({'tool_name': step_name} if step_name else {}),
                               **({'is_error': True} if step.get('is_error') else {}))
             if progress is not None:
                 progress.snapshot(current)
+                for pkey, pval in list(progress.parts.items()):
+                    if pval.get('type') == 'status':
+                        continue
+                    timing_tracker.mark_first_reply()
+                    if pkey.startswith('step:'):
+                        tail = pkey.split(':', 1)[1]
+                        if tail.isdigit():
+                            timing_tracker.record_step(
+                                int(tail),
+                                str(pval.get('providerType') or pval.get('type') or 'step'),
+                                label=str(pval.get('toolName') or ''),
+                                status=str(pval.get('status') or 'completed'),
+                            )
+            if pb is not None and message_id:
+                await timing_tracker.sync_if_dirty(pb, message_id)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
+                timing_tracker.mark_completed(current['status'])
                 control = await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 if control.get('canceled') and current['status'] != 'completed':
                     await pool.mark_cancelled(index, lease)
                     raise AgentCanceled('Agent 已取消')
                 await pool.mark_success(index, lease)
                 result = parse_interaction(current, secrets=pool.keys)
+                if summary_task is not None:
+                    summary_task.cancel()
+                    await asyncio.gather(summary_task, return_exceptions=True)
+                    summary_task = None
+                if summary_worker is not None:
+                    await summary_worker.finalize()
+                if pb is not None and message_id:
+                    await timing_tracker.sync_if_dirty(pb, message_id, force=True)
+                if title_task is not None:
+                    if not title_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(title_task), timeout=5.0)
+                        except (TimeoutError, Exception):
+                            pass
                 telemetry('completed',
                     status=current['status'],
                     elapsed_seconds=round(clock() - started, 2),
@@ -507,6 +556,12 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             telemetry('cancel_failed', error_type=type(cancel_error).__name__)
         raise
     finally:
+        if summary_task is not None:
+            summary_task.cancel()
+            await asyncio.gather(summary_task, return_exceptions=True)
+        if title_task is not None and not title_task.done():
+            title_task.cancel()
+            await asyncio.gather(title_task, return_exceptions=True)
         if observer is not None:
             observer.cancel()
             await asyncio.gather(observer, return_exceptions=True)
