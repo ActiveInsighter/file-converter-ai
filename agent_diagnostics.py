@@ -85,7 +85,7 @@ async def reconcile_canceled_job(client, root, token, job_id, keys):
         raise RuntimeError('No attempted canceled messages found')
     unconfirmed = False
     for message in candidates:
-        trace = AgentTrace(job=job_id, segment=message['index'], secrets=keys, verbose=False)
+        trace = AgentTrace(job=job_id, segment=message['index'], secrets=keys)
         state = message.get('providerState') or {}
         if isinstance(state, str):
             state = json.loads(state)
