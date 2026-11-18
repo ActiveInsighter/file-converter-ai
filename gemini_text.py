@@ -83,19 +83,64 @@ async def create_key_pool(keys: list[str], options: dict, raw_groups: str = "") 
         rpm_per_key=options["rpmPerKey"], rpd_per_key=options["rpdPerKey"])
 
 
+_THINKING_LEVEL_ALIASES = {
+    "none": "off",
+    "xhigh": "high",
+    "max": "high",
+}
+
+_GEMINI_25_BUDGETS = {
+    "off": 0,
+    "minimal": 0,
+    "low": 4096,
+    "medium": 8192,
+    "high": 24576,
+}
+
+
+def normalize_thinking_level(raw: str | None) -> str:
+    value = str(raw or "").strip().lower()
+    return _THINKING_LEVEL_ALIASES.get(value, value)
+
+
 def build_payload(job: dict, message: dict) -> dict:
     parts = [{"text": value} for value in (job.get("prompt", ""), message.get("inputText", "")) if value]
-    options = job["options"]
+    options = job.get("options") or {}
+    model = str(job.get("model") or "").strip()
+    model_lower = model.lower()
+    thinking_level = normalize_thinking_level(options.get("thinkingLevel"))
+    max_output_tokens = int(options.get("maxOutputTokens") or 8192)
     payload = GeminiProvider().build_payload(
-        job["model"], parts, thinking_level=options.get("thinkingLevel", ""),
-        max_output_tokens=options["maxOutputTokens"],
+        model, parts, thinking_level=thinking_level,
+        max_output_tokens=max_output_tokens,
     )
-    if not options.get('thinkingLevel'):
-        payload['generationConfig']['thinkingConfig'].pop('thinkingLevel', None)
-    if job['model'].startswith(('gemini-2.5', 'gemini-3', 'gemini-4')):
-        payload['generationConfig'].setdefault('thinkingConfig', {})['includeThoughts'] = True
-    elif not options.get('thinkingLevel'):
-        payload['generationConfig'].pop('thinkingConfig', None)
+    if model_lower.startswith("gemini-2.5"):
+        payload["generationConfig"].pop("thinkingConfig", None)
+        if thinking_level in _GEMINI_25_BUDGETS:
+            budget = _GEMINI_25_BUDGETS[thinking_level]
+            if budget == 0 and "pro" in model_lower:
+                budget = 128
+            cfg = {"thinkingBudget": budget}
+            if budget != 0:
+                cfg["includeThoughts"] = True
+            payload["generationConfig"]["thinkingConfig"] = cfg
+        elif thinking_level in ("", "auto"):
+            payload["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
+    elif model_lower.startswith(("gemini-1.5", "gemini-2.0")) and "thinking" not in model_lower:
+        payload["generationConfig"].pop("thinkingConfig", None)
+    elif thinking_level == "off":
+        payload["generationConfig"].pop("thinkingConfig", None)
+    elif thinking_level in ("minimal", "low", "medium", "high"):
+        payload["generationConfig"]["thinkingConfig"] = {
+            "thinkingLevel": thinking_level,
+            "includeThoughts": True,
+        }
+    else:
+        payload["generationConfig"]["thinkingConfig"].pop("thinkingLevel", None)
+        if model_lower.startswith(("gemini-3", "gemini-4")):
+            payload["generationConfig"].setdefault("thinkingConfig", {})["includeThoughts"] = True
+        else:
+            payload["generationConfig"].pop("thinkingConfig", None)
     if options.get('responseMimeType'):
         payload['generationConfig']['responseMimeType'] = str(options['responseMimeType'])
     if isinstance(options.get('responseSchema'), dict):
@@ -372,12 +417,24 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     path = f"jobs/{job_id}"
     identity = {"executionId": execution_id}
     job = await pb.post(f"{path}/claim", identity, retries=3)
-    pool = await pool_factory(job["options"])
+    options = job.setdefault("options", {})
+    options.setdefault("concurrency", 5)
+    options.setdefault("maxOutputTokens", 8192)
+    options.setdefault("rpmPerKey", 15)
+    options.setdefault("rpdPerKey", 500)
+    options.setdefault("thinkingLevel", "")
+    model_override = os.environ.get("GEMINI_MODEL", "").strip()
+    if model_override:
+        job["model"] = model_override
+    thinking_override = os.environ.get("GEMINI_THINKING_LEVEL", "").strip()
+    if thinking_override:
+        options["thinkingLevel"] = normalize_thinking_level(thinking_override)
+    pool = await pool_factory(options)
     job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
     antigravity = is_antigravity(job['model'])
     protocol = 'interactions' if antigravity else 'generateContent'
     job_log.emit('job_started', model=job['model'], protocol=protocol,
-                 segments=len(job['messages']), concurrency=job['options']['concurrency'])
+                 segments=len(job['messages']), concurrency=options['concurrency'])
     queue = asyncio.Queue()
     for message in job["messages"]:
         if message["status"] == "queued":

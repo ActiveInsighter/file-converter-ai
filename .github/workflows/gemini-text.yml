@@ -13,6 +13,16 @@ on:
         required: false
         default: "180"
         type: string
+      model:
+        description: Optional Gemini or Antigravity model override
+        required: false
+        default: ""
+        type: string
+      thinking_level:
+        description: Optional thinking level (minimal, low, medium, high, off)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -31,6 +41,8 @@ jobs:
     env:
       REQUEST_ID: ${{ inputs.request_id }}
       AGENT_TRACE_SECONDS: ${{ inputs.diagnostic_seconds || '180' }}
+      GEMINI_MODEL: ${{ inputs.model }}
+      GEMINI_THINKING_LEVEL: ${{ inputs.thinking_level }}
       GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
       GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
       ANTIGRAVITY_GITHUB_TOKEN: ${{ secrets.ANTIGRAVITY_GITHUB_TOKEN }}

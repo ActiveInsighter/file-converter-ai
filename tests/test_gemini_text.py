@@ -423,6 +423,60 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await generate(client, KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100), job(), job()['messages'][0])
         self.assertEqual(calls, 1)
 
+    def test_build_payload_supports_diverse_gemini_models_and_thinking(self):
+        def make_job(model, thinking):
+            j = job()
+            j['model'] = model
+            j['options']['thinkingLevel'] = thinking
+            return j
+
+        # Gemini 2.5 maps thinkingLevel to thinkingBudget
+        p25_flash = build_payload(make_job('gemini-2.5-flash', 'medium'), job()['messages'][0])
+        self.assertEqual(p25_flash['generationConfig']['thinkingConfig'], {'thinkingBudget': 8192, 'includeThoughts': True})
+
+        p25_pro_min = build_payload(make_job('gemini-2.5-pro', 'minimal'), job()['messages'][0])
+        self.assertEqual(p25_pro_min['generationConfig']['thinkingConfig'], {'thinkingBudget': 128, 'includeThoughts': True})
+
+        # Gemini 3+ uses thinkingLevel + includeThoughts
+        p3 = build_payload(make_job('gemini-3-flash-preview', 'high'), job()['messages'][0])
+        self.assertEqual(p3['generationConfig']['thinkingConfig'], {'thinkingLevel': 'high', 'includeThoughts': True})
+
+        # Gemini 2.0 omits thinkingConfig even if thinkingLevel is passed
+        p20 = build_payload(make_job('gemini-2.0-flash', 'high'), job()['messages'][0])
+        self.assertNotIn('thinkingConfig', p20['generationConfig'])
+
+        # Arbitrary custom future model passes thinkingLevel when set and omits when blank
+        p_custom = build_payload(make_job('gemini-exp-custom', 'low'), job()['messages'][0])
+        self.assertEqual(p_custom['generationConfig']['thinkingConfig'], {'thinkingLevel': 'low', 'includeThoughts': True})
+        p_custom_off = build_payload(make_job('gemini-exp-custom', 'off'), job()['messages'][0])
+        self.assertNotIn('thinkingConfig', p_custom_off['generationConfig'])
+
+    async def test_run_job_applies_env_model_and_thinking_overrides(self):
+        claimed = job()
+        claimed['model'] = 'gemini-3.5-flash-lite'
+        claimed['options'] = {'concurrency': 1, 'maxOutputTokens': 2048, 'rpmPerKey': 15, 'rpdPerKey': 500, 'thinkingLevel': ''}
+        seen = {}
+        class PB:
+            async def post(self, path, data, **kwargs):
+                if path.endswith('/claim'):
+                    return claimed
+                if path.endswith('/start'):
+                    return {'send': True}
+                return {'ok': True}
+        async def fake_generate(client, pool, job_arg, msg_arg, **kwargs):
+            seen['model'] = job_arg['model']
+            seen['thinkingLevel'] = job_arg['options']['thinkingLevel']
+            return {'reply': 'ok', 'error': '', 'finishReason': 'STOP', 'usage': {}}
+        async def pool_factory(_):
+            return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+        import os
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {'GEMINI_MODEL': 'gemini-2.5-pro', 'GEMINI_THINKING_LEVEL': 'high'}), \
+             patch('gemini_text.generate', side_effect=fake_generate):
+            rc = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, {'model': 'gemini-2.5-pro', 'thinkingLevel': 'high'})
+
 
 if __name__ == '__main__':
     unittest.main()
