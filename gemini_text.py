@@ -412,7 +412,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     if is_antigravity(job['model']):
                         async def checkpoint(state=None):
                             return await pb.checkpoint(f"{endpoint}/checkpoint", identity, state)
-                        result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress)
+                        result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress, pb=pb)
                     else:
                         result = await generate(client, pool, job, message, progress=progress)
                 except AgentCanceled:

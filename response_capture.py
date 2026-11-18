@@ -142,7 +142,7 @@ def interaction_snapshot(data, *, secrets=()):
         else:
             parts.append({**base, 'type': 'artifact', 'data': step})
     return snapshot('interactions', parts, {k: data[k] for k in
-                    ('id', 'model', 'agent', 'status', 'created', 'updated', 'usage', 'error', 'incomplete_details') if k in data}, secrets=secrets)
+                    ('id', 'environment_id', 'model', 'agent', 'status', 'created', 'updated', 'usage', 'error', 'incomplete_details') if k in data}, secrets=secrets)
 
 
 def _secret_values(secrets=()):
