@@ -232,14 +232,19 @@ def parse_interaction(data, *, secrets=()):
     }
 
 
-async def request_json(client, method, url, key, payload=None):
-    async with client.stream(method, url, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
+async def request_json(client, method, url, key, payload=None, *, api_revision=None):
+    headers = {'x-goog-api-key': key, 'Content-Type': 'application/json'}
+    if api_revision is not None:
+        headers['Api-Revision'] = api_revision
+    async with client.stream(method, url, headers=headers,
                              json=payload, timeout=90) as response:
         raw = bytearray()
         async for block in response.aiter_bytes():
             raw.extend(block)
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise RuntimeError('Agent 响应超过 6 MiB，原 interaction 保留在上游。')
+        if response.status_code == 204 and not raw:
+            return response.status_code, response.headers, {}
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
@@ -262,10 +267,38 @@ def upstream_error(status, data, key):
     return RuntimeError(f'Antigravity 请求失败（HTTP {status}）：{detail or "请检查 Agent、参数及 API Key 权限"}')
 
 
-async def cancel_interaction(client, url, key):
-    status, _, data = await request_json(client, 'POST', url + '/cancel', key)
-    if status not in (200, 202):
+async def cancel_interaction(client, url, key, *, api_revision=None):
+    status, _, data = await request_json(client, 'POST', url + '/cancel', key, api_revision=api_revision)
+    if status not in (200, 202, 204):
         raise upstream_error(status, data, key)
+    return data
+
+
+async def reconcile_requested_cancel(client, url, key, *, sleep=asyncio.sleep):
+    for attempt, revision in enumerate(('2026-05-20', None)):
+        try:
+            async with asyncio.timeout(15):
+                canceled = await cancel_interaction(client, url, key, api_revision=revision)
+            state = canceled.get('status') if isinstance(canceled, dict) else None
+            if isinstance(state, str) and state in TERMINAL:
+                return state
+        except (RuntimeError, httpx.HTTPError, TimeoutError):
+            pass
+        # Read the saved interaction after a rejection or an asynchronous acceptance.
+        try:
+            async with asyncio.timeout(10):
+                status, _, data = await request_json(client, 'GET', url, key)
+        except (RuntimeError, httpx.HTTPError, TimeoutError):
+            break
+        state = data.get('status') if isinstance(data, dict) else None
+        if status != 200 or not isinstance(state, str):
+            break
+        if state in TERMINAL:
+            return state
+        if state not in ('in_progress', 'queued', 'pending') or attempt == 1:
+            break
+        await sleep(2)
+    return 'cancel_unconfirmed'
 
 
 async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asyncio.sleep, clock=time.monotonic, progress=None, pb=None):
@@ -389,7 +422,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             if progress is not None:
                 progress.snapshot(current)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
-                await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
+                control = await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
+                if control.get('canceled') and current['status'] != 'completed':
+                    await pool.mark_cancelled(index, lease)
+                    raise AgentCanceled('Agent 已取消')
                 await pool.mark_success(index, lease)
                 result = parse_interaction(current, secrets=pool.keys)
                 telemetry('completed',
@@ -405,9 +441,18 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 return result
             control = await checkpoint()
             if control.get('canceled'):
-                await cancel_interaction(client, url, key)
-                await checkpoint({'status': 'cancelled'})
-                await pool.mark_cancelled(index, lease)
+                if observer is not None:
+                    observer.cancel()
+                    await asyncio.gather(observer, return_exceptions=True)
+                    observer = None
+                upstream_status = await reconcile_requested_cancel(client, url, key, sleep=sleep)
+                telemetry('cancel_reconciled', status=upstream_status)
+                try:
+                    await checkpoint({'status': upstream_status})
+                except Exception as error:
+                    telemetry('cancel_checkpoint_failed', error_type=type(error).__name__)
+                finally:
+                    await pool.mark_cancelled(index, lease)
                 raise AgentCanceled('Agent 已取消')
             await sleep(3)
             try:
@@ -447,6 +492,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     except asyncio.CancelledError:
         try:
             await asyncio.shield(cancel_interaction(client, url, key))
+        except (RuntimeError, httpx.HTTPError, TimeoutError) as error:
+            telemetry('cancel_failed', error_type=type(error).__name__)
         finally:
             await pool.mark_cancelled(index, lease)
         raise

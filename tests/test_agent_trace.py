@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 
-from agent_diagnostics import diagnose
+from agent_diagnostics import diagnose, reconcile_canceled_job
 from agent_trace import AgentTrace, MAX_EVENT_BYTES, observe_stream, sse_events
 
 
@@ -228,3 +228,38 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                 result = await diagnose(client, 'https://pb.fixture', 'fixture-pb', 'j' * 15, [key], 10)
         self.assertEqual(result, 0)
         self.assertEqual(methods, ['GET', 'GET', 'GET'])
+
+
+    async def test_retry_cancel_requires_an_explicit_pocketbase_cancellation(self):
+        async def outbound(request):
+            self.assertEqual(request.method, 'GET')
+            self.assertTrue(request.url.path.endswith('/' + 'j' * 15))
+            return httpx.Response(200, json={'status': 'running', 'cancelRequested': False})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            with self.assertRaisesRegex(RuntimeError, 'explicit cancellation'):
+                await reconcile_canceled_job(client, 'https://pb.fixture', 'fixture-pb', 'j' * 15, ['fixture-key'])
+
+    async def test_retry_cancel_only_sends_cancel_for_the_saved_original_run(self):
+        requests = []
+        key = 'fixture-key'
+
+        async def outbound(request):
+            requests.append((request.url.host, request.method, request.url.path))
+            if request.url.host == 'pb.fixture':
+                if request.url.path.endswith('aw_gemini_messages/records'):
+                    return httpx.Response(200, json={'items': [{'index': 1, 'status': 'failed',
+                        'providerState': {'id': 'v1_saved', 'credentialHash': hashlib.sha256(key.encode()).hexdigest()}}]})
+                return httpx.Response(200, json={'status': 'canceled', 'cancelRequested': True})
+            self.assertEqual(request.headers['x-goog-api-key'], key)
+            if request.method == 'POST':
+                self.assertEqual(request.headers['Api-Revision'], '2026-05-20')
+                self.assertTrue(request.url.path.endswith('/v1_saved/cancel'))
+                return httpx.Response(200, json={'status': 'cancelled'})
+            self.assertTrue(request.url.path.endswith('/v1_saved'))
+            return httpx.Response(200, json={'status': 'in_progress'})
+
+        with patch('builtins.print'):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                self.assertEqual(await reconcile_canceled_job(
+                    client, 'https://pb.fixture', 'fixture-pb', 'j' * 15, [key]), 0)
+        self.assertEqual([method for _, method, _ in requests], ['GET', 'GET', 'GET', 'POST'])

@@ -376,6 +376,32 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row['segment'] for row in rows if row['event'] == 'reply'}, {1, 2})
         self.assertIn('partial answer', logs.getvalue())
 
+    async def test_error_after_user_cancel_does_not_overwrite_pocketbase(self):
+        value = job(1)
+        value['model'] = 'Antigravity'
+        value['messages'] = value['messages'][:1]
+        calls = []
+
+        class PB:
+            async def post(self, path, data, **kwargs):
+                action = path.rsplit('/', 1)[-1]
+                calls.append(action)
+                if action == 'claim': return value
+                if action == 'start': return {'send': True}
+                raise AssertionError(f'Unexpected write: {action}')
+
+            async def checkpoint(self, *args):
+                return {'canceled': True}
+
+        async def pool_factory(_):
+            return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+                'gemini_text.generate', side_effect=RuntimeError('Precondition check failed.')):
+            self.assertEqual(await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory)), 0)
+            self.assertEqual(list(Path(directory).glob('*.json')), [])
+        self.assertEqual(calls, ['claim', 'start'])
+
     async def test_cancel_or_ambiguous_permit_never_sends(self):
         value = job()
         async def pool_factory(_): return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)

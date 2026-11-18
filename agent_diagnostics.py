@@ -1,4 +1,4 @@
-"""Read-only trace of saved interactions. Never claim, create, complete or cancel a job."""
+"""Inspect stored interactions and reconcile explicitly canceled PocketBase jobs."""
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from agent_trace import AgentTrace, TERMINAL, watch_interaction
-from gemini_agent import ROOT, request_json
+from gemini_agent import ROOT, reconcile_requested_cancel, request_json
 from gemini_text import PocketBase
 
 
@@ -66,7 +66,45 @@ async def diagnose(client, root, token, job_id, keys, seconds):
     return 0 if all(await asyncio.gather(*(bounded(m) for m in messages))) else 2
 
 
-async def main(request_id=None):
+async def reconcile_canceled_job(client, root, token, job_id, keys):
+    headers = {'Authorization': token}
+    saved = await client.get(f'{root}/api/collections/aw_gemini_jobs/records/{job_id}',
+                             params={'fields': 'id,status,cancelRequested'}, headers=headers, timeout=30)
+    if (saved.status_code != 200 or saved.json().get('status') != 'canceled'
+            or saved.json().get('cancelRequested') is not True):
+        raise RuntimeError('PocketBase does not show an explicit cancellation for this job')
+    rows = await client.get(f'{root}/api/collections/aw_gemini_messages/records',
+                            params={'filter': f'job="{job_id}" && attempted=true', 'perPage': 100,
+                                    'fields': 'index,status,providerState'},
+                            headers=headers, timeout=30)
+    if rows.status_code != 200:
+        raise RuntimeError('PocketBase rejected the canceled message lookup')
+
+    candidates = [message for message in rows.json().get('items', []) if message['status'] in ('canceled', 'failed')]
+    if not candidates:
+        raise RuntimeError('No attempted canceled messages found')
+    unconfirmed = False
+    for message in candidates:
+        trace = AgentTrace(job=job_id, segment=message['index'], secrets=keys, verbose=False)
+        state = message.get('providerState') or {}
+        if isinstance(state, str):
+            state = json.loads(state)
+        key = next((key for key in keys if hashlib.sha256(key.encode()).hexdigest() == state.get('credentialHash')), None)
+        if not key or not state.get('id'):
+            trace.emit('cancel_unavailable', reason='saved interaction or matching credential missing')
+            unconfirmed = True
+            continue
+        url = f'{ROOT}/{quote(state["id"], safe="")}'
+        status, _, data = await request_json(client, 'GET', url, key)
+        state = data.get('status') if status == 200 and isinstance(data, dict) else None
+        if not isinstance(state, str) or state not in TERMINAL:
+            state = await reconcile_requested_cancel(client, url, key)
+        trace.emit('cancel_reconciled', status=state)
+        unconfirmed = unconfirmed or state == 'cancel_unconfirmed'
+    return 2 if unconfirmed else 0
+
+
+async def main(request_id=None, *, retry_cancel=False):
     root = os.environ.get('GEMINI_PB_URL', '').rstrip('/')
     job_id = request_id or os.environ.get('REQUEST_ID', '')
     if not re.fullmatch(r'https://[^/?#@]+', root) or not re.fullmatch(r'[a-z0-9]{15}', job_id):
@@ -82,6 +120,8 @@ async def main(request_id=None):
         await pb.authenticate(token=os.environ.get('POCKETBASE_SERVER_TOKEN', ''),
                               email=os.environ.get('GEMINI_PB_EMAIL', ''),
                               password=os.environ.get('GEMINI_PB_PASSWORD', ''))
+        if retry_cancel:
+            return await reconcile_canceled_job(client, root, pb.token, job_id, keys)
         return await diagnose(client, root, pb.token, job_id, keys, seconds)
 
 

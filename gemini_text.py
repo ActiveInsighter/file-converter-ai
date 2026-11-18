@@ -374,7 +374,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     job = await pb.post(f"{path}/claim", identity, retries=3)
     pool = await pool_factory(job["options"])
     job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
-    protocol = 'interactions' if is_antigravity(job['model']) else 'generateContent'
+    antigravity = is_antigravity(job['model'])
+    protocol = 'interactions' if antigravity else 'generateContent'
     job_log.emit('job_started', model=job['model'], protocol=protocol,
                  segments=len(job['messages']), concurrency=job['options']['concurrency'])
     queue = asyncio.Queue()
@@ -409,7 +410,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 progress_task = asyncio.create_task(progress.pump())
                 stage = 'generation'
                 try:
-                    if is_antigravity(job['model']):
+                    if antigravity:
                         async def checkpoint(state=None):
                             return await pb.checkpoint(f"{endpoint}/checkpoint", identity, state)
                         result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress, pb=pb)
@@ -420,6 +421,16 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                     log.emit('segment_canceled')
                     continue
                 except Exception as error:
+                    if antigravity:
+                        try:
+                            stopped = (await checkpoint()).get('canceled', False)
+                        except Exception as check_error:
+                            stopped = False
+                            log.emit('cancel_check_failed', error_type=type(check_error).__name__)
+                        if stopped:
+                            counts['canceled'] += 1
+                            log.emit('segment_canceled')
+                            continue
                     # Never include provider bodies, credentials, or source text in logs.
                     detail = str(error)
                     secrets = [*pool.keys, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '')]
@@ -525,6 +536,9 @@ async def main():
     if not args.recover_dir and re.fullmatch(r'sync-[a-z0-9]{15}', job_id):
         from agent_progress_sync import main as sync_main
         return await sync_main(job_id.removeprefix('sync-'))
+    if not args.recover_dir and re.fullmatch(r'cancel-requested-[a-z0-9]{15}', job_id):
+        from agent_diagnostics import main as reconcile_cancel
+        return await reconcile_cancel(job_id.removeprefix('cancel-requested-'), retry_cancel=True)
     if not args.recover_dir and re.fullmatch(r'trace-[a-z0-9]{15}', job_id):
         from agent_diagnostics import main as diagnose_main
         return await diagnose_main(job_id.removeprefix('trace-'))

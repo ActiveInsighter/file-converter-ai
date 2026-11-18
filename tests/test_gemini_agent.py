@@ -301,6 +301,38 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                 await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint)
         self.assertEqual(canceled, ['/v1beta/interactions/v1_cancel/cancel'])
 
+    async def test_user_cancel_precondition_reconciles_original_interaction(self):
+        for remote_status, requests, saved_status in (
+            ('cancelled', ['POST', 'cancel', 'GET'], 'cancelled'),
+            ('in_progress', ['POST', 'cancel', 'GET', 'cancel', 'GET'], 'cancel_unconfirmed'),
+        ):
+            with self.subTest(remote_status=remote_status):
+                state, sent = {}, []
+
+                async def checkpoint(update=None):
+                    if update: state.update(update)
+                    return {'state': state.copy(), 'canceled': bool(state.get('id'))}
+
+                async def outbound(request):
+                    if request.url.path.endswith('/cancel'):
+                        sent.append('cancel')
+                        return httpx.Response(400, json={'error': {'message': 'Precondition check failed.'}})
+                    sent.append(request.method)
+                    status = remote_status if request.method == 'GET' else 'in_progress'
+                    return httpx.Response(200, json={'id': 'fixture-cancel', 'status': status})
+
+                async def sleep(_):
+                    pass
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                    with self.assertRaises(AgentCanceled):
+                        await generate_agent(
+                            client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100),
+                            job(), {}, checkpoint=checkpoint, sleep=sleep,
+                        )
+                self.assertEqual(sent, requests)
+                self.assertEqual(state['status'], saved_status)
+
     async def test_ambiguous_create_is_not_retried(self):
         calls = 0
         async def checkpoint(update=None): return {'state': {}, 'canceled': False}
