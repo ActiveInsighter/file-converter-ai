@@ -80,6 +80,73 @@ class TextPayloadTests(unittest.TestCase):
 
 
 class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_jobs_preserve_sandbox_across_turns(self):
+        first_id, second_id = 'a' * 15, 'b' * 15
+        first_message, second_message = 'c' * 15, 'd' * 15
+        jobs = {
+            first_id: {**job(1), 'id': first_id, 'model': 'Antigravity', 'prompt': 'write marker'},
+            second_id: {**job(1), 'id': second_id, 'model': 'Antigravity', 'prompt': 'read marker',
+                        'history': [{'role': 'user', 'text': 'write marker'}]},
+        }
+        for job_id, message_id in ((first_id, first_message), (second_id, second_message)):
+            jobs[job_id]['messages'] = [{'id': message_id, 'index': 1, 'status': 'queued'}]
+        states, completed, creates = {}, {}, []
+
+        async def outbound(request):
+            path = request.url.path.split('/')
+            if request.url.host != 'pb.example':
+                self.assertEqual(request.method, 'POST')
+                payload = json.loads(request.content)
+                creates.append((request.headers['x-goog-api-key'], payload))
+                if len(creates) == 1:
+                    return httpx.Response(200, json={'id': 'first-turn', 'status': 'completed',
+                        'environment_id': 'shared-sandbox', 'output_text': 'marker written'})
+                self.assertEqual(payload['environment'], 'shared-sandbox')
+                self.assertEqual(payload['previous_interaction_id'], 'first-turn')
+                self.assertEqual(payload['input'], 'read marker')
+                return httpx.Response(200, json={'id': 'second-turn', 'status': 'completed',
+                    'environment_id': 'shared-sandbox', 'output_text': 'marker found'})
+
+            self.assertEqual(request.headers['Authorization'], 'fixture-pb-token')
+            if request.method == 'GET':
+                # The deployed claim API omits relationship fields.
+                if path[3] == 'aw_gemini_jobs':
+                    parent = first_message if path[-1] == second_id else ''
+                    return httpx.Response(200, json={'parentMessage': parent})
+                self.assertEqual(path[-1], first_message)
+                return httpx.Response(200, json={'providerState': states[first_message]})
+            action = path[-1]
+            if action == 'claim':
+                return httpx.Response(200, json=jobs[path[-2]])
+            if action == 'start':
+                return httpx.Response(200, json={'send': True})
+            body = json.loads(request.content)
+            message_id = path[-2]
+            if action == 'checkpoint':
+                state = states.setdefault(message_id, {})
+                state.update(body.get('state', {}))
+                return httpx.Response(200, json={'state': state, 'canceled': False})
+            if action == 'complete':
+                completed[message_id] = body
+            else:
+                self.assertEqual(action, 'progress')
+            return httpx.Response(200, json={})
+
+        async def pool_factory(_):
+            return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            pb = PocketBase(client, 'https://pb.example')
+            await pb.authenticate(token='fixture-pb-token')
+            with tempfile.TemporaryDirectory() as directory:
+                for job_id in (first_id, second_id):
+                    self.assertEqual(await run_job(pb, client, job_id, '123:1', pool_factory, Path(directory)), 0)
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(creates[0][0], creates[1][0])
+        self.assertNotIn('previous_interaction_id', creates[0][1])
+        self.assertEqual(completed[second_message]['reply'], 'marker found')
+        self.assertEqual(states[second_message]['environmentId'], states[first_message]['environmentId'])
+
     async def test_agent_checkpoint_outage_recovers_without_recreating_or_canceling(self):
         from gemini_agent import generate_agent
         state, requests, delays = {}, [], []

@@ -188,11 +188,11 @@ class PocketBase:
         return await self.post(path, {**identity, **({'state': state} if state is not None else {})}, retries=12)
 
 
-async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None) -> dict:
+async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None, pb=None) -> dict:
     if is_antigravity(job['model']):
         if checkpoint is None:
             raise RuntimeError('Agent requires durable execution state')
-        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress)
+        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress, pb=pb)
     provider = GeminiProvider()
     payload = build_payload(job, message)
     last_http_error = ''
