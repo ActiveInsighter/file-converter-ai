@@ -227,11 +227,8 @@ PocketBase 用户 ID、额外后端迁移或 Google Credentials API。
 Antigravity Interactions API 请求时检测密钥；只要已配置，GitHub Git/REST 认证就始终可用，
 不再依赖“仓库”“分支”等提示词关键词。默认使用 REST/Git 和精简的工作区 helper，
 不加载完整 GitHub MCP 工具目录；特殊调用可显式设置 `options.agent.githubMcpEnabled=true`。
-项目任务在创建 Google interaction 前解析目标仓库，并在需要推送代码时用只读 Git
-receive-pack 握手检查实际写权限。检查不修改仓库；拒绝时立即说明目标和所需权限，
-不先花几十分钟改代码。它检查普通 Git 写权限，不替代分支保护、workflow 文件权限或 PR 权限。
-执行器优先明确的 owner/repository，其次匹配当前 Token 可访问仓库的精简清单，
-不在全 GitHub 搜索 `remote`、`exam` 等泛词。仓库歧义明确报出候选，不盲选。
+执行器直接创建 Google interaction。Agent 根据请求和可访问的仓库清单确定目标，
+实际 Git 和 REST 操作由 GitHub 按 Token 权限处理。
 只有需要源码的任务才克隆指定仓库到 `/workspace`，不预先克隆所有仓库。
 单纯重新部署使用 workflow API，不先克隆、安装依赖或本地构建。
 为空则保持原来的普通 Agent 模式。
@@ -244,8 +241,7 @@ receive-pack 握手检查实际写权限。检查不修改仓库；拒绝时立�
 但不应进入模型提示词、代码仓库文件、生成日志或用户可见消息。
 建议使用最小范围、短有效期的 PAT，定期轮换。
 
-配置后先在 Remote 的「Gemini 消息」选择 Antigravity，要求它只读取目标仓库并测试
-GitHub REST 访问；需要修改源码时，执行器还会在开始前验证 Git 写权限。
+配置后可以在 Remote 的「Gemini 消息」选择 Antigravity，请它读取目标仓库以验证 GitHub REST 访问。
 **不要直接推送 `main`**：Anyworkflow-remote 的 `main` 推送会触发正式 Cloudflare 部署。
 真实凭据能力检查、工作区恢复和运行时探针记录在本次修复说明中。
 

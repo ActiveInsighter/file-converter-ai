@@ -20,7 +20,7 @@ import httpx
 from agent_trace import AgentTrace, TERMINAL
 from response_capture import extract_structured_payload, interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
-from github_context import is_project_task, prepare_github_context, task_text
+from github_context import is_project_task, task_text
 
 ROOT = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 DEFAULT_AGENT = 'antigravity-preview-09-2026'
@@ -207,11 +207,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     def telemetry(event, **fields):
         agent_telemetry(event, **trace.context, **fields)
     state = (await checkpoint()).get('state') or {}
-    if not state.get('id'):
-        context = await prepare_github_context(client, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''),
-                                               task_text(job, message), trace=trace)
-        if context:
-            payload['system_instruction'] = payload.get('system_instruction', '') + '\n\nTrusted task context:\n' + json.dumps(context)
     telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
