@@ -187,6 +187,36 @@ class PocketBase:
         # keep the same execution identity through that recovery window.
         return await self.post(path, {**identity, **({'state': state} if state is not None else {})}, retries=12)
 
+    async def patch_record(self, collection: str, record_id: str, data: dict) -> bool:
+        if not self.root or not self.token or not record_id:
+            return False
+        try:
+            response = await self.client.patch(
+                f"{self.root}/api/collections/{collection}/records/{record_id}",
+                headers={"Authorization": self.token},
+                json=data,
+                timeout=15,
+            )
+            return response.is_success
+        except httpx.HTTPError:
+            return False
+
+    async def update_job_title(self, job_id: str, title: str) -> bool:
+        if not self.root or not self.token or not job_id or not title:
+            return False
+        if await self.patch_record("aw_gemini_jobs", job_id, {"title": title, "titleGenerated": True}):
+            return True
+        try:
+            response = await self.client.patch(
+                f"{self.root}/api/anyworkflow/{self.api_prefix}/jobs/{job_id}/metadata",
+                headers={"Authorization": self.token},
+                json={"title": title, "titleGenerated": True},
+                timeout=15,
+            )
+            return response.is_success
+        except httpx.HTTPError:
+            return False
+
 
 async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None, pb=None) -> dict:
     if is_antigravity(job['model']):
@@ -479,9 +509,38 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
             finally:
                 queue.task_done()
 
+    title_task: asyncio.Task | None = None
+    if antigravity:
+        from fast_model import generate_title, resolve_fast_model, should_generate_title
+        if should_generate_title(job):
+            user_text = str(job.get('prompt') or '')
+            if not user_text and job.get('messages'):
+                user_text = str(job['messages'][0].get('inputText') or '')
+            fast_model = resolve_fast_model(job)
+
+            async def _generate_and_save_title():
+                try:
+                    generated = await generate_title(client, pool.keys, user_text, model=fast_model)
+                    if generated:
+                        saved_ok = await pb.update_job_title(job_id, generated)
+                        job_log.emit('title_generated', saved=saved_ok, length=len(generated), model=fast_model)
+                except Exception as exc:
+                    job_log.emit('title_generation_failed', error_type=type(exc).__name__)
+
+            title_task = asyncio.create_task(_generate_and_save_title())
+
     try:
         await asyncio.gather(*(worker() for _ in range(job["options"]["concurrency"])))
+        if title_task is not None and not title_task.done():
+            try:
+                async with asyncio.timeout(5):
+                    await title_task
+            except (TimeoutError, Exception):
+                title_task.cancel()
     finally:
+        if title_task is not None and not title_task.done():
+            title_task.cancel()
+            await asyncio.gather(title_task, return_exceptions=True)
         await pool.close()
     totals = {}
     for name, key in TOKEN_FIELDS.items():

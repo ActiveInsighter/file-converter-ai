@@ -95,6 +95,8 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         async def outbound(request):
             path = request.url.path.split('/')
             if request.url.host != 'pb.example':
+                if ':generateContent' in request.url.path:
+                    return httpx.Response(200, json={'candidates': [{'content': {'parts': [{'text': '测试标题'}]}}]})
                 self.assertEqual(request.method, 'POST')
                 payload = json.loads(request.content)
                 creates.append((request.headers['x-goog-api-key'], payload))
@@ -108,6 +110,8 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
                     'environment_id': 'shared-sandbox', 'output_text': 'marker found'})
 
             self.assertEqual(request.headers['Authorization'], 'fixture-pb-token')
+            if request.method == 'PATCH':
+                return httpx.Response(200, json={})
             self.assertEqual(request.method, 'POST')
             action = path[-1]
             if action == 'claim':

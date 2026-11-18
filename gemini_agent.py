@@ -344,6 +344,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
         if resumed:
             # Resume the original remote execution, never create a second interaction.
             current = {'id': state['id'], 'status': 'in_progress'}
+            if progress is not None:
+                progress.mark_submitted()
             break
         try:
             create_started = clock()
@@ -360,6 +362,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             current = data
             if not isinstance(data.get('id'), str) or not data['id']:
                 raise RuntimeError('Agent 未返回 interaction ID；未自动重发。')
+            if progress is not None:
+                progress.mark_submitted()
             telemetry('created', elapsed_seconds=round(clock() - started, 2),
                             status=data.get('status', 'unknown'),
                             environment_created=bool(data.get('environment_id')))
@@ -406,6 +410,37 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     last_report = started
     last_status = None
     seen_steps = set()
+    from fast_model import SUMMARY_INTERVAL_SECONDS, resolve_fast_model, summarize_agent_progress
+    fast_model = resolve_fast_model(job)
+    last_summary_at = started
+    last_summary_steps = 0
+    summary_task: asyncio.Task | None = None
+
+    async def _run_summary(step_count: int, run_status: str):
+        if progress is None:
+            return
+        try:
+            summary = await summarize_agent_progress(
+                client,
+                pool.keys,
+                user_prompt=str(message.get('inputText') or job.get('prompt') or ''),
+                history=job.get('history'),
+                parts=progress.parts,
+                step_count=step_count,
+                status=run_status,
+                model=fast_model,
+            )
+            if summary:
+                progress.set_summary(summary)
+                telemetry('summary_updated', step_count=step_count, model=fast_model)
+                if pb is not None and hasattr(pb, 'patch_record') and progress.message_id:
+                    await pb.patch_record('aw_gemini_messages', progress.message_id, {
+                        'summary': summary,
+                        'timeline': progress.timeline,
+                    })
+        except Exception as exc:
+            telemetry('summary_failed', error_type=type(exc).__name__)
+
     try:
         while True:
             for idx, step in enumerate(current.get('steps') or current.get('outputs') or []):
@@ -421,6 +456,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                               **({'is_error': True} if step.get('is_error') else {}))
             if progress is not None:
                 progress.snapshot(current)
+            current_step_count = max(len(seen_steps), progress.usage.get('agentStepCount', 0) if progress is not None else 0)
             if current.get('status') in ['completed', 'failed', 'incomplete', 'requires_action', 'cancelled', 'canceled']:
                 control = await checkpoint({'status': current['status'], **({'environmentId': current['environment_id']} if current.get('environment_id') else {})})
                 if control.get('canceled') and current['status'] != 'completed':
@@ -428,6 +464,19 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     raise AgentCanceled('Agent 已取消')
                 await pool.mark_success(index, lease)
                 result = parse_interaction(current, secrets=pool.keys)
+                if progress is not None:
+                    if summary_task is not None and not summary_task.done():
+                        try:
+                            async with asyncio.timeout(5):
+                                await summary_task
+                        except (TimeoutError, Exception):
+                            summary_task.cancel()
+                    if current_step_count > last_summary_steps or progress.summary is None:
+                        try:
+                            async with asyncio.timeout(12):
+                                await _run_summary(current_step_count, str(current.get('status') or 'completed'))
+                        except (TimeoutError, Exception):
+                            pass
                 telemetry('completed',
                     status=current['status'],
                     elapsed_seconds=round(clock() - started, 2),
@@ -439,6 +488,13 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     annotations_count=len(result.get('annotations') or []),
                     **agent_usage_diagnostics(current))
                 return result
+            if (progress is not None
+                    and (summary_task is None or summary_task.done())
+                    and current_step_count > last_summary_steps
+                    and clock() - last_summary_at >= SUMMARY_INTERVAL_SECONDS):
+                last_summary_at = clock()
+                last_summary_steps = current_step_count
+                summary_task = asyncio.create_task(_run_summary(current_step_count, str(current.get('status') or 'running')))
             control = await checkpoint()
             if control.get('canceled'):
                 if observer is not None:
@@ -507,6 +563,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             telemetry('cancel_failed', error_type=type(cancel_error).__name__)
         raise
     finally:
+        if summary_task is not None and not summary_task.done():
+            summary_task.cancel()
+            await asyncio.gather(summary_task, return_exceptions=True)
         if observer is not None:
             observer.cancel()
             await asyncio.gather(observer, return_exceptions=True)

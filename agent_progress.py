@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from datetime import datetime, timezone
 import json
 import re
 import time
@@ -27,6 +28,22 @@ class MessageProgress:
         self.redactor = AgentTrace(secrets=secrets, verbose=False)
         self.parts, self.dirty, self.usage, self.steps = {}, set(), {}, {}
         self._last_flushed_usage = {}
+        self.summary = None
+        self._last_flushed_summary = None
+        self._started_mono = clock()
+        self._last_node_mono = self._started_mono
+        self.timeline = {
+            'startedAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+            'submittedAt': None,
+            'submittedOffsetMs': None,
+            'firstReplyAt': None,
+            'firstReplyOffsetMs': None,
+            'finishedAt': None,
+            'totalDurationMs': None,
+            'steps': [],
+        }
+        self._last_flushed_timeline = None
+        self._timeline_keys = set()
         self.sequence = 0
         self.capture_bytes = 0
         self.post, self.identity, self.target = post, identity or {}, target
@@ -95,6 +112,48 @@ class MessageProgress:
             self.parts[key] = part
             self.capture_bytes += len(part['content'].encode()) - old_bytes
             self.dirty.add(key)
+            if kind != 'status' and key != 'annotations' and key not in self._timeline_keys:
+                self._timeline_keys.add(key)
+                now_mono = self.clock()
+                now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                offset_ms = max(0, round((now_mono - self._started_mono) * 1000))
+                delta_ms = max(0, round((now_mono - self._last_node_mono) * 1000))
+                self._last_node_mono = now_mono
+                if self.timeline['firstReplyAt'] is None:
+                    self.timeline['firstReplyAt'] = now_iso
+                    self.timeline['firstReplyOffsetMs'] = offset_ms
+                if len(self.timeline['steps']) < 200:
+                    label = tool_name or provider_type or (
+                        '思考分析' if kind == 'reasoning_summary'
+                        else '生成回复' if kind == 'text'
+                        else '工具调用' if kind in ('tool_call', 'tool_result')
+                        else kind
+                    )
+                    self.timeline['steps'].append({
+                        'index': len(self.timeline['steps']),
+                        'key': key,
+                        'type': kind,
+                        'label': str(label)[:80],
+                        'receivedAt': now_iso,
+                        'offsetMs': offset_ms,
+                        'deltaMs': delta_ms,
+                    })
+
+    def mark_submitted(self):
+        if self.timeline['submittedAt'] is None:
+            now_mono = self.clock()
+            self.timeline['submittedAt'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+            self.timeline['submittedOffsetMs'] = max(0, round((now_mono - self._started_mono) * 1000))
+            self._last_node_mono = now_mono
+
+    def mark_finished(self):
+        now_mono = self.clock()
+        self.timeline['finishedAt'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+        self.timeline['totalDurationMs'] = max(0, round((now_mono - self._started_mono) * 1000))
+
+    def set_summary(self, summary: dict | None):
+        if isinstance(summary, dict) and summary:
+            self.summary = summary
 
     def snapshot(self, data):
         raw_usage = data.get('usage') or {}
@@ -251,12 +310,18 @@ class MessageProgress:
             # At most four 60 KiB parts per request, below the server's 256 KiB limit.
             keys = sorted(self.dirty, key=lambda key: self.parts[key]['sequence'])
             usage_changed = self.usage != self._last_flushed_usage
-            if not keys and self.pending is None and not usage_changed and not force:
+            summary_changed = self.summary is not None and self.summary != self._last_flushed_summary
+            timeline_snapshot = json.loads(json.dumps(self.timeline, ensure_ascii=False))
+            timeline_changed = timeline_snapshot != self._last_flushed_timeline
+            if not keys and self.pending is None and not usage_changed and not summary_changed and not timeline_changed and not force:
                 return
             while True:
                 if self.pending is None:
                     batch = []
                     body = {**self.identity, 'sequence': self.sequence + 1, 'parts': batch, 'usage': self.usage.copy()}
+                    if self.summary is not None:
+                        body['summary'] = self.summary
+                    body['timeline'] = timeline_snapshot
                     for key in keys[:4]:
                         batch.append(self.parts[key].copy())
                         if len(json.dumps(body, ensure_ascii=False).encode()) > 250 * 1024:
@@ -272,6 +337,10 @@ class MessageProgress:
                 self.last_flushed_at = self.clock()
                 self.sequence = self.pending['sequence']
                 self._last_flushed_usage = self.pending['usage'].copy()
+                if 'summary' in self.pending:
+                    self._last_flushed_summary = self.pending['summary']
+                if 'timeline' in self.pending:
+                    self._last_flushed_timeline = self.pending['timeline']
                 for saved in self.pending['parts']:
                     if self.parts.get(saved['key']) == saved:
                         self.dirty.discard(saved['key'])
@@ -312,6 +381,7 @@ class MessageProgress:
                 await sleep(min(2 ** failures, 30))
 
     def finalize(self, result):
+        self.mark_finished()
         usage = result.get('usage') or {}
         self.usage.update({key: value for key, value in usage.items() if key in {*USAGE.values(), 'agentStepCount'} and type(value) is int and value >= 0})
         if result.get('reply') and not any(p['type'] == 'text' for p in self.parts.values()):
@@ -320,6 +390,10 @@ class MessageProgress:
             self.put('annotations', 'annotations', json.dumps(result['annotations'], ensure_ascii=False), provider_type='annotations')
         self.put('agent-status', 'status', result.get('error') or result.get('finishReason') or 'completed',
                  status='failed' if result.get('error') else 'completed')
+        if self.summary is not None and 'summary' not in result:
+            result['summary'] = self.summary
+        if 'timeline' not in result:
+            result['timeline'] = json.loads(json.dumps(self.timeline, ensure_ascii=False))
 
 
 async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):

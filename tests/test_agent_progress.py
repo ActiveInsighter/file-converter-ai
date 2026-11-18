@@ -250,6 +250,8 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             return {'state': state, 'canceled': False}
         async def outbound(request):
             nonlocal creates, snapshots
+            if request.method == 'POST' and ':generateContent' in request.url.path:
+                return httpx.Response(200, json={'candidates': [{'content': {'parts': [{'text': '{"overview":"ok","sentSummary":"ok","actions":[],"completed":[],"issues":[]}'}]}}]})
             if request.method == 'POST':
                 creates += 1
                 return httpx.Response(200, json={'id': 'agent-1', 'status': 'in_progress'})
