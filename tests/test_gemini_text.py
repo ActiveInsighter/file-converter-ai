@@ -281,6 +281,32 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 1)
         self.assertNotIn('tools', captured[0])
 
+    async def test_progress_conflict_does_not_block_final_reply(self):
+        value = job(1)
+        value['messages'] = value['messages'][:1]
+        calls = []
+        class PB:
+            async def post(self, path, data, **kwargs):
+                calls.append((path.rsplit('/', 1)[-1], data))
+                if path.endswith('/claim'): return value
+                if path.endswith('/start'): return {'send': True}
+                if path.endswith('/progress'): raise RuntimeError('PB request failed (HTTP 409)')
+                return {'status': 'succeeded'}
+
+        async def pool_factory(_):
+            return KeyPool(['fixture-key'], rpm_per_key=1e6, rpd_per_key=100)
+
+        answer = {'reply': 'complete reply', 'error': '', 'finishReason': 'STOP', 'usage': {}}
+        with tempfile.TemporaryDirectory() as directory, patch('gemini_text.generate', return_value=answer) as model:
+            result = await run_job(PB(), None, 'a' * 15, '123:1', pool_factory, Path(directory))
+            self.assertEqual(result, 0)
+            self.assertEqual(list(Path(directory).glob('*.json')), [])
+            model.assert_awaited_once()
+
+        self.assertEqual([action for action, _ in calls], ['claim', 'start', 'progress', 'complete'])
+        self.assertEqual(calls[-1][1]['reply'], 'complete reply')
+        self.assertEqual(calls[-1][1]['executionId'], '123:1')
+
     async def test_database_outage_keeps_recovery_artifact_and_no_model_resend(self):
         value = job(1)
         value['messages'] = value['messages'][:1]
@@ -302,7 +328,7 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(events.index('reply'), events.index('segment_error'))
             self.assertEqual(next(row for row in rows if row['event'] == 'reply')['text'], 'unsaved reply')
             error = next(row for row in rows if row['event'] == 'segment_error')
-            self.assertEqual(error['stage'], 'progress_persistence')
+            self.assertEqual(error['stage'], 'persistence')
             self.assertEqual(error['error'], 'PB offline')
             self.assertTrue(error['recovery_available'])
             self.assertEqual(model.call_count, 1)
@@ -311,8 +337,12 @@ class TextRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(paths[0].read_text())['result']['reply'], 'unsaved reply')
             saved = []
             class RecoveryPB:
-                async def post(self, path, data, **kwargs): saved.append((path, data))
+                async def post(self, path, data, **kwargs):
+                    if path.endswith('/progress'): raise RuntimeError('PB request failed (HTTP 409)')
+                    saved.append((path, data))
             await recover(RecoveryPB(), Path(directory))
+            self.assertEqual(len(saved), 1)
+            self.assertTrue(saved[0][0].endswith('/complete'))
             self.assertEqual(saved[0][1]['executionId'], '123:1')
             self.assertEqual(model.call_count, 1)
 

@@ -14,6 +14,27 @@ from key_pool import KeyPool
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compacted_terminal_snapshot_preserves_streamed_step_identity(self):
+        writes = []
+        async def post(body):
+            writes.extend(body['parts'])
+            return {'accepted': True}
+
+        progress = MessageProgress(post=post)
+        progress.consume({'index': 1, 'step': {'type': 'text', 'text': 'written reply'}}, 'step.stop')
+        await progress.flush()
+
+        progress.snapshot({'status': 'completed', 'steps': [
+            {'type': 'text', 'text': 'written reply'},
+            {'type': 'function_call', 'name': 'tool from a shifted position'},
+        ]})
+        await progress.flush()
+
+        self.assertEqual(progress.parts['step:1']['type'], 'text')
+        self.assertEqual(progress.parts['step:1']['sequence'], 2)
+        self.assertNotIn('step:0', progress.parts)
+        self.assertEqual([part['type'] for part in writes if part['key'] == 'step:1'], ['text'])
+
     async def test_quiet_agent_sends_heartbeat_without_rewriting_content(self):
         now, writes = [0.0], []
         async def post(body): writes.append((now[0], json.loads(json.dumps(body)))); return {}

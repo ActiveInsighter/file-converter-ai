@@ -40,6 +40,7 @@ class MessageProgress:
         self.clock = clock
         self.last_flushed_at = clock()
         self.replay_completed = set()
+        self.stream_steps_seen = False
 
     def begin_stream(self):
         if not self.last_event_id:
@@ -50,6 +51,9 @@ class MessageProgress:
 
     def put(self, key, kind, content='', *, status='completed', tool_name='', call_id='', provider_type='', truncated=False, payload=None, tool_kind=''):
         previous = self.parts.get(key)
+        # PocketBase fixes each part's key, sequence and type on first write.
+        if previous is not None and previous['type'] != kind:
+            return
         if previous is None and len(self.parts) >= 10000:
             return
         content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', self.redactor.redact(content))
@@ -98,9 +102,12 @@ class MessageProgress:
                            if type(raw_usage.get(src)) is int and raw_usage[src] >= 0})
         steps = data.get('steps') or data.get('outputs') or []
         self.usage['agentStepCount'] = max(self.usage.get('agentStepCount', 0), len(steps))
-        for index, step in enumerate(steps):
-            if isinstance(step, dict):
-                self.step(index, step)
+        # Snapshot positions can be compressed or reordered relative to SSE indexes.
+        # Use snapshot steps when no indexed stream has supplied progress.
+        if not self.stream_steps_seen:
+            for index, step in enumerate(steps):
+                if isinstance(step, dict):
+                    self.step(index, step)
         self.put('agent-status', 'status', str(data.get('status', 'in_progress')),
                  status='completed' if data.get('status') in TERMINAL else 'running')
         if data.get('output_text') and not any(p['type'] == 'text' and key != 'answer' for key, p in self.parts.items()):
@@ -178,6 +185,7 @@ class MessageProgress:
         # SSE is an optional low-latency cache. Poll snapshots remain authoritative.
         index = data.get('index')
         if kind in ('step.start', 'step.delta', 'step.stop') and type(index) is int and 0 <= index < 10000:
+            self.stream_steps_seen = True
             self.usage['agentStepCount'] = max(self.usage.get('agentStepCount', 0), index + 1)
         if kind == 'step.start' and type(index) is int and 0 <= index < 10000:
             step = data.get('step') or {}

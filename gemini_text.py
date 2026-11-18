@@ -444,9 +444,13 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 temporary = target.with_suffix(".tmp")
                 temporary.write_text(json.dumps({"jobId": job_id, "messageId": message["id"], "result": saved}, ensure_ascii=False), encoding="utf-8")
                 temporary.replace(target)
-                stage = 'progress_persistence'
-                progress.finalize(result)
-                await progress.flush()
+                try:
+                    progress.finalize(result)
+                    await progress.flush()
+                except Exception as error:
+                    # The final reply has its own durable payload and endpoint.
+                    log.emit('progress_persistence_deferred', error_type=type(error).__name__,
+                             error=log.redact(str(error))[:240])
                 stage = 'persistence'
                 # Retrying persistence cannot trigger another Gemini request.
                 await pb.post(f"{endpoint}/complete", saved, retries=5)
@@ -492,7 +496,12 @@ async def recover(pb, directory: Path):
         progress.sequence, progress.parts, progress.usage, progress.pending = data['sequence'], data['parts'], data['usage'], data.get('pending')
         progress.capture_bytes = sum(len(p['content'].encode()) for p in progress.parts.values())
         progress.dirty = set(progress.parts)
-        await progress.flush()
+        try:
+            await progress.flush()
+        except Exception as error:
+            if not (directory / f"{data['messageId']}.json").is_file():
+                raise
+            print(f"[gemini] progress recovery deferred ({type(error).__name__}); saving final reply", flush=True)
     for path in sorted(directory.glob('*.json')):
         if path.name.endswith('.progress.json'): continue
         data = json.loads(path.read_text(encoding='utf-8'))
