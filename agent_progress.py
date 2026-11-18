@@ -311,8 +311,14 @@ class MessageProgress:
             keys = sorted(self.dirty, key=lambda key: self.parts[key]['sequence'])
             usage_changed = self.usage != self._last_flushed_usage
             summary_changed = self.summary is not None and self.summary != self._last_flushed_summary
-            timeline_snapshot = json.loads(json.dumps(self.timeline, ensure_ascii=False))
-            timeline_changed = timeline_snapshot != self._last_flushed_timeline
+            has_timeline_events = bool(
+                self.timeline['submittedAt']
+                or self.timeline['firstReplyAt']
+                or self.timeline['finishedAt']
+                or self.timeline['steps']
+            )
+            timeline_snapshot = json.loads(json.dumps(self.timeline, ensure_ascii=False)) if has_timeline_events else None
+            timeline_changed = timeline_snapshot is not None and timeline_snapshot != self._last_flushed_timeline
             if not keys and self.pending is None and not usage_changed and not summary_changed and not timeline_changed and not force:
                 return
             while True:
@@ -321,7 +327,8 @@ class MessageProgress:
                     body = {**self.identity, 'sequence': self.sequence + 1, 'parts': batch, 'usage': self.usage.copy()}
                     if self.summary is not None:
                         body['summary'] = self.summary
-                    body['timeline'] = timeline_snapshot
+                    if timeline_snapshot is not None:
+                        body['timeline'] = timeline_snapshot
                     for key in keys[:4]:
                         batch.append(self.parts[key].copy())
                         if len(json.dumps(body, ensure_ascii=False).encode()) > 250 * 1024:
