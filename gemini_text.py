@@ -527,7 +527,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                             continue
                     # Never include provider bodies, credentials, or source text in logs.
                     detail = str(error)
-                    secrets = [*pool.keys, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '')]
+                    secrets = [*pool.keys, os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', ''), os.environ.get('ANTIGRAVITY_CLOUDFLARE_TOKEN', '')]
                     for secret in secrets:
                         if secret:
                             detail = detail.replace(secret, "[REDACTED]")

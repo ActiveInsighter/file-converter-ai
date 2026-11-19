@@ -152,19 +152,20 @@ def build_agent_payload(job, message, *, environment_id=None, previous_interacti
     # that PAT, not an application-defined list. Clone repositories on demand.
     # User content cannot override the authentication rules or MCP endpoint.
     github_token = os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()
-    if github_token:
-        if not reused_env:
+    cf_token = os.environ.get('ANTIGRAVITY_CLOUDFLARE_TOKEN', '').strip()
+    if (github_token or cf_token) and not reused_env:
+        allowlist = []
+        if github_token:
             basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
-            payload['environment'] = {
-                'type': 'remote',
-                'network': {
-                    'allowlist': [
-                        {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
-                        {'domain': 'api.github.com', 'transform': {'Authorization': f'Bearer {github_token}'}},
-                        {'domain': '*'},
-                    ],
-                },
-            }
+            allowlist.extend([
+                {'domain': 'github.com', 'transform': {'Authorization': f'Basic {basic}'}},
+                {'domain': 'api.github.com', 'transform': {'Authorization': f'Bearer {github_token}'}},
+            ])
+        if cf_token:
+            allowlist.append({'domain': 'api.cloudflare.com', 'transform': {'Authorization': f'Bearer {cf_token}'}})
+        allowlist.append({'domain': '*'})
+        payload['environment'] = {'type': 'remote', 'network': {'allowlist': allowlist}}
+    if github_token:
         # REST/Git stay authenticated for every prompt; no keyword can hide access.
         # Avoid loading the full GitHub MCP schema into every reasoning turn.
         if options.get('githubMcpEnabled') is True:
@@ -177,6 +178,15 @@ def build_agent_payload(job, message, *, environment_id=None, previous_interacti
         payload['system_instruction'] = '\n\n'.join(
             part for part in [payload.get('system_instruction', ''), GUIDE if project else
                               'GitHub HTTPS Git and REST authentication is configured in the environment.'] if part
+        )
+    if cf_token:
+        cf_guide = (
+            'Cloudflare REST API authentication (https://api.cloudflare.com/client/v4) is configured in the environment. '
+            'Never request, print, or store credentials. For wrangler CLI, pass CLOUDFLARE_API_TOKEN=proxy-injected '
+            'and CLOUDFLARE_ACCOUNT_ID if needed.'
+        )
+        payload['system_instruction'] = '\n\n'.join(
+            part for part in [payload.get('system_instruction', ''), cf_guide] if part
         )
     return payload
 
@@ -262,6 +272,9 @@ def upstream_error(status, data, key):
     if github_token:
         basic = base64.b64encode(f'x-oauth-basic:{github_token}'.encode()).decode()
         detail = detail.replace(github_token, '[REDACTED]').replace(basic, '[REDACTED]')
+    cf_token = os.environ.get('ANTIGRAVITY_CLOUDFLARE_TOKEN', '').strip()
+    if cf_token:
+        detail = detail.replace(cf_token, '[REDACTED]')
     detail = detail[:1200]
     if status == 429 and 'free tier' in detail.casefold() and 'limit: 0' in detail.casefold():
         detail = ('当前 API 项目的所选模型免费额度为 0。请使用有该模型 Agent 额度的 API Key，'
