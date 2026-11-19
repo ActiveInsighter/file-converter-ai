@@ -81,6 +81,7 @@ async def resolve_previous_agent_context(pb, job):
             'environment_id': context.get('environmentId'),
             'previous_interaction_id': context.get('interactionId'),
             'credential_hash': context.get('credentialHash'),
+            'required': context.get('required') is True,
         }
     # Compatibility with PocketBase versions where claim omits Agent context.
     if len(job.get('messages', [])) > 1 or pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None):
@@ -182,13 +183,13 @@ def build_agent_payload(job, message, *, environment_id=None, previous_interacti
 
 def parse_interaction(data, *, secrets=()):
     reply = data.get('output_text')
-    if not isinstance(reply, str):
+    if not isinstance(reply, str) or not reply.strip():
         reply = '\n\n'.join(
             part['text'] for step in data.get('steps', []) if step.get('type') == 'model_output'
             for part in step.get('content', []) if part.get('type') == 'text' and isinstance(part.get('text'), str)
         )
     # Compatibility with the older Interactions response shape.
-    if not reply and isinstance(data.get('outputs'), list):
+    if not reply.strip() and isinstance(data.get('outputs'), list):
         reply = '\n'.join(part['text'] for part in data['outputs'] if part.get('type') == 'text' and isinstance(part.get('text'), str))
     if len(reply.encode()) > MAX_REPLY_BYTES:
         raise RuntimeError('Agent 回复超过 2 MiB，执行结果已保留在原 interaction 中。')
@@ -203,7 +204,8 @@ def parse_interaction(data, *, secrets=()):
     elif status in ['cancelled', 'canceled']:
         error = 'Agent 已取消'
     elif not reply.strip():
-        error = 'Agent 返回空回复'
+        error = ('Agent 已结束但没有返回正文，可在当前对话发送下一条指令继续。'
+                 if status == 'completed' else 'Agent 返回空回复')
     usage = data.get('usage') or {}
     mapping = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candidatesTokenCount',
                'total_thought_tokens': 'thoughtsTokenCount', 'total_cached_tokens': 'cachedContentTokenCount', 'total_tokens': 'totalTokenCount'}
@@ -316,7 +318,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     preferred_key = next((i for i, k in enumerate(pool.keys) if hashlib.sha256(k.encode()).hexdigest() == preferred_hash), None)
     if resumed and preferred_key is None:
         raise RuntimeError('无法找到原 Agent interaction 使用的 API Key；未创建重复执行。')
+    continuation_required = context.get('required') is True
     reusing_remote = bool(context.get('environment_id') and context.get('previous_interaction_id'))
+    if continuation_required and (not reusing_remote or preferred_key is None):
+        raise RuntimeError('无法续接上文：缺少原交互、原沙盒或匹配的 API Key。')
     if reusing_remote and preferred_key is None:
         telemetry('environment_fallback', reason='credential_missing')
         reusing_remote = False
@@ -376,6 +381,9 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 await cancel_interaction(client, f'{ROOT}/{quote(data["id"], safe="")}', key)
                 raise
             break
+        if continuation_required and status in (400, 404, 410):
+            await pool.mark_cancelled(index, lease)
+            raise RuntimeError(f'原 Agent 任务续接被上游拒绝。{upstream_error(status, data, key)}')
         if status in (400, 404) and reusing_remote:
             reusing_remote = False
             await pool.mark_cancelled(index, lease)

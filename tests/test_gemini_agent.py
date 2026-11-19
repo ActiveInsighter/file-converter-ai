@@ -119,7 +119,7 @@ class AgentPayloadTests(unittest.TestCase):
             self.assertNotIn('fixture-api-key', str(error))
 
     def test_response_only_reads_public_model_output_and_usage(self):
-        result = parse_interaction({'status': 'completed', 'steps': [
+        result = parse_interaction({'status': 'completed', 'output_text': '', 'steps': [
             {'type': 'thought', 'content': [{'type': 'text', 'text': 'private'}]},
             {'type': 'code_execution_call'},
             {'type': 'code_execution_result', 'content': [{'type': 'text', 'text': 'tool log'}]},
@@ -428,6 +428,45 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[0]['previous_interaction_id'], 'v1_parent')
         self.assertEqual(sent_bodies[0]['input'], 'question')
         self.assertEqual(result['response']['metadata']['environment_id'], 'env_reused_1')
+
+    async def test_empty_completed_reply_requires_the_same_interaction_and_sandbox(self):
+        for upstream_status, saved_key, expected_error in [
+            (200, 'key-2', None),
+            (404, 'key-2', '原 Agent 任务续接被上游拒绝'),
+            (200, 'missing-key', '缺少原交互、原沙盒或匹配的 API Key'),
+        ]:
+            with self.subTest(upstream_status=upstream_status, saved_key=saved_key):
+                state, requests = {}, []
+
+                async def checkpoint(update=None):
+                    state.update(update or {})
+                    return {'state': state, 'canceled': False}
+
+                def outbound(request):
+                    self.assertEqual(request.method, 'POST')
+                    self.assertEqual(request.headers['x-goog-api-key'], 'key-2')
+                    payload = json.loads(request.content)
+                    requests.append(payload)
+                    self.assertEqual(payload['environment'], 'original-sandbox')
+                    self.assertEqual(payload['previous_interaction_id'], 'original-turn')
+                    self.assertEqual(payload['input'], 'question')
+                    return httpx.Response(upstream_status, json={
+                        'id': 'follow-up', 'status': 'completed', 'output_text': 'continued',
+                    } if upstream_status == 200 else {'error': {'message': 'environment not found'}})
+
+                task = {**job(), 'history': [{'role': 'user', 'text': 'original task'}, {'role': 'model', 'text': ''}],
+                        'agentContext': {'environmentId': 'original-sandbox', 'interactionId': 'original-turn',
+                                         'credentialHash': hashlib.sha256(saved_key.encode()).hexdigest(), 'required': True}}
+                pool = KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                    if expected_error:
+                        with self.assertRaisesRegex(RuntimeError, expected_error):
+                            await generate_agent(client, pool, task, {}, checkpoint=checkpoint)
+                    else:
+                        result = await generate_agent(client, pool, task, {}, checkpoint=checkpoint)
+                        self.assertEqual(result['reply'], 'continued')
+                        self.assertEqual(state['environmentId'], 'original-sandbox')
+                self.assertEqual(len(requests), int(saved_key == 'key-2'))
 
     async def test_generate_agent_falls_back_to_fresh_environment_when_expired(self):
         import hashlib
