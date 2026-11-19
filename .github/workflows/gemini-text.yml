@@ -48,13 +48,14 @@ jobs:
       - name: Install baseline text dependencies
         if: matrix.variant == 'baseline'
         run: pip install 'httpx>=0.28,<1'
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: text-dependencies
         if: matrix.variant == 'optimized'
         with:
           path: ${{ runner.temp }}/gemini-text-deps
           key: gemini-text-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements-gemini-text.txt') }}
       - name: Install optimized text dependencies
+        id: install-text-dependencies
         if: matrix.variant == 'optimized' && steps.text-dependencies.outputs.cache-hit != 'true'
         run: >-
           python -m pip install --disable-pip-version-check --no-cache-dir
@@ -64,3 +65,8 @@ jobs:
         env:
           PYTHONPATH: ${{ matrix.variant == 'optimized' && format('{0}/gemini-text-deps', runner.temp) || '' }}
         run: python -u -m benchmarks.agent_startup_fixture
+      - uses: actions/cache/save@v4
+        if: ${{ !cancelled() && steps.install-text-dependencies.outcome == 'success' }}
+        with:
+          path: ${{ runner.temp }}/gemini-text-deps
+          key: ${{ steps.text-dependencies.outputs.cache-primary-key }}
