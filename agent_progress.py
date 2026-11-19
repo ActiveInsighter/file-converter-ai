@@ -42,6 +42,7 @@ class MessageProgress:
         self.last_flushed_at = clock()
         self.replay_completed = set()
         self.stream_steps_seen = False
+        self.terminal_event = asyncio.Event()
 
     def begin_stream(self):
         if not self.last_event_id:
@@ -381,6 +382,7 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
                                 return
                         if event_type in ('interaction.completed', 'interaction.failed', 'interaction.cancelled',
                                           'interaction.canceled', 'interaction.incomplete', 'interaction.requires_action'):
+                            progress.terminal_event.set()
                             return
         except (httpx.HTTPError, ValueError, UnicodeError) as error:
             # Exception text/URLs can contain credentials; log the type only.

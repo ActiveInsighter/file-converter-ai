@@ -304,8 +304,10 @@ class AgentTimingTracker:
                 self._dirty = False
                 updated = await _post_insights(pb, endpoint, identity, agentTimings=self.to_dict())
                 self._dirty = self._dirty or 'titleUpdated' not in updated
-            if finished.is_set() and not self.changed.is_set():
-                return
+            if finished.is_set():
+                if not self.changed.is_set():
+                    return
+                continue
             await asyncio.sleep(1)
 
 

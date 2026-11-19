@@ -503,3 +503,48 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('user: old turn', sent_bodies[1]['input'])
         self.assertEqual(state['environmentId'], 'env_new')
 
+    async def test_fresh_agent_dispatch_makes_single_pre_create_checkpoint(self):
+        events = []
+        state = {}
+        async def checkpoint(update=None):
+            events.append(('checkpoint', dict(update) if update else None))
+            if update:
+                state.update(update)
+            return {'state': state, 'canceled': False}
+        async def sleep(_): pass
+        async def outbound(request):
+            events.append((request.method, str(request.url)))
+            return httpx.Response(200, json={'id': 'v1_fast', 'status': 'completed', 'output_text': 'ok'})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(client, KeyPool(['key-1'], rpm_per_key=1e6, rpd_per_key=100),
+                                          {**job(), 'agentContext': {}}, {}, checkpoint=checkpoint, sleep=sleep)
+        self.assertEqual(result['reply'], 'ok')
+        post_index = next(i for i, item in enumerate(events) if item[0] == 'POST')
+        pre_create_checkpoints = [e for e in events[:post_index] if e[0] == 'checkpoint']
+        self.assertEqual(len(pre_create_checkpoints), 1)
+
+    async def test_sse_terminal_event_wakes_polling_immediately(self):
+        import time
+        from agent_progress import MessageProgress
+        state = {}
+        async def checkpoint(update=None):
+            if update:
+                state.update(update)
+            return {'state': state, 'canceled': False}
+        async def outbound(request):
+            if request.method == 'POST':
+                return httpx.Response(202, json={'id': 'v1_sse', 'status': 'in_progress'})
+            if request.url.params.get('stream') == 'true':
+                sse = b'event: interaction.completed\ndata: {"event_type":"interaction.completed","interaction":{"id":"v1_sse","status":"completed"}}\n\n'
+                return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=sse)
+            return httpx.Response(200, json={'id': 'v1_sse', 'status': 'completed', 'output_text': 'fast reply'})
+        progress = MessageProgress()
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(client, KeyPool(['key-1'], rpm_per_key=1e6, rpd_per_key=100),
+                                          {**job(), 'agentContext': {}}, {}, checkpoint=checkpoint, progress=progress)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(result['reply'], 'fast reply')
+        self.assertLess(elapsed, 1.0)
+
+

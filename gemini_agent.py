@@ -311,7 +311,8 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                        segment=message.get('index'), secrets=pool.keys, clock=clock, verbose=False)
     def telemetry(event, **fields):
         agent_telemetry(event, **trace.context, **fields)
-    state = (await checkpoint()).get('state') or {}
+    initial_checkpoint = await checkpoint()
+    state = initial_checkpoint.get('state') or {}
     resumed = bool(state.get('id'))
     context = {} if resumed else await resolve_previous_agent_context(pb, job)
     preferred_hash = state.get('credentialHash') if resumed else context.get('credential_hash')
@@ -342,8 +343,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     current = None
     attempts = len(pool.keys) + int(reusing_remote)
     for attempt in range(attempts):
-        if not resumed and (await checkpoint()).get('canceled'):
-            raise AgentCanceled('Agent 已取消，未创建远程执行。')
+        if not resumed:
+            control = initial_checkpoint if attempt == 0 else await checkpoint()
+            if control.get('canceled'):
+                raise AgentCanceled('Agent 已取消，未创建远程执行。')
         index, key, lease = await pool.acquire(key_index=preferred_key if resumed or reusing_remote else None)
         fingerprint = hashlib.sha256(key.encode()).hexdigest()
         if resumed:
@@ -466,7 +469,14 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                 finally:
                     await pool.mark_cancelled(index, lease)
                 raise AgentCanceled('Agent 已取消')
-            await sleep(3)
+            terminal_event = getattr(progress, 'terminal_event', None)
+            if terminal_event is not None and sleep is asyncio.sleep:
+                try:
+                    await asyncio.wait_for(terminal_event.wait(), timeout=3)
+                except TimeoutError:
+                    pass
+            else:
+                await sleep(3)
             try:
                 poll_started = clock()
                 status, _, data = await request_json(client, 'GET', url, key)
