@@ -58,12 +58,13 @@ jobs:
           python-version: '3.12'
       # Cache the importable text dependencies, without the PDF wheels or a
       # pip invocation on cache hits. Python and runner architecture scope the cache.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: text-dependencies
         with:
           path: ${{ runner.temp }}/gemini-text-deps
           key: gemini-text-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements-gemini-text.txt') }}
       - name: Install text executor dependencies
+        id: install-text-dependencies
         if: steps.text-dependencies.outputs.cache-hit != 'true'
         run: >-
           python -m pip install --disable-pip-version-check --no-cache-dir
@@ -81,3 +82,9 @@ jobs:
           path: work/gemini/recovery/*.json
           if-no-files-found: ignore
           retention-days: 3
+      # A valid install can warm the next runner even when the model fails.
+      - uses: actions/cache/save@v4
+        if: ${{ !cancelled() && steps.install-text-dependencies.outcome == 'success' }}
+        with:
+          path: ${{ runner.temp }}/gemini-text-deps
+          key: ${{ steps.text-dependencies.outputs.cache-primary-key }}
