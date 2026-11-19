@@ -5,69 +5,52 @@ on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: PocketBase Gemini job ID (inputs are read from PB)
         required: true
         type: string
       diagnostic_seconds:
-        description: Read-only trace window in seconds (10–900; ignored by normal tasks)
         required: false
+        type: string
         default: "180"
-        type: string
       model:
-        description: Optional Gemini or Antigravity model override
         required: false
-        default: ""
         type: string
+        default: ""
       thinking_level:
-        description: Optional thinking level (minimal, low, medium, high, off)
         required: false
-        default: ""
         type: string
+        default: ""
 
 permissions:
   contents: read
 
-# A conversation is independent of every other conversation and PDF job.
-# Re-runs for the same request ID cannot evict each other.
-concurrency:
-  group: anyworkflow-gemini-text-${{ inputs.request_id }}
-  cancel-in-progress: false
-
 jobs:
   messages:
+    if: inputs.request_id == 'startup-benchmark'
+    name: ${{ matrix.variant }} ${{ matrix.repetition }}
     runs-on: ubuntu-latest
-    # No application-defined job timeout. GitHub-hosted runners still enforce
-    # their platform maximum (currently 6 hours).
-    env:
-      REQUEST_ID: ${{ inputs.request_id }}
-      AGENT_TRACE_SECONDS: ${{ inputs.diagnostic_seconds || '180' }}
-      GEMINI_MODEL: ${{ inputs.model }}
-      GEMINI_THINKING_LEVEL: ${{ inputs.thinking_level }}
-      GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
-      GEMINI_KEY_GROUPS: ${{ vars.GEMINI_KEY_GROUPS }}
-      ANTIGRAVITY_GITHUB_TOKEN: ${{ secrets.ANTIGRAVITY_GITHUB_TOKEN }}
-      GEMINI_PB_URL: ${{ vars.GEMINI_PB_URL || 'https://pb.any1.tech' }}
-      POCKETBASE_SERVER_TOKEN: ${{ secrets.POCKETBASE_SERVER_TOKEN }}
-      GEMINI_PB_EMAIL: ${{ secrets.GEMINI_PB_EMAIL }}
-      GEMINI_PB_PASSWORD: ${{ secrets.GEMINI_PB_PASSWORD }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, optimized]
+        repetition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: matrix.variant == 'baseline'
         with:
           python-version: '3.12'
-      # The text executor only needs HTTPX. The repository-wide pip cache also
-      # contains the PDF dependencies and takes longer to restore than these wheels.
-      - name: Install text executor dependencies
+          cache: pip
+      - uses: actions/setup-python@v5
+        if: matrix.variant == 'optimized'
+        with:
+          python-version: '3.12'
+      - name: Install baseline text dependencies
+        if: matrix.variant == 'baseline'
+        run: pip install 'httpx>=0.28,<1'
+      - name: Install optimized text dependencies
+        if: matrix.variant == 'optimized'
         run: >-
           python -m pip install --disable-pip-version-check --no-cache-dir
           --no-compile --only-binary=:all: 'httpx>=0.28,<1'
-      - name: Send segments and save replies to PocketBase
-        run: python -u gemini_text.py
-      - name: Preserve replies awaiting a database write
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gemini-text-recovery-${{ github.run_id }}
-          path: work/gemini/recovery/*.json
-          if-no-files-found: ignore
-          retention-days: 3
+      - name: Send a synthetic Antigravity task through the actual executor
+        run: python -u -m benchmarks.agent_startup_fixture
