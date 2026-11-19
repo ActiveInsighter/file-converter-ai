@@ -21,6 +21,7 @@ from agent_trace import AgentTrace, TERMINAL
 from response_capture import extract_structured_payload, interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
 from github_context import is_project_task, task_text
+from image_fetch import collect_job_image_urls, extract_image_markers, fetch_images_as_base64
 
 ROOT = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 DEFAULT_AGENT = 'antigravity-preview-09-2026'
@@ -128,17 +129,62 @@ async def resolve_previous_agent_context(pb, job):
         return {}
 
 
-def build_agent_payload(job, message, *, environment_id=None, previous_interaction_id=None):
+def _build_turn_content(text: str, image_urls: list[str], resolved_images: dict[str, tuple[str, str]]) -> list[dict]:
+    content: list[dict] = []
+    if text:
+        content.append({'type': 'text', 'text': text})
+    for url in image_urls:
+        entry = resolved_images.get(url)
+        if entry is not None:
+            mime_type, b64_data = entry
+            content.append({'type': 'image', 'mime_type': mime_type, 'data': b64_data})
+    return content
+
+
+def build_agent_payload(job, message, *, environment_id=None, previous_interaction_id=None, resolved_images=None):
     options = job.get('options', {}).get('agent', {})
     name = str(job['model']).lower()
     reused_env = str(environment_id or '').strip() or None
     prev_interaction = str(previous_interaction_id or '').strip() or None
-    input_parts = [job.get('prompt', ''), message.get('inputText', '')]
-    if not prev_interaction:
-        input_parts = [*[f"{turn['role']}: {turn['text']}" for turn in job.get('history', [])], *input_parts]
+    images_map = resolved_images or {}
+
+    clean_prompt, prompt_imgs = extract_image_markers(job.get('prompt', ''))
+    clean_input, msg_imgs = extract_image_markers(message.get('inputText', ''))
+    current_imgs = [*prompt_imgs, *msg_imgs]
+    history = [] if prev_interaction else (job.get('history') or [])
+
+    history_parsed = []
+    has_history_imgs = False
+    for turn in history:
+        t_text, t_imgs = extract_image_markers(turn.get('text', ''))
+        if t_imgs:
+            has_history_imgs = True
+        history_parsed.append((turn.get('role', 'user'), t_text, t_imgs))
+
+    if images_map and (current_imgs or has_history_imgs):
+        current_text = '\n\n'.join(value for value in (clean_prompt, clean_input) if value)
+        current_content = _build_turn_content(current_text, current_imgs, images_map)
+        if history_parsed:
+            turns: list[dict] = []
+            for role, t_text, t_imgs in history_parsed:
+                turn_type = 'model_output' if role in ('model', 'assistant') else 'user_input'
+                turn_content = _build_turn_content(t_text, t_imgs, images_map)
+                if turn_content:
+                    turns.append({'type': turn_type, 'content': turn_content})
+            if current_content:
+                turns.append({'type': 'user_input', 'content': current_content})
+            agent_input: str | list[dict] = turns
+        else:
+            agent_input = current_content
+    else:
+        input_parts = [clean_prompt, clean_input]
+        if history_parsed:
+            input_parts = [*[f"{role}: {t_text}" for role, t_text, _ in history_parsed], *input_parts]
+        agent_input = '\n\n'.join(value for value in input_parts if value)
+
     payload = {
         'agent': options.get('id') or (DEFAULT_AGENT if name == 'antigravity' else name),
-        'input': '\n\n'.join(value for value in input_parts if value),
+        'input': agent_input,
         'background': True, 'store': True,
         'environment': reused_env if reused_env else {'type': 'remote'},
         'tools': [{'type': name} for name in ['code_execution', 'google_search', 'url_context']],
@@ -338,15 +384,25 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     if reusing_remote and preferred_key is None:
         telemetry('environment_fallback', reason='credential_missing')
         reusing_remote = False
+    image_urls = [] if resumed else collect_job_image_urls(job, message, include_history=not reusing_remote)
+    resolved_images = await fetch_images_as_base64(client, image_urls) if image_urls else {}
     payload = build_agent_payload(job, message,
         environment_id=context['environment_id'] if reusing_remote else None,
-        previous_interaction_id=context['previous_interaction_id'] if reusing_remote else None)
+        previous_interaction_id=context['previous_interaction_id'] if reusing_remote else None,
+        resolved_images=resolved_images)
+    raw_input = payload['input']
+    input_chars = len(raw_input) if isinstance(raw_input, str) else sum(
+        len(item.get('text', '')) for entry in raw_input
+        for item in (entry.get('content', []) if 'content' in entry else [entry])
+        if item.get('type') == 'text'
+    )
     telemetry('prepared',
         model=payload['agent_config']['model'],
         tools=[tool.get('type') for tool in payload['tools']],
         github_enabled=bool(os.environ.get('ANTIGRAVITY_GITHUB_TOKEN', '').strip()),
         github_mcp_enabled=any(tool.get('type') == 'mcp_server' for tool in payload['tools']),
-        input_chars=len(payload['input']),
+        input_chars=input_chars,
+        image_count=len(resolved_images),
         system_chars=len(payload.get('system_instruction', '')),
         resumed=resumed,
         reused_environment=isinstance(payload.get('environment'), str),
@@ -401,7 +457,10 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             reusing_remote = False
             await pool.mark_cancelled(index, lease)
             telemetry('environment_fallback', reason='upstream_rejected', http=status)
-            payload = build_agent_payload(job, message)
+            missing_urls = [u for u in collect_job_image_urls(job, message, include_history=True) if u not in resolved_images]
+            if missing_urls:
+                resolved_images = {**resolved_images, **(await fetch_images_as_base64(client, missing_urls))}
+            payload = build_agent_payload(job, message, resolved_images=resolved_images)
             continue
         await pool.mark_error(index, lease, http_status=status)
         scope = provider.credential_error_scope(status, data)

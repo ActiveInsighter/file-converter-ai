@@ -24,6 +24,7 @@ from gemini_agent import AgentCanceled, generate_agent, is_antigravity
 from agent_fast_tasks import AgentSummaryWorker, AgentTimingTracker, maybe_generate_title
 from agent_trace import AgentTrace
 from agent_progress import MessageProgress
+from image_fetch import collect_job_image_urls, extract_image_markers, fetch_images_as_base64
 
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 TOKEN_FIELDS = {
@@ -104,8 +105,25 @@ def normalize_thinking_level(raw: str | None) -> str:
     return _THINKING_LEVEL_ALIASES.get(value, value)
 
 
-def build_payload(job: dict, message: dict) -> dict:
-    parts = [{"text": value} for value in (job.get("prompt", ""), message.get("inputText", "")) if value]
+def _parts_with_images(texts: list[str], images_map: dict[str, tuple[str, str]]) -> list[dict]:
+    parts: list[dict] = []
+    urls: list[str] = []
+    for raw in texts:
+        clean_text, found = extract_image_markers(raw)
+        if clean_text:
+            parts.append({"text": clean_text})
+        urls.extend(found)
+    for url in urls:
+        entry = images_map.get(url)
+        if entry is not None:
+            mime_type, b64_data = entry
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
+    return parts
+
+
+def build_payload(job: dict, message: dict, *, resolved_images: dict[str, tuple[str, str]] | None = None) -> dict:
+    images_map = resolved_images or {}
+    parts = _parts_with_images([job.get("prompt", ""), message.get("inputText", "")], images_map)
     options = job.get("options") or {}
     model = str(job.get("model") or "").strip()
     model_lower = model.lower()
@@ -240,7 +258,9 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise RuntimeError('Agent requires durable execution state')
         return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress, pb=pb, timing=timing)
     provider = GeminiProvider()
-    payload = build_payload(job, message)
+    image_urls = collect_job_image_urls(job, message, include_history=True)
+    resolved_images = await fetch_images_as_base64(client, image_urls) if image_urls else {}
+    payload = build_payload(job, message, resolved_images=resolved_images)
     last_http_error = ''
     last_data = {}
     for attempt in range(4):
