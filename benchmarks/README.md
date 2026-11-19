@@ -58,3 +58,34 @@ logs and historical document URLs remain under ignored `work/audit/`.
 
 See [the audit report](../docs/reliability-quality-2026-10-23.md) for run links,
 timings, scope, and checked-in synthetic outputs.
+
+## Warm Agent dispatch
+
+This benchmark starts an isolated PocketBase with the AnyWorkflow hooks and
+migrations. A preloaded executor listens for real PocketBase create events.
+It measures from the message creation request to the first Antigravity POST
+through the existing claim, start and checkpoint APIs. The model is mocked,
+and each sample verifies one model POST and a persisted reply.
+
+```sh
+python -m benchmarks.warm_agent_dispatch \
+  --pocketbase /path/to/pocketbase \
+  --pocketbase-source /path/to/AnyWorkflow-workers/pocketbase \
+  --samples 12 --pocketbase-delay-ms 150
+```
+
+Use a PocketBase source revision that supports Agent workflows
+(such as AnyWorkflow-workers `948fb7c`). The delay is applied to each
+PocketBase HTTP request. Pass zero for a loopback-only measurement.
+
+Measured with PocketBase 0.39.10 on the same host as the executor, 12 sequential
+jobs per scenario. All 24 jobs saved their reply after exactly one model POST.
+
+| Added delay per PocketBase request | Median to model POST | Slowest sample |
+| --- | ---: | ---: |
+| 0 ms | 0.047 s | 0.075 s |
+| 150 ms | 0.953 s | 0.964 s |
+
+The fixture performs the dispatcher state change in the isolated database.
+These measurements cover the warm dispatch path. Production network,
+concurrency, and Google response latency require separate measurements.
