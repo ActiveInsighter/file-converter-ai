@@ -20,7 +20,14 @@ import httpx
 from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from response_capture import extract_structured_payload, generate_content_snapshot
-from gemini_agent import AgentCanceled, generate_agent, is_antigravity
+from gemini_agent import (
+    AgentCanceled,
+    extract_image_urls,
+    generate_agent,
+    is_antigravity,
+    resolve_images_to_base64,
+    strip_image_markers,
+)
 from agent_fast_tasks import AgentSummaryWorker, AgentTimingTracker, maybe_generate_title
 from agent_trace import AgentTrace
 from agent_progress import MessageProgress
@@ -104,8 +111,14 @@ def normalize_thinking_level(raw: str | None) -> str:
     return _THINKING_LEVEL_ALIASES.get(value, value)
 
 
-def build_payload(job: dict, message: dict) -> dict:
-    parts = [{"text": value} for value in (job.get("prompt", ""), message.get("inputText", "")) if value]
+def build_payload(job: dict, message: dict, *, resolved_images=None) -> dict:
+    parts = [
+        {"text": stripped}
+        for value in (job.get("prompt", ""), message.get("inputText", ""))
+        if (stripped := strip_image_markers(value))
+    ]
+    for mime_type, b64_data in (resolved_images or ()):
+        parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
     options = job.get("options") or {}
     model = str(job.get("model") or "").strip()
     model_lower = model.lower()
@@ -152,7 +165,7 @@ def build_payload(job: dict, message: dict) -> dict:
         payload['tools'] = options['tools']
     if job.get('history'):
         payload['contents'] = [
-            {'role': turn['role'], 'parts': [{'text': turn['text']}]}
+            {'role': turn['role'], 'parts': [{'text': strip_image_markers(turn['text'])}]}
             for turn in job['history']
         ] + payload['contents']
     if job.get("systemPrompt"):
@@ -240,7 +253,9 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
             raise RuntimeError('Agent requires durable execution state')
         return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress, pb=pb, timing=timing)
     provider = GeminiProvider()
-    payload = build_payload(job, message)
+    image_urls = extract_image_urls(job, message)
+    resolved_images = await resolve_images_to_base64(client, image_urls) if image_urls else []
+    payload = build_payload(job, message, resolved_images=resolved_images)
     last_http_error = ''
     last_data = {}
     for attempt in range(4):

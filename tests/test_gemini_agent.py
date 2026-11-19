@@ -528,3 +528,51 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('user: old turn', sent_bodies[1]['input'])
         self.assertEqual(state['environmentId'], 'env_new')
 
+    async def test_generate_agent_downloads_images_to_base64_concurrently(self):
+        import base64
+        sent_bodies = []
+        downloaded_urls = []
+        img1_bytes = b'\x89PNG\r\n\x1a\nfake1'
+        img2_bytes = b'\xff\xd8\xff\xe0fake2'
+        async def outbound(request):
+            url = str(request.url)
+            if url.startswith('https://file.any1.tech/api/library/image-sources/'):
+                downloaded_urls.append(url)
+                if url.endswith('.png'):
+                    return httpx.Response(200, content=img1_bytes, headers={'content-type': 'image/png'})
+                return httpx.Response(200, content=img2_bytes, headers={'content-type': 'image/jpeg'})
+            if request.method == 'POST':
+                sent_bodies.append(json.loads(request.content))
+                return httpx.Response(200, json={'id': 'v1_img', 'status': 'completed', 'output_text': 'saw 2 images'})
+            raise AssertionError(f'Unexpected request: {request.method} {url}')
+        url1 = 'https://file.any1.tech/api/library/image-sources/00000000-0000-4000-8000-000000000001.png'
+        url2 = 'https://file.any1.tech/api/library/image-sources/00000000-0000-4000-8000-000000000002.jpg'
+        task = {
+            **job(),
+            'prompt': f'描述这两张图\n<!-- aw:images:{json.dumps([url1])} -->',
+            'images': [url2],
+        }
+        async def checkpoint(state=None):
+            return {}
+        async def noop_sleep(_):
+            pass
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(client, KeyPool(['key-1'], rpm_per_key=1e6, rpd_per_key=100), task, {}, checkpoint=checkpoint, sleep=noop_sleep)
+        self.assertEqual(result['reply'], 'saw 2 images')
+        self.assertEqual(set(downloaded_urls), {url1, url2})
+        self.assertEqual(len(sent_bodies), 1)
+        agent_input = sent_bodies[0]['input']
+        self.assertIsInstance(agent_input, list)
+        self.assertEqual(agent_input[0], {'type': 'text', 'text': '描述这两张图'})
+        self.assertEqual(agent_input[1], {
+            'type': 'image',
+            'mime_type': 'image/jpeg',
+            'data': base64.b64encode(img2_bytes).decode('ascii'),
+        })
+        self.assertEqual(agent_input[2], {
+            'type': 'image',
+            'mime_type': 'image/png',
+            'data': base64.b64encode(img1_bytes).decode('ascii'),
+        })
+
+
