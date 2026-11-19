@@ -23,7 +23,7 @@ USAGE = {'total_input_tokens': 'promptTokenCount', 'total_output_tokens': 'candi
 
 
 class MessageProgress:
-    def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id='', clock=time.monotonic):
+    def __init__(self, *, secrets=(), post=None, identity=None, target=None, job_id='', message_id='', clock=time.monotonic, timing=None):
         self.redactor = AgentTrace(secrets=secrets, verbose=False)
         self.parts, self.dirty, self.usage, self.steps = {}, set(), {}, {}
         self._last_flushed_usage = {}
@@ -38,6 +38,7 @@ class MessageProgress:
         self.closed = False
         self.lock = asyncio.Lock()
         self.clock = clock
+        self.timing = timing
         self.last_flushed_at = clock()
         self.replay_completed = set()
         self.stream_steps_seen = False
@@ -95,6 +96,11 @@ class MessageProgress:
             self.parts[key] = part
             self.capture_bytes += len(part['content'].encode()) - old_bytes
             self.dirty.add(key)
+            if self.timing is not None and kind != 'status':
+                self.timing.mark_first_reply()
+                if key.startswith('step:'):
+                    self.timing.record_step(int(key.split(':')[1]), provider_type or kind,
+                                            label=part['toolName'], status=status)
 
     def snapshot(self, data):
         raw_usage = data.get('usage') or {}

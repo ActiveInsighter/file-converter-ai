@@ -21,6 +21,7 @@ from key_pool import KeyPool, QuotaPoolExhaustedError, parse_key_groups
 from providers import GeminiProvider
 from response_capture import extract_structured_payload, generate_content_snapshot
 from gemini_agent import AgentCanceled, generate_agent, is_antigravity
+from agent_fast_tasks import AgentSummaryWorker, AgentTimingTracker, maybe_generate_title
 from agent_trace import AgentTrace
 from agent_progress import MessageProgress
 
@@ -233,11 +234,11 @@ class PocketBase:
         return await self.post(path, {**identity, **({'state': state} if state is not None else {})}, retries=12)
 
 
-async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None, pb=None) -> dict:
+async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoint=None, progress=None, pb=None, timing=None) -> dict:
     if is_antigravity(job['model']):
         if checkpoint is None:
             raise RuntimeError('Agent requires durable execution state')
-        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress, pb=pb)
+        return await generate_agent(client, pool, job, message, checkpoint=checkpoint, sleep=sleep, progress=progress, pb=pb, timing=timing)
     provider = GeminiProvider()
     payload = build_payload(job, message)
     last_http_error = ''
@@ -413,9 +414,16 @@ async def generate(client, pool, job, message, *, sleep=asyncio.sleep, checkpoin
     raise GeminiRequestError("Gemini 暂时不可用或请求额度不足，请稍后重新提交", last_data, secrets=pool.keys)
 
 
-async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work_dir: Path):
+async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work_dir: Path, *, fast_pool_factory=None):
     path = f"jobs/{job_id}"
     identity = {"executionId": execution_id}
+    model_override = os.environ.get("GEMINI_MODEL", "").strip().removeprefix('models/')
+    if model_override and (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,109}', model_override) or
+                           any(part in ('.', '..') for part in model_override.split('/'))):
+        raise RuntimeError('Invalid Gemini model override')
+    thinking_override = normalize_thinking_level(os.environ.get("GEMINI_THINKING_LEVEL"))
+    if thinking_override and thinking_override not in {'auto', *_GEMINI_25_BUDGETS}:
+        raise RuntimeError('Invalid Gemini thinking level override')
     job = await pb.post(f"{path}/claim", identity, retries=3)
     options = job.setdefault("options", {})
     options.setdefault("concurrency", 5)
@@ -423,13 +431,29 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
     options.setdefault("rpmPerKey", 15)
     options.setdefault("rpdPerKey", 500)
     options.setdefault("thinkingLevel", "")
-    model_override = os.environ.get("GEMINI_MODEL", "").strip()
-    if model_override:
-        job["model"] = model_override
-    thinking_override = os.environ.get("GEMINI_THINKING_LEVEL", "").strip()
+    if model_override and model_override.casefold() != job['model'].casefold():
+        if is_antigravity(model_override) or is_antigravity(job['model']):
+            raise RuntimeError('Antigravity execution settings must come from the PocketBase job')
+        job['model'] = model_override
     if thinking_override:
-        options["thinkingLevel"] = normalize_thinking_level(thinking_override)
+        options['thinkingLevel'] = thinking_override
     pool = await pool_factory(options)
+    fast_pool = None
+    auxiliary_tasks = set()
+    if fast_pool_factory is not None and is_antigravity(job['model']):
+        try:
+            fast_pool = await fast_pool_factory(options)
+        except Exception as error:
+            print(f'[agent.fast] pool_setup_failed error_type={type(error).__name__}', flush=True)
+
+    def run_auxiliary(coro):
+        task = asyncio.create_task(coro)
+        auxiliary_tasks.add(task)
+        def done(task):
+            auxiliary_tasks.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                print(f'[agent.fast] task_failed error_type={type(task.exception()).__name__}', flush=True)
+        task.add_done_callback(done)
     job_log = AgentTrace(job=job_id, secrets=pool.keys, prefix='[gemini]')
     antigravity = is_antigravity(job['model'])
     protocol = 'interactions' if antigravity else 'generateContent'
@@ -450,6 +474,9 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
             endpoint = f"{path}/messages/{message['id']}"
             log = AgentTrace(job=job_id, segment=message['index'], secrets=pool.keys, prefix='[gemini]')
             stage = 'permit'
+            ended = asyncio.Event()
+            timing = None
+            final_status = 'failed'
             try:
                 begun = time.monotonic()
                 started_at = datetime.now(timezone.utc).isoformat()
@@ -462,18 +489,27 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 log.emit('segment_started', model=job['model'], protocol=protocol, message_id=message['id'])
                 async def upload_progress(body):
                     return await pb.post(f"{endpoint}/progress", body, retries=2)
+                if antigravity:
+                    timing = AgentTimingTracker(t0=begun, submitted_at=job.get('created'))
                 progress = MessageProgress(secrets=pool.keys, post=upload_progress, identity=identity,
-                    target=work_dir / f"{message['id']}.progress.json", job_id=job_id, message_id=message['id'])
+                    target=work_dir / f"{message['id']}.progress.json", job_id=job_id, message_id=message['id'], timing=timing)
+                if timing is not None:
+                    run_auxiliary(timing.pump(pb, endpoint, identity, ended))
+                    if fast_pool is not None:
+                        run_auxiliary(maybe_generate_title(client, fast_pool, pb, job, message, endpoint=endpoint, identity=identity))
+                        summary = AgentSummaryWorker(client, fast_pool, pb, job, message, progress, endpoint=endpoint, identity=identity)
+                        run_auxiliary(summary.run(ended))
                 progress_task = asyncio.create_task(progress.pump())
                 stage = 'generation'
                 try:
                     if antigravity:
                         async def checkpoint(state=None):
                             return await pb.checkpoint(f"{endpoint}/checkpoint", identity, state)
-                        result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress, pb=pb)
+                        result = await generate(client, pool, job, message, checkpoint=checkpoint, progress=progress, pb=pb, timing=timing)
                     else:
                         result = await generate(client, pool, job, message, progress=progress)
                 except AgentCanceled:
+                    final_status = 'canceled'
                     counts['canceled'] += 1
                     log.emit('segment_canceled')
                     continue
@@ -485,6 +521,7 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                             stopped = False
                             log.emit('cancel_check_failed', error_type=type(check_error).__name__)
                         if stopped:
+                            final_status = 'canceled'
                             counts['canceled'] += 1
                             log.emit('segment_canceled')
                             continue
@@ -498,6 +535,9 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 finally:
                     progress_task.cancel()
                     await asyncio.gather(progress_task, return_exceptions=True)
+                final_status = 'failed' if result.get('error') else 'completed'
+                if timing is not None:
+                    timing.mark_completed(final_status)
                 usages.append(result.get('usage') or {})
                 log_result(log, result)
                 stage = 'recovery_write'
@@ -534,11 +574,21 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 log.emit('segment_error', stage=stage, error_type=type(error).__name__,
                          error=log.redact(str(error))[:1800], recovery_available=(work_dir / f"{message['id']}.json").exists())
             finally:
+                if timing is not None and timing.completed_at is None:
+                    timing.mark_completed(final_status)
+                ended.set()
                 queue.task_done()
 
     try:
         await asyncio.gather(*(worker() for _ in range(job["options"]["concurrency"])))
     finally:
+        if auxiliary_tasks:
+            _, pending = await asyncio.wait(tuple(auxiliary_tasks), timeout=50)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        if fast_pool is not None:
+            await fast_pool.close()
         await pool.close()
     totals = {}
     for name, key in TOKEN_FIELDS.items():
@@ -621,7 +671,11 @@ async def main():
         async def pool_factory(options):
             return await create_key_pool(keys, options, os.environ.get("GEMINI_KEY_GROUPS", ""))
 
-        return await run_job(pb, client, job_id, execution_id, pool_factory, Path("work/gemini/recovery"))
+        async def fast_pool_factory(options):
+            return await pool_factory({"rpmPerKey": 15, "rpdPerKey": 500})
+
+        return await run_job(pb, client, job_id, execution_id, pool_factory, Path("work/gemini/recovery"),
+                             fast_pool_factory=fast_pool_factory)
 
 
 if __name__ == "__main__":

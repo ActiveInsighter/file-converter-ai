@@ -12,16 +12,16 @@ import json
 import os
 import re
 import time
-from urllib.parse import quote
 
 import httpx
 
 from providers import GeminiProvider
+from agent_trace import AgentTrace
 
 DEFAULT_FAST_MODEL = os.environ.get('GEMINI_FAST_MODEL', 'gemini-3.5-flash-lite').strip() or 'gemini-3.5-flash-lite'
 DEFAULT_SUMMARY_INTERVAL_SECONDS = 120.0
 MAX_TITLE_CHARS = 24
-MAX_SUMMARY_INPUT_CHARS = 24000
+MAX_SUMMARY_INPUT_CHARS = 100000
 MAX_TIMING_STEPS = 100
 
 
@@ -64,6 +64,8 @@ def is_continuation_job(job: dict) -> bool:
 def _extract_reply_text(data: dict) -> str:
     candidate = (data.get('candidates') or [{}])[0]
     parts = (candidate.get('content') or {}).get('parts') or []
+    if candidate.get('finishReason') not in (None, '', 'STOP'):
+        return ''
     return '\n'.join(
         part['text'] for part in parts
         if isinstance(part, dict) and isinstance(part.get('text'), str) and not part.get('thought')
@@ -79,6 +81,7 @@ async def call_fast_model(
     system_instruction: str = '',
     max_output_tokens: int = 512,
     timeout: float = 30.0,
+    json_output: bool = False,
 ) -> str | None:
     if pool is None or not getattr(pool, 'keys', None):
         return None
@@ -88,6 +91,8 @@ async def call_fast_model(
         'generationConfig': {
             'temperature': 0.2,
             'maxOutputTokens': max_output_tokens,
+            **({'responseMimeType': 'application/json'} if json_output else {}),
+            **({'thinkingConfig': {'thinkingLevel': 'minimal'}} if model == 'gemini-3.5-flash-lite' else {}),
         },
     }
     if system_instruction:
@@ -129,40 +134,15 @@ async def call_fast_model(
         return None
 
 
-async def _pb_get_record(pb, collection: str, record_id: str, fields: str) -> dict | None:
-    if pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None) or not record_id:
-        return None
+async def _post_insights(pb, endpoint: str, identity: dict, **fields) -> dict:
+    if not endpoint:
+        return {}
     try:
-        resp = await pb.client.get(
-            f"{pb.root}/api/collections/{collection}/records/{quote(str(record_id), safe='')}",
-            headers={'Authorization': pb.token},
-            params={'fields': fields},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        pass
-    return None
-
-
-async def _pb_patch_record(pb, collection: str, record_id: str, body: dict) -> bool:
-    if pb is None or not getattr(pb, 'root', None) or not getattr(pb, 'token', None) or not record_id:
-        return False
-    try:
-        resp = await pb.client.patch(
-            f"{pb.root}/api/collections/{collection}/records/{quote(str(record_id), safe='')}",
-            headers={'Authorization': pb.token},
-            json=body,
-            timeout=15,
-        )
-        return bool(resp.is_success)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return False
+        async with asyncio.timeout(8):
+            return await pb.post(f'{endpoint}/insights', {**identity, **fields})
+    except Exception as error:
+        print(f'[agent.fast] persistence_failed error_type={type(error).__name__}', flush=True)
+        return {}
 
 
 def clean_generated_title(raw: str) -> str:
@@ -171,7 +151,10 @@ def clean_generated_title(raw: str) -> str:
         return ''
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), '')
     cleaned = re.sub(r'^[#*\-\s"\'“”‘’《》【】「」]+|[#*\-\s"\'“”‘’《》【】「」。，,.!?！？:：]+$', '', first_line)
+    cleaned = re.sub(r'[\x00-\x1f\x7f]', ' ', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    if re.search(r'[㐀-鿿]', cleaned):
+        return cleaned[:16].rstrip()
     if len(cleaned) > MAX_TITLE_CHARS:
         cleaned = cleaned[:MAX_TITLE_CHARS].rstrip()
     return cleaned
@@ -183,14 +166,11 @@ async def maybe_generate_title(
     pb,
     job: dict,
     message: dict,
+    *, endpoint: str, identity: dict,
 ) -> str | None:
     """Generate and overwrite the conversation title for a brand-new conversation."""
     job_id = str(job.get('id') or '').strip()
-    if not job_id or is_continuation_job(job):
-        return None
-
-    record = await _pb_get_record(pb, 'aw_gemini_jobs', job_id, 'id,title,titleSource')
-    if record is None or str(record.get('titleSource') or '').strip().lower() == 'ai':
+    if not job_id or is_continuation_job(job) or job.get('replacesMessage') or job.get('titleSource') or message.get('index') != 1:
         return None
 
     user_text = '\n'.join(
@@ -200,6 +180,7 @@ async def maybe_generate_title(
         return None
 
     model = resolve_fast_model(job)
+    user_text = AgentTrace(secrets=getattr(pool, 'keys', ())).redact(user_text)
     prompt = (
         "请根据下面用户的首条消息，生成一个简洁、准确的对话标题。\n"
         "要求：\n"
@@ -213,10 +194,7 @@ async def maybe_generate_title(
     if not title:
         return None
 
-    ok = await _pb_patch_record(pb, 'aw_gemini_jobs', job_id, {'title': title, 'titleSource': 'ai'})
-    if not ok:
-        # Fallback if titleSource field has not been migrated in PocketBase yet.
-        ok = await _pb_patch_record(pb, 'aw_gemini_jobs', job_id, {'title': title})
+    ok = (await _post_insights(pb, endpoint, identity, title=title)).get('titleUpdated')
     if ok:
         print(f'[agent.fast] title_updated job={job_id} model={model} chars={len(title)}', flush=True)
     return title if ok else None
@@ -228,7 +206,15 @@ class AgentTimingTracker:
     def __init__(self, *, clock=time.monotonic, t0: float | None = None, submitted_at: str | None = None):
         self.clock = clock
         self.t0 = t0 if t0 is not None else clock()
-        self.submitted_at = submitted_at or _utc_iso()
+        self.submitted_at = _utc_iso()
+        self._queue_seconds = 0.0
+        if submitted_at:
+            try:
+                submitted = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+                self._queue_seconds = max(0.0, (datetime.now(timezone.utc) - submitted).total_seconds())
+                self.submitted_at = submitted.isoformat(timespec='milliseconds')
+            except (ValueError, TypeError):
+                pass
         self.dispatched_at: str | None = None
         self.dispatch_seconds: float | None = None
         self.first_reply_at: str | None = None
@@ -239,21 +225,24 @@ class AgentTimingTracker:
         self._steps: dict[int, dict] = {}
         self._last_step_elapsed: float = 0.0
         self._dirty = False
+        self.changed = asyncio.Event()
 
     def _elapsed(self) -> float:
-        return round(max(0.0, self.clock() - self.t0), 2)
+        return round(self._queue_seconds + max(0.0, self.clock() - self.t0), 2)
 
     def mark_dispatched(self) -> None:
         if self.dispatched_at is None:
             self.dispatched_at = _utc_iso()
             self.dispatch_seconds = self._elapsed()
             self._dirty = True
+            self.changed.set()
 
     def mark_first_reply(self) -> None:
         if self.first_reply_at is None:
             self.first_reply_at = _utc_iso()
             self.first_reply_seconds = self._elapsed()
             self._dirty = True
+            self.changed.set()
 
     def record_step(self, index: int, step_type: str, *, label: str = '', status: str = 'completed') -> None:
         self.mark_first_reply()
@@ -275,18 +264,21 @@ class AgentTimingTracker:
                 'status': status,
             }
             self._dirty = True
+            self.changed.set()
         else:
             if status != existing.get('status') or (label and not existing.get('label')):
                 existing['status'] = status
                 if label and not existing.get('label'):
                     existing['label'] = str(label)[:80]
                 self._dirty = True
+                self.changed.set()
 
     def mark_completed(self, status: str) -> None:
         self.completed_at = _utc_iso()
         self.total_seconds = self._elapsed()
         self.status = str(status or 'completed')
         self._dirty = True
+        self.changed.set()
 
     def to_dict(self) -> dict:
         return {
@@ -301,11 +293,26 @@ class AgentTimingTracker:
             'steps': [self._steps[idx] for idx in sorted(self._steps)],
         }
 
-    async def sync_if_dirty(self, pb, message_id: str, *, force: bool = False) -> bool:
-        if not message_id or (not self._dirty and not force):
-            return False
-        self._dirty = False
-        return await _pb_patch_record(pb, 'aw_gemini_messages', message_id, {'agentTimings': self.to_dict()})
+    async def pump(self, pb, endpoint, identity, finished: asyncio.Event):
+        while True:
+            try:
+                await asyncio.wait_for(self.changed.wait(), timeout=5)
+            except TimeoutError:
+                pass
+            self.changed.clear()
+            if self._dirty:
+                self._dirty = False
+                updated = await _post_insights(pb, endpoint, identity, agentTimings=self.to_dict())
+                self._dirty = self._dirty or 'titleUpdated' not in updated
+            if finished.is_set() and not self.changed.is_set():
+                return
+            await asyncio.sleep(1)
+
+
+def _summary_items(value, limit):
+    if not isinstance(value, list):
+        return []
+    return [item.strip()[:120] for item in value if isinstance(item, str) and item.strip()][:limit]
 
 
 def _parse_summary_json(raw: str) -> dict | None:
@@ -323,9 +330,9 @@ def _parse_summary_json(raw: str) -> dict | None:
         if isinstance(obj, dict):
             return {
                 'sentWhat': str(obj.get('sentWhat') or '').strip()[:600],
-                'actionsDone': [str(x).strip()[:240] for x in (obj.get('actionsDone') or []) if str(x).strip()][:12],
-                'completed': [str(x).strip()[:240] for x in (obj.get('completed') or []) if str(x).strip()][:12],
-                'issues': [str(x).strip()[:240] for x in (obj.get('issues') or []) if str(x).strip()][:8],
+                'actionsDone': _summary_items(obj.get('actionsDone'), 12),
+                'completed': _summary_items(obj.get('completed'), 12),
+                'issues': _summary_items(obj.get('issues'), 8),
                 'summary': str(obj.get('summary') or '').strip()[:800],
             }
     except ValueError:
@@ -343,7 +350,8 @@ def build_summary_digest(job: dict, message: dict, progress) -> tuple[str, int]:
     parts_list = []
     step_count = 0
     if progress is not None:
-        step_count = int(progress.usage.get('agentStepCount') or 0)
+        step_count = max(int(progress.usage.get('agentStepCount') or 0),
+                         sum(key.startswith('step:') for key in progress.parts))
         ordered = sorted(progress.parts.values(), key=lambda p: p.get('sequence', 0))
         for p in ordered:
             ptype = p.get('type', '')
@@ -360,15 +368,15 @@ def build_summary_digest(job: dict, message: dict, progress) -> tuple[str, int]:
                 parts_list.append(f"[AI回复]: {content[:1200]}")
 
     history_lines = []
-    for turn in (job.get('history') or [])[-6:]:
+    for turn in job.get('history') or []:
         role = turn.get('role', 'user')
-        text = str(turn.get('text') or '').strip()[:500]
+        text = str(turn.get('text') or '').strip()[:1800]
         if text:
             history_lines.append(f"{role}: {text}")
 
     current_user = '\n'.join(
         p for p in (str(job.get('prompt') or '').strip(), str(message.get('inputText') or '').strip()) if p
-    ).strip()[:1500]
+    ).strip()[:4000]
 
     sections = []
     if history_lines:
@@ -376,35 +384,36 @@ def build_summary_digest(job: dict, message: dict, progress) -> tuple[str, int]:
     if current_user:
         sections.append("【本轮用户发送】\n" + current_user)
     if parts_list:
-        sections.append("【当前执行步骤与输出】\n" + "\n".join(parts_list[-40:]))
+        sections.append("【当前执行步骤与输出】\n" + "\n".join(parts_list[-80:]))
 
     digest = '\n\n'.join(sections)
     if len(digest) > MAX_SUMMARY_INPUT_CHARS:
-        digest = digest[-MAX_SUMMARY_INPUT_CHARS:]
+        digest = digest[:MAX_SUMMARY_INPUT_CHARS]
     return digest, step_count
 
 
 class AgentSummaryWorker:
     """Periodically summarizes Agent execution progress using the fast model."""
 
-    def __init__(self, client: httpx.AsyncClient, pool, pb, job: dict, message: dict, progress, *, sleep=asyncio.sleep):
+    def __init__(self, client: httpx.AsyncClient, pool, pb, job: dict, message: dict, progress, *, endpoint: str, identity: dict):
         self.client = client
         self.pool = pool
         self.pb = pb
         self.job = job
         self.message = message
         self.progress = progress
-        self.sleep = sleep
+        self.endpoint = endpoint
+        self.identity = identity
         self.interval = resolve_summary_interval(job)
         self.model = resolve_fast_model(job)
         self.last_step_count = 0
-        self.has_summarized = False
 
     async def summarize_once(self, *, force: bool = False) -> dict | None:
         message_id = str(self.message.get('id') or '').strip()
         if not message_id:
             return None
         digest, step_count = build_summary_digest(self.job, self.message, self.progress)
+        digest = self.progress.redactor.redact(digest) if hasattr(self.progress, 'redactor') else digest
         if not digest.strip():
             return None
         if not force and step_count <= self.last_step_count:
@@ -420,7 +429,7 @@ class AgentSummaryWorker:
             '- "summary": 字符串，1-2句话概括当前整体进展\n\n'
             f"{digest}"
         )
-        reply = await call_fast_model(self.client, self.pool, self.model, prompt, max_output_tokens=700, timeout=35.0)
+        reply = await call_fast_model(self.client, self.pool, self.model, prompt, max_output_tokens=1000, timeout=35.0, json_output=True)
         parsed = _parse_summary_json(reply or '')
         if not parsed:
             return None
@@ -428,30 +437,17 @@ class AgentSummaryWorker:
         parsed['updatedAt'] = _utc_iso()
         parsed['stepCount'] = step_count
         parsed['model'] = self.model
-        ok = await _pb_patch_record(self.pb, 'aw_gemini_messages', message_id, {'agentSummary': parsed})
+        ok = 'titleUpdated' in await _post_insights(self.pb, self.endpoint, self.identity, agentSummary=parsed)
         if ok:
             self.last_step_count = step_count
-            self.has_summarized = True
             print(f'[agent.fast] summary_updated msg={message_id} steps={step_count} model={self.model}', flush=True)
         return parsed if ok else None
 
-    async def run(self) -> None:
-        while True:
-            await self.sleep(self.interval)
+    async def run(self, finished: asyncio.Event) -> None:
+        while not finished.is_set():
             try:
-                await self.summarize_once(force=False)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                print(f'[agent.fast] summary_loop_error type={type(error).__name__}', flush=True)
-
-    async def finalize(self) -> None:
-        digest, step_count = build_summary_digest(self.job, self.message, self.progress)
-        if not digest.strip() or step_count <= 0:
-            return
-        if not self.has_summarized or step_count > self.last_step_count:
-            try:
-                async with asyncio.timeout(25.0):
-                    await self.summarize_once(force=True)
-            except Exception as error:
-                print(f'[agent.fast] final_summary_skipped type={type(error).__name__}', flush=True)
+                await asyncio.wait_for(finished.wait(), timeout=self.interval)
+            except TimeoutError:
+                await self.summarize_once()
+        if self.progress.parts:
+            await self.summarize_once(force=True)

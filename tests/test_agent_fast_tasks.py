@@ -21,7 +21,7 @@ class FastTasksTests(unittest.IsolatedAsyncioTestCase):
     def test_clean_generated_title(self):
         self.assertEqual(clean_generated_title('“代码重构与性能优化。”'), '代码重构与性能优化')
         self.assertEqual(clean_generated_title('# **Hello World!**\nSecond line'), 'Hello World')
-        self.assertEqual(len(clean_generated_title('一' * 40)), 24)
+        self.assertEqual(len(clean_generated_title('一' * 40)), 16)
 
     def test_is_continuation_job(self):
         self.assertFalse(is_continuation_job({'id': 'job1', 'threadRoot': 'job1', 'history': []}))
@@ -31,35 +31,22 @@ class FastTasksTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_maybe_generate_title_skips_continuation_and_existing_ai_title(self):
         with patch('agent_fast_tasks.call_fast_model', new=AsyncMock(return_value='新标题')) as call_mock:
-            res1 = await maybe_generate_title(None, None, None, {'id': 'job2', 'parentMessage': 'm1', 'prompt': 'hi'}, {})
-            self.assertIsNone(res1)
-            call_mock.assert_not_called()
-
-        with patch('agent_fast_tasks._pb_get_record', new=AsyncMock(return_value={'id': 'job1', 'titleSource': 'ai'})), \
-             patch('agent_fast_tasks.call_fast_model', new=AsyncMock(return_value='新标题')) as call_mock:
-            res2 = await maybe_generate_title(None, None, object(), {'id': 'job1', 'prompt': 'hi'}, {})
-            self.assertIsNone(res2)
+            for job in [{'parentMessage': 'm1'}, {'titleSource': 'ai'}, {'titleSource': 'manual'}, {'replacesMessage': 'm1'}]:
+                self.assertIsNone(await maybe_generate_title(None, None, None, {'id': 'job1', 'prompt': 'hi', **job},
+                    {'index': 1}, endpoint='messages/m1', identity={'executionId': '1:1'}))
             call_mock.assert_not_called()
 
     async def test_maybe_generate_title_updates_new_conversation(self):
-        patch_mock = AsyncMock(return_value=True)
-        with patch('agent_fast_tasks._pb_get_record', new=AsyncMock(return_value={'id': 'job1', 'title': 'old'})), \
-             patch('agent_fast_tasks.call_fast_model', new=AsyncMock(return_value='《Android草稿缓存修复》')), \
-             patch('agent_fast_tasks._pb_patch_record', new=patch_mock):
+        post = AsyncMock(return_value={'titleUpdated': True})
+        with patch('agent_fast_tasks.call_fast_model', new=AsyncMock(return_value='《Android草稿缓存修复》')), \
+             patch('agent_fast_tasks._post_insights', new=post):
             title = await maybe_generate_title(
-                None,
-                None,
-                object(),
+                None, None, None,
                 {'id': 'job1', 'prompt': '帮我修复 Android 输入框草稿缓存问题'},
-                {'inputText': ''},
+                {'inputText': '', 'index': 1}, endpoint='messages/m1', identity={'executionId': '1:1'},
             )
         self.assertEqual(title, 'Android草稿缓存修复')
-        patch_mock.assert_awaited_once_with(
-            unittest.mock.ANY,
-            'aw_gemini_jobs',
-            'job1',
-            {'title': 'Android草稿缓存修复', 'titleSource': 'ai'},
-        )
+        post.assert_awaited_once_with(None, 'messages/m1', {'executionId': '1:1'}, title=title)
 
     def test_timing_tracker_milestones_and_deltas(self):
         now = [100.0]
@@ -86,7 +73,7 @@ class FastTasksTests(unittest.IsolatedAsyncioTestCase):
         progress = FakeProgress()
         progress.usage['agentStepCount'] = 2
         progress.parts['step:0'] = {'sequence': 1, 'type': 'tool_call', 'toolName': 'git', 'status': 'completed', 'content': 'clone'}
-        worker = AgentSummaryWorker(None, None, object(), {'id': 'j1', 'prompt': 'test'}, {'id': 'm1'}, progress)
+        worker = AgentSummaryWorker(None, None, object(), {'id': 'j1', 'prompt': 'test'}, {'id': 'm1'}, progress, endpoint='m1', identity={})
 
         summary_json = json.dumps({
             'sentWhat': '测试任务',
@@ -96,9 +83,9 @@ class FastTasksTests(unittest.IsolatedAsyncioTestCase):
             'summary': '进展顺利',
         }, ensure_ascii=False)
 
-        patch_mock = AsyncMock(return_value=True)
+        patch_mock = AsyncMock(return_value={'titleUpdated': False})
         with patch('agent_fast_tasks.call_fast_model', new=AsyncMock(return_value=summary_json)), \
-             patch('agent_fast_tasks._pb_patch_record', new=patch_mock):
+             patch('agent_fast_tasks._post_insights', new=patch_mock):
             first = await worker.summarize_once(force=False)
             self.assertIsNotNone(first)
             self.assertEqual(first['sentWhat'], '测试任务')
