@@ -41,16 +41,26 @@ jobs:
           python-version: '3.12'
           cache: pip
       - uses: actions/setup-python@v5
+        id: python
         if: matrix.variant == 'optimized'
         with:
           python-version: '3.12'
       - name: Install baseline text dependencies
         if: matrix.variant == 'baseline'
         run: pip install 'httpx>=0.28,<1'
-      - name: Install optimized text dependencies
+      - uses: actions/cache@v4
+        id: text-dependencies
         if: matrix.variant == 'optimized'
+        with:
+          path: ${{ runner.temp }}/gemini-text-deps
+          key: gemini-text-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements-gemini-text.txt') }}
+      - name: Install optimized text dependencies
+        if: matrix.variant == 'optimized' && steps.text-dependencies.outputs.cache-hit != 'true'
         run: >-
           python -m pip install --disable-pip-version-check --no-cache-dir
-          --no-compile --only-binary=:all: 'httpx>=0.28,<1'
+          --no-compile --only-binary=:all: --target "$RUNNER_TEMP/gemini-text-deps"
+          -r requirements-gemini-text.txt
       - name: Send a synthetic Antigravity task through the actual executor
+        env:
+          PYTHONPATH: ${{ matrix.variant == 'optimized' && format('{0}/gemini-text-deps', runner.temp) || '' }}
         run: python -u -m benchmarks.agent_startup_fixture

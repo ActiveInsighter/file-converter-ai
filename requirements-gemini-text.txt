@@ -1,0 +1,2 @@
+# Text and Antigravity executor dependencies. PDF workers use requirements.txt.
+httpx>=0.28,<1
