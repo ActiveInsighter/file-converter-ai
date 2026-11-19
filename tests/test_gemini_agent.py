@@ -118,6 +118,31 @@ class AgentPayloadTests(unittest.TestCase):
             self.assertNotIn(basic, str(error))
             self.assertNotIn('fixture-api-key', str(error))
 
+    def test_cloudflare_token_injects_allowlist_and_redacts_errors(self):
+        with patch.dict('os.environ', {'ANTIGRAVITY_CLOUDFLARE_TOKEN': 'fixture-cf-secret'}, clear=True):
+            data = build_agent_payload(job(), {'inputText': 'list my cloudflare workers'})
+            rules = data['environment']['network']['allowlist']
+            self.assertEqual(rules, [
+                {'domain': 'api.cloudflare.com', 'transform': {'Authorization': 'Bearer fixture-cf-secret'}},
+                {'domain': '*'},
+            ])
+            self.assertIn('api.cloudflare.com/client/v4', data['system_instruction'])
+            self.assertNotIn('fixture-cf-secret', data['system_instruction'])
+            error = upstream_error(403, {'error': {'message': 'denied Bearer fixture-cf-secret'}}, 'fixture-api-key')
+            self.assertNotIn('fixture-cf-secret', str(error))
+            self.assertNotIn('fixture-api-key', str(error))
+
+        with patch.dict('os.environ', {
+            'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-gh-secret',
+            'ANTIGRAVITY_CLOUDFLARE_TOKEN': 'fixture-cf-secret',
+        }, clear=True):
+            data = build_agent_payload(job(), {'inputText': 'deploy worker'})
+            rules = data['environment']['network']['allowlist']
+            self.assertEqual([r['domain'] for r in rules], ['github.com', 'api.github.com', 'api.cloudflare.com', '*'])
+            self.assertEqual(rules[2]['transform']['Authorization'], 'Bearer fixture-cf-secret')
+            self.assertNotIn('fixture-cf-secret', data['system_instruction'])
+            self.assertNotIn('fixture-gh-secret', data['system_instruction'])
+
     def test_response_only_reads_public_model_output_and_usage(self):
         result = parse_interaction({'status': 'completed', 'output_text': '', 'steps': [
             {'type': 'thought', 'content': [{'type': 'text', 'text': 'private'}]},
