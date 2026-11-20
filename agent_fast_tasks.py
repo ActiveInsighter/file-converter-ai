@@ -296,7 +296,7 @@ class AgentTimingTracker:
     async def pump(self, pb, endpoint, identity, finished: asyncio.Event):
         while True:
             try:
-                await asyncio.wait_for(self.changed.wait(), timeout=5)
+                await asyncio.wait_for(self.changed.wait(), timeout=15)
             except TimeoutError:
                 pass
             self.changed.clear()
@@ -306,7 +306,11 @@ class AgentTimingTracker:
                 self._dirty = self._dirty or 'titleUpdated' not in updated
             if finished.is_set() and not self.changed.is_set():
                 return
-            await asyncio.sleep(1)
+            if not finished.is_set():
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=5)
+                except TimeoutError:
+                    pass
 
 
 def _summary_items(value, limit):
