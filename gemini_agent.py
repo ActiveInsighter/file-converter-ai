@@ -61,7 +61,8 @@ def extract_image_urls(job: dict, message: dict) -> list[str]:
             seen.add(value)
             urls.append(value)
 
-    for container in (job, message):
+    options = job.get('options') if isinstance(job, dict) else None
+    for container in (job, options, message):
         if not isinstance(container, dict):
             continue
         raw_images = container.get('images')
@@ -121,7 +122,7 @@ async def resolve_images_to_base64(
     client: httpx.AsyncClient,
     urls: list[str],
     *,
-    timeout: float = 15.0,
+    timeout: float = 30.0,
 ) -> list[tuple[str, str]]:
     if not urls:
         return []
