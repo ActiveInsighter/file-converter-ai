@@ -543,6 +543,7 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     failures = 0
     poll_count = 0
     last_report = started
+    last_checkpoint_at = started - 15.0
     last_status = None
     seen_steps = set()
     try:
@@ -580,21 +581,25 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     annotations_count=len(result.get('annotations') or []),
                     **agent_usage_diagnostics(current))
                 return result
-            control = await checkpoint()
-            if control.get('canceled'):
-                if observer is not None:
-                    observer.cancel()
-                    await asyncio.gather(observer, return_exceptions=True)
-                    observer = None
-                upstream_status = await reconcile_requested_cancel(client, url, key, sleep=sleep)
-                telemetry('cancel_reconciled', status=upstream_status)
-                try:
-                    await checkpoint({'status': upstream_status})
-                except Exception as error:
-                    telemetry('cancel_checkpoint_failed', error_type=type(error).__name__)
-                finally:
-                    await pool.mark_cancelled(index, lease)
-                raise AgentCanceled('Agent 已取消')
+            now_mono = clock()
+            progress_closed = bool(progress is not None and getattr(progress, 'closed', False))
+            if progress_closed or (now_mono - last_checkpoint_at >= 15.0):
+                last_checkpoint_at = now_mono
+                control = await checkpoint()
+                if control.get('canceled'):
+                    if observer is not None:
+                        observer.cancel()
+                        await asyncio.gather(observer, return_exceptions=True)
+                        observer = None
+                    upstream_status = await reconcile_requested_cancel(client, url, key, sleep=sleep)
+                    telemetry('cancel_reconciled', status=upstream_status)
+                    try:
+                        await checkpoint({'status': upstream_status})
+                    except Exception as error:
+                        telemetry('cancel_checkpoint_failed', error_type=type(error).__name__)
+                    finally:
+                        await pool.mark_cancelled(index, lease)
+                    raise AgentCanceled('Agent 已取消')
             await sleep(3)
             try:
                 poll_started = clock()
