@@ -179,7 +179,8 @@ Remote 的“资料库”保存可复用 PDF，“收藏和模板”是独立侧
 PDF/OCR 转换流程不变；Antigravity 的独立 Interactions API 工具配置也不变。
 
 不同 Gemini 对话使用各自的 GitHub Actions concurrency group（由 request_id 区分），
-与 PDF 转换独立调度；Cloudflare Gemini 任务并发上限为 4。
+与 PDF 转换独立调度。Cloudflare 分批派发 Gemini 任务，活跃对话数无应用层上限。
+实际并发受 GitHub Runner 配额限制。
 每个 Actions Runner 的 KeyPool 仅管理当前任务，多个任务复用相同 API Key 时可能
 更早触发 Google 的项目级 RPM/RPD 或其他服务限制，请合理设置任务数量。
 
