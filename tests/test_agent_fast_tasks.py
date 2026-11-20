@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -68,6 +69,22 @@ class FastTasksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['steps'][0]['elapsedSeconds'], 5.0)
         self.assertEqual(data['steps'][1]['elapsedSeconds'], 9.25)
         self.assertEqual(data['steps'][1]['deltaSeconds'], 4.25)
+
+    async def test_completed_timing_flushes_without_waiting_for_the_throttle(self):
+        tracker = AgentTimingTracker()
+        finished = asyncio.Event()
+
+        async def post(*args, **kwargs):
+            if not finished.is_set():
+                tracker.mark_completed('completed')
+                finished.set()
+            return {'titleUpdated': True}
+
+        tracker.mark_dispatched()
+        with patch('agent_fast_tasks._post_insights', new=AsyncMock(side_effect=post)) as mock:
+            await asyncio.wait_for(tracker.pump(None, 'm1', {}, finished), timeout=0.5)
+        self.assertEqual(mock.await_count, 2)
+        self.assertEqual(mock.await_args.kwargs['agentTimings']['status'], 'completed')
 
     async def test_summary_worker_requires_new_steps_unless_forced(self):
         progress = FakeProgress()

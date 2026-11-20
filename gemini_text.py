@@ -592,6 +592,8 @@ async def run_job(pb, client, job_id: str, execution_id: str, pool_factory, work
                 if timing is not None and timing.completed_at is None:
                     timing.mark_completed(final_status)
                 ended.set()
+                if timing is not None:
+                    timing.changed.set()
                 queue.task_done()
 
     try:

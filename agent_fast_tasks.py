@@ -295,10 +295,11 @@ class AgentTimingTracker:
 
     async def pump(self, pb, endpoint, identity, finished: asyncio.Event):
         while True:
-            try:
-                await asyncio.wait_for(self.changed.wait(), timeout=15)
-            except TimeoutError:
-                pass
+            if not finished.is_set():
+                try:
+                    await asyncio.wait_for(self.changed.wait(), timeout=15)
+                except TimeoutError:
+                    pass
             self.changed.clear()
             if self._dirty:
                 self._dirty = False
