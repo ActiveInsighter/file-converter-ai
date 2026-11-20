@@ -493,6 +493,56 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(state['environmentId'], 'original-sandbox')
                 self.assertEqual(len(requests), int(saved_key == 'key-2'))
 
+    async def test_recovers_required_continuation_after_system_instruction_mismatch(self):
+        from gemini_agent import ROOT
+
+        with patch.dict('os.environ', {'ANTIGRAVITY_GITHUB_TOKEN': 'fixture-github-secret'}, clear=True):
+            original_task = {**job(), 'prompt': '检查我的 GitHub 仓库权限'}
+            original_instruction = build_agent_payload(original_task, {})['system_instruction']
+            for previous_instruction, accepts_retry in [(original_instruction, True), (None, True), (original_instruction, False)]:
+                with self.subTest(parent_had_instruction=previous_instruction is not None, accepts_retry=accepts_retry):
+                    task = {**job(), 'prompt': '继续完成', 'systemPrompt': 'updated settings',
+                            'agentContext': {'environmentId': 'original-sandbox', 'interactionId': 'original-turn',
+                                             'credentialHash': hashlib.sha256(b'key-2').hexdigest(), 'required': True}}
+                    state, requests = {}, []
+
+                    async def checkpoint(update=None):
+                        state.update(update or {})
+                        return {'state': state}
+
+                    def outbound(request):
+                        self.assertEqual(request.headers['x-goog-api-key'], 'key-2')
+                        requests.append(request.method)
+                        if request.method == 'GET':
+                            self.assertEqual(str(request.url), ROOT + '/original-turn')
+                            parent = {'id': 'original-turn', 'status': 'completed'}
+                            if previous_instruction is not None:
+                                parent['system_instruction'] = previous_instruction
+                            return httpx.Response(200, json=parent)
+
+                        payload = json.loads(request.content)
+                        self.assertEqual(str(request.url), ROOT)
+                        self.assertEqual(payload['environment'], 'original-sandbox')
+                        self.assertEqual(payload['previous_interaction_id'], 'original-turn')
+                        self.assertEqual(payload['input'], '继续完成')
+                        if not accepts_retry or payload.get('system_instruction') != previous_instruction:
+                            return httpx.Response(400, json={'error': {
+                                'message': 'system_instruction must match the interaction referenced by previous_interaction_id.',
+                            }})
+                        return httpx.Response(200, json={'id': 'child', 'status': 'completed', 'output_text': 'continued'})
+
+                    pool = KeyPool(['key-1', 'key-2'], rpm_per_key=1e6, rpd_per_key=100)
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                        if accepts_retry:
+                            result = await generate_agent(client, pool, task, {}, checkpoint=checkpoint)
+                            self.assertEqual(state['environmentId'], 'original-sandbox')
+                            self.assertEqual(result['reply'], 'continued')
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, '原 Agent 任务续接被上游拒绝'):
+                                await generate_agent(client, pool, task, {}, checkpoint=checkpoint)
+                            self.assertEqual(state, {})
+                    self.assertEqual(requests, ['POST', 'GET', 'POST'])
+
     async def test_generate_agent_falls_back_to_fresh_environment_when_expired(self):
         import hashlib
         sent_bodies = []

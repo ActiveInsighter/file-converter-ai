@@ -374,6 +374,37 @@ async def request_json(client, method, url, key, payload=None, *, api_revision=N
         return response.status_code, response.headers, data
 
 
+async def restore_parent_system_instruction(client, key, payload, error):
+    message = error.get('message') if isinstance(error, dict) else error
+    if not isinstance(message, str) or (
+        'system_instruction must match the interaction referenced by previous_interaction_id' not in message.casefold()
+    ):
+        return None
+
+    # Read the original request because each turn can assemble different instructions,
+    # including turns created before this executor version.
+    parent_id = payload['previous_interaction_id']
+    try:
+        async with asyncio.timeout(15):
+            status, _, parent = await request_json(client, 'GET', f'{ROOT}/{quote(parent_id, safe="")}', key)
+    except (httpx.HTTPError, RuntimeError, TimeoutError):
+        return None
+    if status != 200 or not isinstance(parent, dict) or parent.get('id') != parent_id:
+        return None
+
+    instruction = parent.get('system_instruction')
+    if instruction == payload.get('system_instruction') or (
+        instruction is not None and not isinstance(instruction, str)
+    ):
+        return None
+    corrected = payload.copy()
+    if instruction is None:
+        corrected.pop('system_instruction', None)
+    else:
+        corrected['system_instruction'] = instruction
+    return corrected
+
+
 def upstream_error(status, data, key):
     error = data.get('error') or {}
     detail = error.get('message', '') if isinstance(error, dict) else str(error)
@@ -479,19 +510,31 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
             # Resume the original remote execution, never create a second interaction.
             current = {'id': state['id'], 'status': 'in_progress'}
             break
-        try:
+        instruction_retry = False
+        while True:
             create_started = clock()
             if timing is not None:
                 timing.mark_dispatched()
-            status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
+            try:
+                status, headers, data = await request_json(client, 'POST', ROOT, key, payload)
+            except (httpx.TransportError, TimeoutError) as error:
+                trace.emit('create_transport_error', error_type=type(error).__name__,
+                           seconds=round(clock() - create_started, 3), resent=False)
+                await pool.mark_error(index, lease)
+                raise RuntimeError('Agent 提交连接中断，无法确认是否已创建；为避免重复执行，未自动重发。') from None
             trace.emit('create_http', http=status, seconds=round(clock() - create_started, 3),
-                       attempt=attempt + 1,
+                       attempt=attempt + 1, instruction_retry=instruction_retry,
                        **({'error': trace.preview(data['error'])} if data.get('error') else {}))
-        except (httpx.TransportError, TimeoutError) as error:
-            trace.emit('create_transport_error', error_type=type(error).__name__,
-                       seconds=round(clock() - create_started, 3), resent=False)
-            await pool.mark_error(index, lease)
-            raise RuntimeError('Agent 提交连接中断，无法确认是否已创建；为避免重复执行，未自动重发。') from None
+            if instruction_retry or not reusing_remote or status != 400:
+                break
+            corrected = await restore_parent_system_instruction(client, key, payload, data.get('error'))
+            if corrected is None:
+                break
+            if (await checkpoint()).get('canceled'):
+                await pool.mark_cancelled(index, lease)
+                raise AgentCanceled('Agent 已取消，未创建远程执行。')
+            payload = corrected
+            instruction_retry = True
         if status in [200, 201, 202]:
             current = data
             if not isinstance(data.get('id'), str) or not data['id']:
