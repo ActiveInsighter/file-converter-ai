@@ -328,6 +328,14 @@ class MessageProgress:
                  status='failed' if result.get('error') else 'completed')
 
 
+def is_interaction_precondition_error(status, data):
+    if status != 400 or not isinstance(data, dict):
+        return False
+    error = data.get('error')
+    return (isinstance(error, dict) and error.get('code') == 'invalid_request'
+            and error.get('message') == 'Precondition check failed.')
+
+
 async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
     from agent_trace import sse_events
     import httpx
@@ -349,12 +357,11 @@ async def observe_progress(client, url, key, progress, *, sleep=asyncio.sleep):
                     # authentication/other invalid requests stay permanent.
                     precondition = False
                     if response.status_code == 400:
-                        raw = await response.aread()
                         try:
-                            detail = json.loads(raw).get('error', {})
-                            precondition = (isinstance(detail, dict) and detail.get('code') == 'invalid_request'
-                                            and detail.get('message') == 'Precondition check failed.')
-                        except (ValueError, AttributeError):
+                            precondition = is_interaction_precondition_error(
+                                response.status_code, json.loads(await response.aread()),
+                            )
+                        except ValueError:
                             pass
                     if response.status_code not in (408, 429, 500, 502, 503, 504) and not precondition:
                         print(f'[agent.progress] stream unavailable job={progress.job_id} '

@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 import httpx
 
+from agent_progress import is_interaction_precondition_error, observe_progress
 from agent_trace import AgentTrace, TERMINAL
 from response_capture import extract_structured_payload, interaction_snapshot
 from agent_runtime import GUIDE, mount_runtime
@@ -581,7 +582,6 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
     # GET snapshots reconcile the optional event channel; neither can create a run.
     observer = None
     if progress is not None:
-        from agent_progress import observe_progress
         observer = asyncio.create_task(observe_progress(client, url, key, progress))
     failures = 0
     poll_count = 0
@@ -651,11 +651,16 @@ async def generate_agent(client, pool, job, message, *, checkpoint, sleep=asynci
                     trace.emit('poll_http_error', http=status, consecutive_failures=failures + 1,
                                seconds=round(clock() - poll_started, 3),
                                **({'error': trace.preview(data['error'])} if data.get('error') else {}))
-                    if status in [429, 500, 502, 503, 504]:
+                    if is_interaction_precondition_error(status, data):
+                        retry_limit = 5
+                    elif status in (429, 500, 502, 503, 504):
+                        retry_limit = 20
+                    else:
+                        retry_limit = 0
+                    if failures < retry_limit:
                         failures += 1
-                        if failures <= 20:
-                            await sleep(min(failures * 2, 30))
-                            continue
+                        await sleep(min(failures * 2, 30))
+                        continue
                     raise upstream_error(status, data, key)
                 current, failures = data, 0
                 poll_count += 1

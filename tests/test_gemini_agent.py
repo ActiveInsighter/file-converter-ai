@@ -311,6 +311,73 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             result = await generate_agent(client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100), job(), {}, checkpoint=checkpoint, sleep=sleep)
         self.assertEqual(result['reply'], 'restored')
 
+    async def test_poll_recovers_from_precondition_error_on_the_same_interaction(self):
+        state, requests, delays = {}, [], []
+
+        async def checkpoint(update=None):
+            if update:
+                state.update(update)
+            return {'state': state.copy()}
+
+        async def outbound(request):
+            requests.append((request.method, request.url.path, request.headers['x-goog-api-key']))
+            if request.method == 'POST':
+                return httpx.Response(200, json={'id': 'v1_poll', 'status': 'in_progress'})
+            if len(requests) < 4:
+                return httpx.Response(400, json={'error': {
+                    'code': 'invalid_request', 'message': 'Precondition check failed.',
+                }})
+            return httpx.Response(200, json={'id': 'v1_poll', 'status': 'completed', 'output_text': 'recovered'})
+
+        async def sleep(delay):
+            delays.append(delay)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+            result = await generate_agent(
+                client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100),
+                job(), {}, checkpoint=checkpoint, sleep=sleep,
+            )
+        self.assertEqual(requests, [
+            ('POST', '/v1beta/interactions', 'fixture-secret'),
+            *[('GET', '/v1beta/interactions/v1_poll', 'fixture-secret')] * 3,
+        ])
+        self.assertEqual(delays, [3, 2, 3, 4, 3])
+        self.assertEqual(state['status'], 'completed')
+        self.assertEqual(result['reply'], 'recovered')
+
+    async def test_poll_precondition_retries_are_bounded_and_other_400s_fail_immediately(self):
+        for error_message, expected_polls in (('Precondition check failed.', 6), ('Invalid request field.', 1)):
+            with self.subTest(error_message=error_message):
+                state, requests = {}, []
+
+                async def checkpoint(update=None):
+                    if update:
+                        state.update(update)
+                    return {'state': state.copy()}
+
+                async def outbound(request):
+                    requests.append((request.method, request.url.path))
+                    if request.url.path.endswith('/cancel'):
+                        return httpx.Response(204)
+                    if request.method == 'POST':
+                        return httpx.Response(200, json={'id': 'v1_poll', 'status': 'in_progress'})
+                    return httpx.Response(400, json={'error': {'code': 'invalid_request', 'message': error_message}})
+
+                async def sleep(_):
+                    pass
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+                    with self.assertRaisesRegex(RuntimeError, r'HTTP 400'):
+                        await generate_agent(
+                            client, KeyPool(['fixture-secret'], rpm_per_key=1e6, rpd_per_key=100),
+                            job(), {}, checkpoint=checkpoint, sleep=sleep,
+                        )
+                self.assertEqual(requests, [
+                    ('POST', '/v1beta/interactions'),
+                    *[('GET', '/v1beta/interactions/v1_poll')] * expected_polls,
+                    ('POST', '/v1beta/interactions/v1_poll/cancel'),
+                ])
+
     async def test_user_cancel_cancels_remote_interaction(self):
         state = {}; canceled = []
         async def checkpoint(update=None):
